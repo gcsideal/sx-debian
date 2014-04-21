@@ -1,0 +1,41 @@
+Source: sx
+Section: web
+Priority: optional
+Maintainer: Laszlo Boszormenyi (GCS) <gcs@debian.org>
+Build-Depends: debhelper (>= 9), libssl-dev, libyajl-dev, libfcgi-dev, libcurl4-openssl-dev
+Standards-Version: 3.9.5
+Homepage: http://www.skylable.com/
+
+Package: sx
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: framework for building distributed data clusters
+ Reliable, powerful, fully distributed cluster solution for your data storage
+ needs. It can aggregate the disk space available on multiple servers and
+ merge it into a single storage system. The cluster makes sure that your data
+ is always replicated over multiple nodes (the exact number of copies is
+ defined by the sysadmin) and synchronized. It has built-in support for
+ deduplication, client-side encryption, on-the-fly compression, and much more.
+
+Package: libsx0
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: framework for building distributed data clusters
+ Reliable, powerful, fully distributed cluster solution for your data storage
+ needs. It can aggregate the disk space available on multiple servers and
+ merge it into a single storage system. The cluster makes sure that your data
+ is always replicated over multiple nodes (the exact number of copies is
+ defined by the sysadmin) and synchronized. It has built-in support for
+ deduplication, client-side encryption, on-the-fly compression, and much more.
+
+Package: libsx-dev
+Section: libdevel
+Architecture: any
+Depends: libsx0 (= ${binary:Version}), ${misc:Depends}
+Description: framework for building distributed data clusters
+ Reliable, powerful, fully distributed cluster solution for your data storage
+ needs. It can aggregate the disk space available on multiple servers and
+ merge it into a single storage system. The cluster makes sure that your data
+ is always replicated over multiple nodes (the exact number of copies is
+ defined by the sysadmin) and synchronized. It has built-in support for
+ deduplication, client-side encryption, on-the-fly compression, and much more.
