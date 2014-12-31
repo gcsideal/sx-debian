@@ -1,0 +1,3 @@
+0001-fix-make-check-when-disable-sxhttpd-is-used.patch
+0002-set-other-paths-needed-to-run-as-non-root.patch
+0003-fix-manpage-has-bad-whatis-entry.patch
