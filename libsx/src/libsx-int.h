@@ -33,15 +33,23 @@ void sxi_setsyserr(sxc_client_t *sx, enum sxc_error_t err, const char *fmt, ...)
 void sxi_clear_operation(sxc_client_t *sx);
 void sxi_set_operation(sxc_client_t *sx, const char *op, const char *cluster, const char *vol, const char *path);
 const char *sxi_get_operation(sxc_client_t *sx);
-void sxi_setclusterr(sxc_client_t *sx, const char *nodeid, const char *reqid, int status,
-                     const char *msg, const char *details);
+void sxi_operation_info(const sxc_client_t *sx, const char **op, const char **host, const char **vol, const char **path);
 
 int sxi_is_debug_enabled(sxc_client_t *sx);
 
 const char *sxi_get_tempdir(sxc_client_t *sx);
 
 #define SXDEBUG(...) sxi_debug(sx, __FUNCTION__, __VA_ARGS__)
-#define CFGDEBUG(...) do{ sxc_client_t *sx; if(cluster && (sx = sxi_cluster_get_client(cluster))) SXDEBUG(__VA_ARGS__); } while(0)
+#define CFGDEBUG(...) do{ sxc_client_t *_sx; if(cluster && (_sx = sxi_cluster_get_client(cluster))) sxi_debug(_sx, __FUNCTION__, __VA_ARGS__); } while(0)
+#define CBDEBUG(...) do{ sxc_client_t *_sx = sxi_conns_get_client(sxi_cbdata_get_conns(yactx->cbdata)); sxi_debug(_sx, __FUNCTION__, __VA_ARGS__); } while(0)
+#define CBDATADEBUG(...) do{ sxc_client_t *_sx = sxi_conns_get_client(sxi_cbdata_get_conns(cbdata)); sxi_debug(_sx, __FUNCTION__, __VA_ARGS__); } while(0)
+
+struct filter_cfg {
+    char *volname;
+    void *cfg;
+    unsigned int cfg_len;
+    struct filter_cfg *next;
+};
 
 struct filter_handle {
     void *dlh;	/* dlhandle */
@@ -49,6 +57,7 @@ struct filter_handle {
     int active;
     sxc_filter_t *f;
     uint8_t uuid_bin[16];
+    struct filter_cfg *cfg;
     sxc_client_t *sx;
 };
 
@@ -65,6 +74,6 @@ struct tempfile_track {
 struct filter_ctx *sxi_get_fctx(sxc_client_t *sx);
 struct tempfile_track *sxi_get_temptrack(sxc_client_t *sx);
 const char *sxi_get_useragent(void);
-int sxi_confirm(sxc_client_t *sx, const char *prompt, int default_answer);
+int sxi_get_input(sxc_client_t *sx, sxc_input_t type, const char *prompt, const char *def, char *in, unsigned int insize);
 
 #endif

@@ -24,19 +24,19 @@
 #include "curlevents.h"
 #include "libsx-int.h"
 #include "misc.h"
-#include "cert.h"
 #include "sxproto.h"
+#include "vcrypto.h"
+#include "vcryptocurl.h"
+#include "jobpoll.h"
 #include <curl/curl.h>
 #include <errno.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <arpa/inet.h>
-#include <openssl/ssl.h>
-#include <openssl/err.h>
-#include <openssl/hmac.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include "fileops.h"
 
 #define ERRBUF_SIZE 512
 enum ctx_tag { CTX_UPLOAD, CTX_UPLOAD_HOST, CTX_DOWNLOAD, CTX_JOB, CTX_HASHOP, CTX_GENERIC };
@@ -64,6 +64,7 @@ struct retry_ctx {
     retry_cb_t cb;
     sxi_retry_t *retry;
     char *op;
+    sxi_jobs_t *jobs;
 };
 
 struct curlev_context {
@@ -74,10 +75,14 @@ struct curlev_context {
     struct recv_context recv_ctx;
 
     /* keep all of the below across retries */
-
     body_cb_t data_cb;
     finish_cb_t finish_cb;
     struct retry_ctx retry;
+
+    /* Store error messages locally */
+    char errbuf[ERRBUF_SIZE+1];
+    enum sxc_error_t errnum;
+    char *op, *op_host, *op_vol, *op_path;
 
     enum ctx_tag tag;
     union {
@@ -89,12 +94,14 @@ struct curlev_context {
         struct generic_ctx *generic_ctx;
     } u;
     void *context;
+
 };
 
 static struct curlev_context *sxi_cbdata_create(sxi_conns_t *conns, finish_cb_t cb)
 {
     struct curlev_context *ret;
     sxc_client_t *sx;
+    const char *op = NULL, *op_host = NULL, *op_vol = NULL, *op_path = NULL;
     if (!conns)
         return NULL;
     sx = sxi_conns_get_client(conns);
@@ -108,6 +115,9 @@ static struct curlev_context *sxi_cbdata_create(sxi_conns_t *conns, finish_cb_t 
     ret->conns = conns;
     ret->finish_cb = cb;
     ret->ref = 1;
+    sxi_cbdata_clearerr(ret);
+    sxi_operation_info(sx, &op, &op_host, &op_vol, &op_path);
+    sxi_cbdata_set_operation(ret, op, op_host, op_vol, op_path);
     sxi_hostlist_init(&ret->retry.hosts);
     return ret;
 }
@@ -115,10 +125,9 @@ static struct curlev_context *sxi_cbdata_create(sxi_conns_t *conns, finish_cb_t 
 static int sxi_cbdata_is_tag(struct curlev_context *ctx, enum ctx_tag expected)
 {
     if (ctx) {
-        sxc_client_t *sx = sxi_conns_get_client(ctx->conns);
         if (ctx->tag == expected)
             return 1;
-        sxi_seterr(sx, SXE_EARG, "context tag mismatch: %d != %d", ctx->tag, expected);
+        sxi_cbdata_seterr(ctx, SXE_EARG, "context tag mismatch: %d != %d", ctx->tag, expected);
     }
     return 0;
 }
@@ -238,7 +247,7 @@ void* sxi_cbdata_get_context(struct curlev_context *ctx)
 
 int sxi_set_retry_cb(curlev_context_t *ctx, const sxi_hostlist_t *hlist, retry_cb_t cb,
                      enum sxi_cluster_verb verb, const char *query, void *content, size_t content_size,
-                     ctx_setup_cb_t setup_callback)
+                     ctx_setup_cb_t setup_callback, sxi_jobs_t *jobs)
 {
     if (ctx) {
         sxc_client_t *sx = sxi_conns_get_client(ctx->conns);
@@ -247,15 +256,20 @@ int sxi_set_retry_cb(curlev_context_t *ctx, const sxi_hostlist_t *hlist, retry_c
         ctx->retry.verb = verb;
         ctx->retry.query = strdup(query);
         if (!ctx->retry.query) {
-            sxi_setsyserr(sx, SXE_EMEM, "Out of memory allocating retry query");
+            sxi_cbdata_setsyserr(ctx, SXE_EMEM, "Out of memory allocating retry query");
             return -1;
         }
         ctx->retry.content = content;
         ctx->retry.content_size = content_size;
-        if (sxi_hostlist_add_list(sx, &ctx->retry.hosts, hlist))
+        if (sxi_hostlist_add_list(sx, &ctx->retry.hosts, hlist)) {
+            sxi_cbdata_restore_global_error(sx, ctx);
             return -1;
-        if (!(ctx->retry.retry = sxi_retry_init(sx)))
+        }
+        if (!(ctx->retry.retry = sxi_retry_init(ctx, RCTX_CBDATA))) {
+            sxi_cbdata_seterr(ctx, SXE_EMEM, "Out of memory allocating retry");
             return -1;
+        }
+        ctx->retry.jobs = jobs;
         return 0;
     }
     return -1;
@@ -273,7 +287,6 @@ void sxi_cbdata_ref(curlev_context_t *ctx)
 void sxi_cbdata_unref(curlev_context_t **ctx_ptr)
 {
     if (ctx_ptr) {
-        const char *op;
         char *oldop;
         curlev_context_t *ctx = *ctx_ptr;
         sxc_client_t *sx;
@@ -282,23 +295,30 @@ void sxi_cbdata_unref(curlev_context_t **ctx_ptr)
             return;
         }
         sx = sxi_conns_get_client(ctx->conns);
-        op = sxi_get_operation(sx);
         oldop = ctx->retry.op;
         /* op might be equal to ctx->retry.op, so don't free it yet
          * before strdup-ing it */
-        ctx->retry.op = op ? strdup(op) : NULL;
+        ctx->retry.op = ctx->op ? strdup(ctx->op) : NULL;
         free(oldop);
-        sxi_clear_operation(sx);
+        sxi_cbdata_clear_operation(ctx);
         ctx->ref--;
         *ctx_ptr = NULL;
         if (ctx->ref < 0) {
-            sxi_seterr(sx, SXE_EARG, "cbdata: reference count wrong: %d", ctx->ref);
+            /* Store message globally, otherwise it wouldn't ever be shown */
+            sxi_seterr(sx, SXE_EARG, "cbdata: Reference count wrong: %d", ctx->ref);
             /* don't free, the reference count is corrupt */
             return;
         }
         SXDEBUG("cbdata reference count for %p: %d", (void*)ctx, ctx->ref);
         if (!ctx->ref) {
             SXDEBUG("freeing cbdata %p", (void*)ctx);
+            /* Store local error message in global error buffer, otherwise it would be lost */
+            if(ctx->errnum != SXE_NOERROR) {
+                sxi_seterr(sx, ctx->errnum, "%s", ctx->errbuf);
+                SXDEBUG("Clearing cbdata, global error message set [%d]: %s", sxc_geterrnum(sx), sxc_geterrmsg(sx));
+            }
+            /* Restore operation globally */
+            sxi_set_operation(sx, ctx->op, ctx->op_host, ctx->op_vol, ctx->op_path);
             sxi_cbdata_reset(ctx);
             sxi_hostlist_empty(&ctx->retry.hosts);
             sxi_retry_done(&ctx->retry.retry);
@@ -309,7 +329,7 @@ void sxi_cbdata_unref(curlev_context_t **ctx_ptr)
             return;
         }
         /* we didn't free it, but no errors */
-        sxi_set_operation(sx, ctx->retry.op, NULL, NULL, NULL);
+        sxi_cbdata_set_operation(ctx, ctx->retry.op, NULL, NULL, NULL);
         return;
     }
     /* error */
@@ -321,6 +341,7 @@ void sxi_cbdata_reset(curlev_context_t *ctx)
         struct recv_context *rctx = &ctx->recv_ctx;
         free(rctx->reason);
         memset(rctx, 0, sizeof(*rctx));
+        sxi_cbdata_clearerr(ctx);
     }
 }
 
@@ -337,19 +358,157 @@ void sxi_cbdata_set_result(curlev_context_t *ctx, int status)
     ctx->recv_ctx.reply_status = status;
 }
 
-int sxi_cbdata_result(curlev_context_t *ctx, int *curlcode)
+int sxi_cbdata_result(curlev_context_t *ctx, int *curlcode, enum sxc_error_t *errnum, long *http_status)
 {
     struct recv_context *rctx = ctx ?  &ctx->recv_ctx : NULL;
     if (!rctx)
         return -1;
+
+    if(http_status && (rctx->rc == CURLE_OK || rctx->rc == CURLE_WRITE_ERROR))
+        *http_status = rctx->reply_status;
+    if(errnum)
+        *errnum = sxi_cbdata_geterrnum(ctx);
     if (curlcode)
         *curlcode = rctx->rc;
-    if (rctx->rc == CURLE_OK || rctx->rc == CURLE_WRITE_ERROR)
-        return rctx->reply_status;
+
     if (rctx->rc == CURLE_OUT_OF_MEMORY) {
-        sxi_seterr(sxi_conns_get_client(ctx->conns), SXE_ECURL,
-                   "Cluster query failed: out of memory in library routine");
+        sxi_cbdata_seterr(ctx, SXE_ECURL, "Cluster query failed: Out of memory in library routine");
         return -1;
+    }
+
+    return 0;
+}
+
+void sxi_cbdata_clear_operation(curlev_context_t *ctx) {
+    if(!ctx)
+        return;
+    free(ctx->op);
+    free(ctx->op_host);
+    free(ctx->op_vol);
+    free(ctx->op_path);
+    ctx->op = NULL;
+    ctx->op_host = NULL;
+    ctx->op_vol = NULL;
+    ctx->op_path = NULL;
+}
+
+void sxi_cbdata_set_operation(curlev_context_t *ctx, const char *op, const char *host, const char *vol, const char *path) {
+    if (!ctx)
+        return;
+    sxi_cbdata_clear_operation(ctx);
+    if(op)
+        ctx->op = strdup(op);
+    if (host)
+        ctx->op_host = strdup(host);
+    if (vol)
+        ctx->op_vol = strdup(vol);
+    if (path)
+        ctx->op_path = strdup(path);
+}
+
+void sxi_cbdata_seterr(curlev_context_t *ctx, enum sxc_error_t err, const char *fmt, ...) {
+    va_list ap;
+
+    if(!ctx)
+        return;
+    ctx->errnum = err;
+    va_start(ap, fmt);
+    vsnprintf(ctx->errbuf, sizeof(ctx->errbuf) - 1, fmt, ap);
+    va_end(ap);
+    ctx->errbuf[sizeof(ctx->errbuf)-1] = '\0';
+}
+
+void sxi_cbdata_setsyserr(curlev_context_t *ctx, enum sxc_error_t err, const char *fmt, ...) {
+    struct sxi_fmt f;
+    va_list ap;
+
+    if(!ctx)
+        return;
+    sxi_fmt_start(&f);
+    va_start(ap, fmt);
+    sxi_vfmt_syserr(&f, fmt, ap);
+    va_end(ap);
+
+    sxi_cbdata_seterr(ctx, err, "%s", f.buf);
+}
+
+void sxi_cbdata_setclusterr(curlev_context_t *ctx, const char *nodeid, const char *reqid, int status,
+                     const char *msg, const char *details)
+{
+    char httpcode[16];
+    struct sxi_fmt f;
+    sxc_client_t *sx;
+    if (!ctx)
+        return;
+    sx = sxi_conns_get_client(sxi_cbdata_get_conns(ctx));
+    if(!sx)
+        return;
+    if (!*msg) {
+        snprintf(httpcode, sizeof(httpcode), "HTTP code %d", status);
+        msg = httpcode;
+    }
+    sxi_fmt_start(&f);
+    sxi_fmt_msg(&f, "Failed to %s: %s", ctx->op ? ctx->op : "query cluster", msg);
+    if (ctx->op_host) {
+        sxi_fmt_msg(&f, ": sx://%s", ctx->op_host);
+        if (ctx->op_vol) {
+            sxi_fmt_msg(&f, "/%s", ctx->op_vol);
+            if (ctx->op_path) {
+                sxi_fmt_msg(&f, "/%s", ctx->op_path);
+            }
+        }
+    }
+    if(status == 500 || status == 503) {
+        sxi_fmt_msg(&f," (on");
+        if (nodeid)
+            sxi_fmt_msg(&f, " node:%s", nodeid);
+        if (reqid)
+            sxi_fmt_msg(&f, " reqid:%s", reqid);
+        sxi_fmt_msg(&f, ")");
+        if (sxc_is_verbose(sx) && details && *details)
+            sxi_fmt_msg(&f, "\nHTTP %d: %s", status, details);
+    }
+    sxi_cbdata_seterr(ctx, (status == 403 || status == 401) ? SXE_EAUTH : SXE_ECOMM, "%s", f.buf);
+    sxi_cbdata_clear_operation(ctx);
+    SXDEBUG("Cluster query failed (HTTP %d): %s", status, f.buf);
+    if (details && *details)
+        SXDEBUG("Cluster error: %s", details);
+}
+
+
+void sxi_cbdata_clearerr(curlev_context_t *cbdata) {
+    if(!cbdata)
+        return;
+    if(cbdata->errnum != SXE_NOERROR)
+        CBDATADEBUG("Clearing error stored in cbdata [%d]: %s", cbdata->errnum, cbdata->errbuf);
+    cbdata->errnum = SXE_NOERROR;
+    strcpy(cbdata->errbuf, "No error");
+}
+
+const char *sxi_cbdata_geterrmsg(const curlev_context_t *ctx) {
+    if(!ctx)
+        return NULL;
+
+    if(ctx->errnum != SXE_NOERROR)
+        return ctx->errbuf;
+    else
+        return "No error";
+}
+
+enum sxc_error_t sxi_cbdata_geterrnum(const curlev_context_t *ctx) {
+    if(!ctx)
+        return SXE_NOERROR;
+
+    return ctx->errnum;
+}
+
+int sxi_cbdata_restore_global_error(sxc_client_t *sx, curlev_context_t *cbdata) {
+    if(!sx || !cbdata)
+        return 1;
+
+    if(sxc_geterrnum(sx) != SXE_NOERROR) {
+        sxi_cbdata_seterr(cbdata, sxc_geterrnum(sx), "%s", sxc_geterrmsg(sx));
+        sxc_clearerr(sx);
     }
     return 0;
 }
@@ -359,22 +518,20 @@ sxi_conns_t *sxi_cbdata_get_conns(curlev_context_t *ctx)
     return ctx ? ctx->conns : NULL;
 }
 
-int sxi_cbdata_wait(curlev_context_t *ctx, curl_events_t *e, int *curlcode)
+int sxi_cbdata_wait(curlev_context_t *ctx, curl_events_t *e, long *http_status)
 {
     if (ctx) {
         struct recv_context *rctx = &ctx->recv_ctx;
         while (!rctx->finished) {
-            if (sxi_curlev_poll(e)) {
-                *curlcode = rctx->rc;
-                return -1;
-            }
+            if (sxi_curlev_poll(e))
+                return -2;
         }
-        return sxi_cbdata_result(ctx, curlcode);
+        return sxi_cbdata_result(ctx, NULL, NULL, http_status);
     }
-    return -1;
+    return -2;
 }
 
-void sxi_cbdata_finish(curl_events_t *e, curlev_context_t **ctxptr, const char *url, error_cb_t err)
+static void sxi_cbdata_finish(curl_events_t *e, curlev_context_t **ctxptr, const char *url, error_cb_t err)
 {
     struct recv_context *rctx;
     curlev_context_t *ctx;
@@ -393,44 +550,54 @@ void sxi_cbdata_finish(curl_events_t *e, curlev_context_t **ctxptr, const char *
         if (rctx->rc != CURLE_WRITE_ERROR) {
             const char *msg = *rctx->errbuf ? rctx->errbuf : strerr;
             if (rctx->rc == CURLE_SSL_CACERT && sxi_curlev_has_cafile(e))
-                sxi_seterr(sx, SXE_ECURL, "%s: possible MITM attack: run sxinit again!",
+                sxi_cbdata_seterr(ctx, SXE_ECURL, "%s: Possible MITM attack, see https://wiki.skylable.com/wiki/FAQ#Possible_MITM_attack",
                            strerr);
-            else
-                sxi_seterr(sx, SXE_ECURL, "%s: %s", url ? url : "", msg);
+            else {
+                SXDEBUG("%s: %s", url ? url : "", msg);
+                sxi_cbdata_seterr(ctx, SXE_ECURL, "Failed to %s: %s", ctx->op ? ctx->op : "query cluster", msg);
+            }
         }
     } else if (rctx->reply_status > 0 && rctx->reason && rctx->reasonsz > 0) {
         rctx->reason[rctx->reasonsz] = '\0';
         if (err)
-            err(ctx->conns, rctx->reply_status, rctx->reason);
+            err(ctx, rctx->reply_status, rctx->reason);
     }
 
     do {
-    if (ctx->retry.cb && (rctx->rc != CURLE_OK || rctx->reply_status / 100 != 2)) {
-        unsigned n = sxi_hostlist_get_count(&ctx->retry.hosts);
+    if (ctx->retry.cb && (rctx->rc != CURLE_OK || rctx->reply_status / 100 != 2) && rctx->reply_status != 413) {
+        int n = sxi_hostlist_get_count(&ctx->retry.hosts);
         if (++ctx->retry.hostidx >= n) {
             if (ctx->retry.retries < 2 || ctx->recv_ctx.reply_status == 429) {
                 ctx->retry.retries++;
                 ctx->retry.hostidx = 0;
+                if (ctx->recv_ctx.reply_status == 429 && ctx->retry.jobs) {
+                    if (sxi_job_wait(ctx->conns, ctx->retry.jobs)) {
+                        SXDEBUG("job wait failed");
+                    }
+                }
                 sxi_retry_throttle(sx, ctx->retry.retries);
             }
         }
         const char *host = sxi_hostlist_get_host(&ctx->retry.hosts, ctx->retry.hostidx);
         if (sxi_retry_check(ctx->retry.retry, ctx->retry.retries * n + ctx->retry.hostidx))
             break;
-        sxi_set_operation(sx, ctx->retry.op, NULL, NULL, NULL);
-        sxi_retry_msg(ctx->retry.retry, host);
+        sxi_cbdata_set_operation(ctx, ctx->retry.op, NULL, NULL, NULL);
+        sxi_retry_msg(sx, ctx->retry.retry, host);
         sxi_cbdata_reset(ctx);
         if (host) {
             if (!ctx->retry.cb(ctx, ctx->conns, host,
                                ctx->retry.verb, ctx->retry.query, ctx->retry.content, ctx->retry.content_size,
                                ctx->retry.setup_callback,
-                               ctx->data_cb))
+                               ctx->data_cb)) {
+                sxi_cbdata_unref(ctxptr);
                 return; /* not finished yet, context reused */
+            }
         }
         else {
-            SXDEBUG("All %d hosts returned failure, retried %d times",
+            sxi_cbdata_seterr(ctx, SXE_EAGAIN, "All %d hosts returned failure, retried %d times",
                     sxi_hostlist_get_count(&ctx->retry.hosts),
                     ctx->retry.retries);
+            sxi_retry_done(&ctx->retry.retry);
         }
     }
     } while(0);
@@ -439,9 +606,10 @@ void sxi_cbdata_finish(curl_events_t *e, curlev_context_t **ctxptr, const char *
     sxi_cbdata_unref(ctxptr);
 }
 
-typedef struct curlev {
+struct curlev {
     curlev_context_t *ctx;
     char *host;
+    sxi_ht *hosts; /* Hold information about active connections for each host */
     char *cluster;
     char *url;
     struct curl_slist *slist;
@@ -452,43 +620,58 @@ typedef struct curlev {
     enum sxi_cluster_verb verb;
     reply_t reply;
     struct curl_slist *resolve;
-} curlev_t;
+    int ssl_verified;/* 1 = OK; -1 = FAILED; 0 = not verified yet */
+    int ssl_ctx_called;
+    int is_http;
+    int verify_peer;
+    uint16_t port;
+};
 
-#define MAX_EVENTS 64
-typedef struct {
-    curlev_t *queue[MAX_EVENTS];
-    unsigned read;
-    unsigned write;
-} curlev_fifo_t;
-
-static int fifo_is_full(const curlev_fifo_t *fifo)
+static void ev_free(curlev_t *ev)
 {
-    return (fifo->write + 1) % MAX_EVENTS == fifo->read;
+    if (!ev)
+        return;
+    if (ev->slist) {
+        curl_slist_free_all(ev->slist);
+        ev->slist = NULL;
+    }
+    if (ev->resolve) {
+        curl_slist_free_all(ev->resolve);
+        ev->resolve = NULL;
+    }
+    if (ev->curl)
+        curl_easy_cleanup(ev->curl);
+    free(ev->host);
+    memset(ev, 0, sizeof(*ev));
 }
 
-static int fifo_count(const curlev_fifo_t *fifo)
+static int check_ssl_cert(curlev_t *ev)
 {
-    return (fifo->write - fifo->read) % MAX_EVENTS;
-}
+    const struct curl_tlssessioninfo *info;
+    sxi_conns_t *conns = ev->ctx ? ev->ctx->conns : NULL;
+    sxc_client_t *sx = sxi_conns_get_client(conns);
 
-static int fifo_put(curlev_fifo_t *fifo, curlev_t *ev)
-{
-    if (fifo_is_full(fifo))
-        return -1;
-    fifo->queue[fifo->write] = ev;
-    fifo->write = (fifo->write + 1) % MAX_EVENTS;
+    if (ev->is_http)
+        return 0;
+    if (!ev->ssl_ctx_called) {
+        SXDEBUG("querying TLS_SESSION");
+        const struct curl_slist *to_info = NULL;
+        CURLcode res = curl_easy_getinfo(ev->curl, CURLINFO_TLS_SESSION, &to_info);
+        memcpy(&info, &to_info, sizeof(to_info));
+        if (!res) {
+            int rc;
+            if (info->backend == CURLSSLBACKEND_NONE)
+                return 0;/* no SSL connection yet */
+            rc = sxi_sslctxfun(sx, ev, info);
+            if (rc == -EAGAIN)
+                return 0;
+            ev->ssl_ctx_called = 1;
+            if (rc)
+                return 1;
+            SXDEBUG("ctx function called");
+        }
+    }
     return 0;
-}
-
-static curlev_t *fifo_get(curlev_fifo_t *fifo)
-{
-    curlev_t *ev;
-    if (fifo->read == fifo->write)
-        return NULL;/* empty */
-    ev = fifo->queue[fifo->read];
-    fifo->queue[fifo->read] = NULL;
-    fifo->read = (fifo->read + 1) % MAX_EVENTS;
-    return ev;
 }
 
 static size_t headfn(void *ptr, size_t size, size_t nmemb, curlev_t *ev)
@@ -502,7 +685,15 @@ static size_t headfn(void *ptr, size_t size, size_t nmemb, curlev_t *ev)
 
     if (!rctx->fail && rctx->reply_status >= 400)
         rctx->fail = 1;
-    switch (ev->head(ctx->conns, ptr, size, nmemb)) {
+    if (!ev || check_ssl_cert(ev))
+        return 0;/* fail */
+    if (ev->ssl_verified < 0 && !ev->is_http) {
+        sxi_cbdata_seterr(ctx, SXE_ECURL, "SSL certificate not verified");
+        return 0;
+    }
+    if (!ev->head)
+        return size * nmemb;
+    switch (ev->head(ctx, rctx->reply_status, ptr, size, nmemb)) {
         case HEAD_SEEN:
             rctx->header_seen = 1;
             /* fall-through */
@@ -529,12 +720,12 @@ static size_t writefn(void *ptr, size_t size, size_t nmemb, void *ctxptr) {
     if(!wd->header_seen) {
 	if(wd->reply_status == 502 || wd->reply_status == 504) {
 	    /* Reply is very likely to come from a busy cluster */
-	    sxi_seterr(sx, SXE_ECOMM, "Bad cluster reply(%ld): the cluster may be under maintenance or overloaded, please try again later", wd->reply_status);
+	    sxi_cbdata_seterr(ctx, SXE_ECOMM, "Bad cluster reply(%ld): The cluster may be under maintenance or overloaded, please try again later", wd->reply_status);
 	} else if(wd->reply_status == 414) {
-	    sxi_seterr(sx, SXE_ECOMM, "URI too long: the path to the requested resource is too long");
+	    sxi_cbdata_seterr(ctx, SXE_ECOMM, "URI too long: Path to the requested resource is too long");
 	} else {
 	    /* Reply is certainly not from sx */
-	    sxi_seterr(sx, SXE_ECOMM, "The server contacted is not an SX Cluster node (http status: %ld)", wd->reply_status);
+	    sxi_cbdata_seterr(ctx, SXE_ECOMM, "The server contacted is not an SX Cluster node (http status: %ld)", wd->reply_status);
 	}
 	wd->fail = 1;
     }
@@ -563,12 +754,306 @@ static size_t writefn(void *ptr, size_t size, size_t nmemb, void *ctxptr) {
     return 0;
 }
 
+/* Hold information needed to control transfer bandwidth */
+typedef struct {
+    int64_t local_limit; /* Bandwidth limit [bytes per second] */
+    int64_t global_limit; /* Bandwidth limit for whole transfer [bytes per second] */
+} bandwidth_t;
+
+/* Maximal number of connections to be done in parallel */
+#define MAX_EVENTS                              64
+#define MAX_ACTIVE_CONNECTIONS                  5
+#define MAX_ACTIVE_PER_HOST                     2
+
+/* Hold information about active connections for each host */
+struct host_info {
+    char *host;
+    unsigned int active;
+};
+
+static struct host_info *host_active_info_new(const char *host) {
+    struct host_info *info = malloc(sizeof(struct host_info));
+    if(!info) {
+        return NULL;
+    }
+
+    info->host = strdup(host);
+    if(!info->host) {
+        free(info);
+        return NULL;
+    }
+
+    info->active = 0;
+    return info;
+}
+
+static void host_active_info_free(struct host_info* info) {
+    if(info) {
+        free(info->host);
+    }
+    free(info);
+}
+
+/* Forward declaration */
+struct ev_queue;
+
+/* Connections pool */
+typedef struct {
+    sxc_client_t *sx;
+    struct ev_queue *queue; /* Queued connections */
+    unsigned int max_active_total; /* Total number of active connections */
+    unsigned int max_active_per_host; /* Number of active connections that each node can connect */
+    curlev_t *active; /* Connections that are currently used */
+    unsigned int active_count; /* Number of active connections */
+    sxi_ht *hosts; /* Hold struct host_active_info structures */
+} connection_pool_t;
+
+struct ev_queue_node {
+    curlev_t *element;
+    struct ev_queue_node *next;
+};
+
+/* 
+ * Ivoked for each element in the list during ev_queue_get() until first matching has been found. 
+ * Element will be removed only if rm_check() returns 1. 
+ */
+typedef int (*rm_check)(const connection_pool_t *pool, const curlev_t *element);
+
+struct ev_queue {
+    struct ev_queue_node *head; /* First list element */
+    struct ev_queue_node *tail; /* Last element */
+    unsigned int length; /* Number of elements */
+    rm_check checker; /* Function used to check if element should be removed */
+    connection_pool_t *pool; /* Parent */
+};
+
+typedef struct ev_queue ev_queue_t;
+
+static ev_queue_t *ev_queue_new(connection_pool_t *pool, rm_check checker) {
+    ev_queue_t *q = NULL;
+    sxc_client_t *sx = NULL;
+
+    if(!pool) {
+        return NULL;
+    }
+    sx = pool->sx;
+
+    q = calloc(1, sizeof(*q));
+    if(!q) {
+        SXDEBUG("OOM Allocating cURL events queue");
+        return NULL;
+    }
+    q->checker = checker;
+    q->pool = pool;
+    return q;
+}
+
+/* Free events queue */
+static void ev_queue_free(ev_queue_t *q) {
+    unsigned int i;
+    struct ev_queue_node *n = NULL;
+    sxc_client_t *sx = NULL;
+
+    if(!q) 
+        return;
+        
+    sx = q->pool->sx;
+    n = q->head;
+
+    /* iterate over all elements */
+    for(i = 0; i < q->length; i++) {
+        struct ev_queue_node *next;
+
+        if(!n) {
+            /* Number of elements should be exactly the same as number of not NULL pointers */
+            SXDEBUG("Error freeing cURL events queue: invalid number of elements");
+            break;
+        }
+        next = n->next;
+
+        ev_free(n->element);
+        free(n);
+        n = next;
+    }
+
+    free(q);
+}
+
+/* Add element to events queue */
+static int ev_queue_add(ev_queue_t *q, curlev_t *element) {
+    struct ev_queue_node *n = NULL;
+    sxc_client_t *sx = NULL;
+
+    if(!q || !element) {
+        SXDEBUG("NULL argument");
+        return 1;
+    }
+    sx = q->pool->sx;
+
+    if(q->length >= MAX_EVENTS) {
+        SXDEBUG("Reachecd maximal number of events");
+        return 1;
+    }
+
+    n = calloc(1, sizeof(*n));
+    if(!n) {
+        SXDEBUG("OOM Allocating new ev_queue_node");
+        return 1;
+    }
+
+    n->element = element;
+    if(q->tail) {
+        q->tail->next = n;
+    } else {
+        /* First element in the queue */
+        q->head = n;
+    }
+    q->tail = n;
+    q->length++;
+    return 0;
+}
+
+/* Get and remove element from queue */
+static curlev_t *ev_queue_get(ev_queue_t *q) {
+    struct ev_queue_node *n = NULL; /* Current element */
+    struct ev_queue_node *p = NULL; /* Previous element */
+    unsigned int i;
+    sxc_client_t *sx = NULL;
+
+    if(!q) {
+        return NULL;
+    }
+    sx = q->pool->sx;
+
+    n = q->head;
+    for(i = 0; i < q->length; i++) {
+        if(!n) {
+            SXDEBUG("Error getting cURL events from queue: invalid number of elements");
+            return NULL;
+        }
+
+        if(!q->checker || q->checker(q->pool, n->element) == 1) {
+            curlev_t *element = n->element;
+
+            /* Remove node */
+            q->length--;
+            if(!p) {
+                /* Previous element is NULL, we are removing first element */
+                q->head = n->next;
+            } else {
+                /* Previous element is not NULL, we are removing middle or last element */
+                p->next = n->next;
+            }
+
+            if(n == q->tail) {
+                q->tail = p;
+            }
+            free(n);
+            return element;
+        } 
+
+        p = n;
+        n = n->next;
+    }
+
+    /* Element not found */
+    return NULL;
+}
+
+static int ev_queue_length(ev_queue_t *q) {
+    if(!q) {
+        return 0;
+    }
+
+    return q->length;
+}
+
+/* Return 1 if cURL event destination host hold less than pool->max_active_per_host */
+static int check_host_active_count(const connection_pool_t *pool,  const curlev_t *ev) {
+    struct host_info *host = NULL;
+
+    if(!ev) {
+        return 0;
+    }
+
+    if(sxi_ht_get(ev->hosts, (void*)ev->host, strlen(ev->host), (void **)&host) || !host) {
+        /* Could not get host info, this is an error, return -1 */
+        return -1;
+    }
+
+    return host->active < pool->max_active_per_host ? 1 : 0;
+}
+
+/* Get new connection pool instance */
+static connection_pool_t *connection_pool_new(sxc_client_t *sx) {
+    connection_pool_t *pool = NULL;
+
+    if(!sx) {
+        return NULL;
+    }
+
+    pool = calloc(1, sizeof(*pool));
+    if(!pool) {
+        return NULL;
+    }
+
+    pool->sx = sx;
+    pool->max_active_total = MAX_ACTIVE_CONNECTIONS;
+    pool->max_active_per_host = MAX_ACTIVE_PER_HOST;
+
+    pool->active = calloc(MAX_EVENTS, sizeof(*pool->active));
+    if(!pool->active) {
+        SXDEBUG("OOM Could not allocate array of events");
+        free(pool);
+        return NULL;
+    }
+
+    pool->queue = ev_queue_new(pool, check_host_active_count);
+    if(!pool->queue) {
+        SXDEBUG("OOM Could not allocate queue");
+        free(pool->active);
+        free(pool);
+        return NULL;
+    }
+
+    pool->hosts = sxi_ht_new(sx, 64);
+    if(!pool->hosts) {
+        SXDEBUG("OOM Could not allocate hosts hash table");
+        ev_queue_free(pool->queue);
+        free(pool->active);
+        free(pool);
+        return NULL;
+    }
+
+    return pool;
+}
+
+/* Free connections pool */
+static void connection_pool_free(connection_pool_t *pool) {
+    unsigned int i = 0;
+    struct host_info *info = NULL;
+    if(!pool)
+        return;
+
+    for(i = 0; i < MAX_EVENTS; i++) {
+        ev_free(&pool->active[i]);
+    }
+
+    ev_queue_free(pool->queue);
+
+    sxi_ht_enum_reset(pool->hosts);
+    while(!sxi_ht_enum_getnext(pool->hosts, NULL, NULL, (const void **)&info)) {
+        host_active_info_free(info);
+    }
+    sxi_ht_free(pool->hosts);
+    free(pool->active);
+    free(pool);
+}
 
 /* to avoid using too much memory */
 struct curl_events {
     CURLM *multi;
     CURLSH *share;
-    sxi_ht *hosts_map;
     sxi_conns_t *conns;
     int running;
     int verbose;
@@ -576,46 +1061,154 @@ struct curl_events {
     int depth;
     int added_notpolled;
     const char *cafile;
-    const char *defaultcafile;
     char *savefile;
     int saved, quiet;
-    X509 *servercert;
+    int disable_proxy;
+
+    /* Connections pool handle connections shared between hosts */
+    connection_pool_t *conn_pool;
+
+    /* Used for bandwidth throttling */
+    bandwidth_t bandwidth;
 };
 
-#define MAX_ACTIVE_PER_HOST 2
-struct host_info {
-    int active;
-    curlev_fifo_t fifo;
-    curlev_t reuse[MAX_ACTIVE_PER_HOST];
-};
+/* Nullify context for each curlev_t element from active and inactive cURL events */
+void sxi_curlev_nullify_upload_context(sxi_conns_t *conns, void *ctx) {
+    unsigned int i;
+    connection_pool_t *pool;
+    struct ev_queue_node *n;
+    curl_events_t *e;
+    if(!ctx || !conns)
+        return;
+    e = sxi_conns_get_curlev(conns);
+    if(!e)
+        return;
+    pool = e->conn_pool;
+    if(!pool || !pool->queue)
+        return;
+
+    for(i = 0; i < MAX_EVENTS; i++) {
+        curlev_context_t *c = pool->active[i].ctx;
+        if(!c)
+            continue;
+        switch(c->tag) {
+            case CTX_UPLOAD_HOST:
+                if(c->u.host_ctx == ctx)
+                    c->u.host_ctx = NULL;
+                break;
+            case CTX_DOWNLOAD:
+                if(c->u.download_ctx == ctx)
+                    c->u.download_ctx = NULL;
+                break;
+            default: 
+                break;
+        }
+    }
+
+    n = pool->queue->head;
+
+    /* iterate over all elements and nullify context */
+    while(n) {
+        if(n->element && n->element->ctx) {
+            curlev_context_t *c = n->element->ctx;
+            switch(c->tag) {
+                case CTX_UPLOAD_HOST:
+                    if(c->u.host_ctx == ctx)
+                        c->u.host_ctx = NULL;
+                    break;
+                case CTX_DOWNLOAD:
+                    if(c->u.download_ctx == ctx)
+                        c->u.download_ctx = NULL;
+                    break;
+                default: 
+                    break;
+            }
+        }
+        n = n->next;
+    }
+}
 
 static void ctx_err(curlev_context_t *ctx, CURLcode rc, const char *msg)
 {
     if (!ctx)
         return;
     ctx->recv_ctx.rc = rc;
-    strncpy(ctx->recv_ctx.errbuf, msg, sizeof(ctx->recv_ctx.errbuf)-1);
-    if (ctx->conns) {
-        sxc_client_t *sx = sxi_conns_get_client(ctx->conns);
-        if (sx) {
-            SXDEBUG("ev_add: %s", msg);
-            sxi_seterr(sx, SXE_EARG, "ev_add: bad argument");
-        }
-    }
+    sxi_strlcpy(ctx->recv_ctx.errbuf, msg, sizeof(ctx->recv_ctx.errbuf));
+    sxi_cbdata_seterr(ctx, SXE_EARG, "ev_add: bad argument");
 }
-
 
 #define EVENTSDEBUG(e, ...) do {\
     if (e && e->conns) {\
-        sxc_client_t *sx = sxi_conns_get_client(e->conns); \
-        SXDEBUG(__VA_ARGS__);\
+        sxc_client_t *_sx = sxi_conns_get_client(e->conns); \
+	sxi_debug(_sx, __FUNCTION__, __VA_ARGS__);\
     }} while (0)
 
 #define EVDEBUG(ev, ...) do {\
     if (ev && ev->ctx && ev->ctx->conns) {\
-        sxc_client_t *sx = sxi_conns_get_client(ev->ctx->conns); \
-        SXDEBUG(__VA_ARGS__);\
+        sxc_client_t *_sx = sxi_conns_get_client(ev->ctx->conns); \
+	sxi_debug(_sx, __FUNCTION__, __VA_ARGS__);\
     }} while (0)
+
+int sxi_curlev_set_bandwidth_limit(curl_events_t *e, int64_t global_bandwidth_limit, unsigned int running) {
+    if(!e) {
+        EVENTSDEBUG(e, "Could not set bandwidth limit, NULL argument");
+        return 1;
+    }
+
+    /* Bandwidth limitation for whole process */
+    e->bandwidth.global_limit = global_bandwidth_limit;
+
+    /* Divide global bandwidth limit by up to that it can be set for each transfer */
+    if(running && running < e->conn_pool->max_active_total)
+        e->bandwidth.local_limit = global_bandwidth_limit / running; 
+    else if(running)
+        e->bandwidth.local_limit = global_bandwidth_limit / e->conn_pool->max_active_total;
+    else
+        e->bandwidth.local_limit = global_bandwidth_limit;
+
+    return 0;
+}
+
+int64_t sxi_curlev_get_bandwidth_limit(const curl_events_t *e) {
+    if(!e) {
+        EVENTSDEBUG(e, "Could not get bandwidth limit, NULL argument");
+        return -1;
+    }
+
+    return e->bandwidth.local_limit;
+}
+
+static int queue_next_inactive(curl_events_t *e);
+int sxi_curlev_set_conns_limit(curl_events_t *e, unsigned int max_active, unsigned int max_active_per_host) {
+    if(!e)
+        return 1;
+
+    /* Check and fallback to defaults if necessary */
+    if(!max_active) max_active = MAX_ACTIVE_CONNECTIONS;
+    if(!max_active_per_host) max_active_per_host = MAX_ACTIVE_PER_HOST;
+
+    e->conn_pool->max_active_per_host = max_active_per_host;
+    /* 
+     * If maximal number of running connections is not increased, simply wait for current
+     * connections to finish. 
+     */
+    if(max_active > e->conn_pool->max_active_total) {
+        int ret = 0;
+        /*
+         * Maximal number of running connections has been increased, we have to dequeue existing
+         * but not running connections.
+         */
+        e->conn_pool->max_active_total = max_active;
+        while(e->conn_pool->active_count < e->conn_pool->max_active_total) {
+            ret = queue_next_inactive(e);
+            if(!ret) /* This happens if no events are queued or all events reached per-host limit */
+                break;
+        }
+    } else {
+        e->conn_pool->max_active_total = max_active;
+    }
+    return 0;
+}
 
 static int curl_check(curlev_t *e, CURLcode code, const char *msg)
 {
@@ -632,8 +1225,8 @@ static int curlm_check(curlev_t *ev, CURLMcode code, const char *msg)
     if (code != CURLM_OK && code != CURLM_CALL_MULTI_PERFORM) {
         EVDEBUG(ev, "WARNING: curl multi %s: %s\n", msg,
                 curl_multi_strerror(code));
-        if (ev && ev->ctx && ev->ctx->conns)
-            sxi_seterr(sxi_conns_get_client(ev->ctx->conns), SXE_ECURL, "curl multi failed: %s, %s",
+        if (ev && ev->ctx)
+            sxi_cbdata_seterr(ev->ctx, SXE_ECURL, "curl multi failed: %s, %s",
                        curl_multi_strerror(code), ev->ctx->recv_ctx.errbuf);
         return -1;
     }
@@ -650,40 +1243,6 @@ static int curlsh_check(curl_events_t *e, CURLSHcode code)
     return 0;
 }
 
-static void ev_free(curlev_t *ev)
-{
-    if (!ev)
-        return;
-    if (ev->slist) {
-        curl_slist_free_all(ev->slist);
-        ev->slist = NULL;
-    }
-    if (ev->resolve) {
-        curl_slist_free_all(ev->resolve);
-        ev->resolve = NULL;
-    }
-    if (ev->curl)
-        curl_easy_cleanup(ev->curl);
-    free(ev->host);
-    memset(ev, 0, sizeof(*ev));
-}
-
-static int info_free(curl_events_t *e, struct host_info *info)
-{
-    unsigned i;
-
-    if (!info) {
-        return 0;
-    }
-    for (i=0;i<MAX_ACTIVE_PER_HOST;i++) {
-        ev_free(&info->reuse[i]);
-    }
-    for (i=0;i<MAX_EVENTS;i++)
-        ev_free(info->fifo.queue[i]);
-    free(info);
-    return 0;
-}
-
 void sxi_curlev_done(curl_events_t **c)
 {
     curl_events_t *e = c ? *c : NULL;
@@ -692,6 +1251,7 @@ void sxi_curlev_done(curl_events_t **c)
     if (e->used) {
         EVENTSDEBUG(e, "Leaked %d curl events!!", e->used);
     }
+    connection_pool_free(e->conn_pool);
     if (e->multi) {
         CURL *dummy;
         /* curl 7.29.0 bug: NULL dereference if multi handle has never seen an
@@ -705,45 +1265,13 @@ void sxi_curlev_done(curl_events_t **c)
         curlm_check(NULL, curl_multi_cleanup(e->multi), "cleanup");
         e->multi = NULL;
     }
-    if (e->hosts_map) {
-        struct host_info *info;
-        const void *host;
-        unsigned host_len;
-        /* TODO: iterate */
-        while (!sxi_ht_enum_getnext(e->hosts_map, &host, &host_len, (const void**)&info)) {
-            info_free(e, info);
-        }
-        sxi_ht_free(e->hosts_map);
-        e->hosts_map = NULL;
-    }
     if (e->share) {
         curlsh_check(e, curl_share_cleanup(e->share));
         e->share = NULL;
     }
-    free(e->servercert);
     free(e->savefile);
     free(e);
     *c = NULL;
-}
-
-static const char *get_default_cafile(sxc_client_t *sx)
-{
-    /* curl determines this at configure time, but if we ship
-     * a single binary we have to detect at runtime */
-    unsigned i;
-    const char *default_ca_files[] = {
-        "/etc/ssl/certs/ca-certificates.crt",
-        "/etc/pki/tls/certs/ca-bundle.crt",
-        "/usr/share/ssl/certs/ca-bundle.crt"
-    };
-    for (i=0; i<sizeof(default_ca_files)/sizeof(default_ca_files[0]);i++) {
-        const char *path = default_ca_files[i];
-        if (access(path, R_OK) == 0) {
-            SXDEBUG("Default CA file: %s", path);
-            return path;
-        }
-    }
-    return "";
 }
 
 curl_events_t *sxi_curlev_init(sxi_conns_t *conns)
@@ -754,11 +1282,8 @@ curl_events_t *sxi_curlev_init(sxi_conns_t *conns)
 
     x->conns = conns;
     do {
-        x->defaultcafile = get_default_cafile(sxi_conns_get_client(conns));
         x->cafile = "";/* verify with default root CAs */
         if (!(x->share = curl_share_init()))
-            break;
-        if (!(x->hosts_map = sxi_ht_new(sxi_conns_get_client(conns), 64)))
             break;
         if (!(x->multi = curl_multi_init()))
             break;
@@ -782,6 +1307,15 @@ curl_events_t *sxi_curlev_init(sxi_conns_t *conns)
         if (curlm_check(NULL, rc2, "set maxconnects") == -1)
             break;
 #endif
+
+        x->conn_pool = connection_pool_new(sxi_conns_get_client(conns));
+        if(!x->conn_pool) {
+            break;
+        }
+        /* Initialize bandwidth limit information */
+        x->bandwidth.global_limit = 0;
+        x->bandwidth.local_limit = 0;
+
         return x;
     } while(0);
     sxi_curlev_done(&x);
@@ -911,7 +1445,7 @@ static int set_headers(curl_events_t *e, curlev_t *ev, const header_t *headers, 
         slist_next = curl_slist_append(ev->slist, header);
         if (!slist_next) {
             curl_slist_free_all(ev->slist);
-            ctx_err(ev->ctx, CURLE_OUT_OF_MEMORY, "curl_slist_append: out of memory");
+            ctx_err(ev->ctx, CURLE_OUT_OF_MEMORY, "curl_slist_append: Out of memory");
             ev->slist = NULL;
             return -1;
         }
@@ -933,6 +1467,110 @@ static int sockoptfn(void *clientp, curl_socket_t curlfd, curlsocktype purpose)
 #if ERRBUF_SIZE < CURL_ERROR_SIZE
 #error "errbuf too small: ERRBUF_SIZE < CURL_ERROR_SIZE"
 #endif
+
+static int curlev_update_bandwidth_limit(curlev_t *ev) {
+    curl_events_t *e;
+    int rc;
+    if(!ev || !ev->ctx)
+        return 1;
+
+    e = sxi_conns_get_curlev(ev->ctx->conns);
+    if(!e)
+        return 1;
+
+    if(e->bandwidth.global_limit) {
+        rc = curl_easy_setopt(ev->curl, CURLOPT_MAX_SEND_SPEED_LARGE, e->bandwidth.local_limit);
+        if (curl_check(ev,rc, "set CURLOPT_MAX_SEND_SPEED_LARGE") == -1) {
+            EVDEBUG(ev, "Could not set CURL max send seed");
+            return 1;
+        }
+
+        rc = curl_easy_setopt(ev->curl, CURLOPT_MAX_RECV_SPEED_LARGE, e->bandwidth.local_limit);
+        if (curl_check(ev,rc, "set CURLOPT_MAX_RECV_SPEED_LARGE") == -1) {
+            EVDEBUG(ev, "Could not set CURL max recv seed");
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static int xferinfo(void *p, curl_off_t dltotal, curl_off_t dlnow,
+                    curl_off_t ultotal, curl_off_t ulnow)
+{
+    curlev_t *ev = p;
+    int err = SXE_ABORT;
+    sxc_client_t *sx;
+    double dl_speed = 0;
+    double ul_speed = 0;
+    curl_events_t *e;
+
+    if (!ev || check_ssl_cert(ev))
+        return -1;
+
+    if(!ev || !ev->ctx) /* Not an error, context could be disabled */
+        return 0;
+
+    e = sxi_conns_get_curlev(ev->ctx->conns);
+    sx = sxi_conns_get_client(ev->ctx->conns);
+
+    /* If we want to abort transfers, other cURL transfers will be killed now */
+    if(sxc_geterrnum(sx) == SXE_ABORT)
+        return 1;
+
+    switch(ev->ctx->tag) {
+        case CTX_DOWNLOAD: {
+            if(!e || (e->bandwidth.global_limit && curl_easy_getinfo(ev->curl, CURLINFO_SPEED_DOWNLOAD, &dl_speed) != CURLE_OK)) {
+                err = SXE_ECURL;
+            } else {
+                err = sxi_file_download_set_xfer_stat(ev->ctx->u.download_ctx, dlnow, dltotal);
+                if(e->bandwidth.global_limit && dl_speed * e->running > e->bandwidth.global_limit * 1.2)
+                    curlev_update_bandwidth_limit(ev);
+            }
+        } break;
+
+        case CTX_UPLOAD_HOST: {
+            if(!e || (e->bandwidth.global_limit && curl_easy_getinfo(ev->curl, CURLINFO_SPEED_UPLOAD, &ul_speed) != CURLE_OK)) {
+                err = SXE_ECURL;
+            } else {
+                err = sxi_host_upload_set_xfer_stat(ev->ctx->u.host_ctx, ulnow, ultotal);
+                if(e->bandwidth.global_limit && ul_speed * e->running > e->bandwidth.global_limit * 1.2)
+                    curlev_update_bandwidth_limit(ev);
+            }
+        } break;
+
+        case CTX_GENERIC: {
+            if(!e || (e->bandwidth.global_limit && (curl_easy_getinfo(ev->curl, CURLINFO_SPEED_DOWNLOAD, &dl_speed) != CURLE_OK ||
+               curl_easy_getinfo(ev->curl, CURLINFO_SPEED_UPLOAD, &ul_speed) != CURLE_OK))) {
+                err = SXE_ECURL;
+            } else {
+                err = sxi_generic_set_xfer_stat(ev->ctx->u.generic_ctx, dlnow, dltotal, ulnow, ultotal);
+                if(e->bandwidth.global_limit && (dl_speed * e->running > e->bandwidth.global_limit * 1.2 ||
+                   ul_speed * e->running > e->bandwidth.global_limit * 1.2))
+                    curlev_update_bandwidth_limit(ev);
+            }
+        } break;
+
+        case CTX_HASHOP:
+        case CTX_JOB:
+        case CTX_UPLOAD: {
+            /* Do nothing simply assign error value as no error */
+            err = SXE_NOERROR;
+        }
+    }
+
+    if(err != SXE_NOERROR) {
+        /* Set error message */
+        if(err == SXE_ABORT)
+            sxi_cbdata_seterr(ev->ctx, err, "Transfer aborted");
+        else
+            sxi_cbdata_seterr(ev->ctx, err, "Could not update progress information");
+
+        /* This stops transfer and causes libcurl to fail */
+        return 1;
+    }
+    return 0;
+}
 
 static int easy_set_default_opt(curl_events_t *e, curlev_t *ev)
 {
@@ -990,14 +1628,24 @@ static int easy_set_default_opt(curl_events_t *e, curlev_t *ev)
     if (curl_check(ev,rc,"set SSL_VERIFYHOST") == -1)
         return -1;
 
-    if (e->cafile && !*e->cafile)
-        e->cafile = e->defaultcafile;
+    /* used for SSL hostname validation with NSS (since we turned off VERIFY_HOST),
+        * and (in the future) for transfer timeouts */
+    curl_easy_setopt(ev->curl, CURLOPT_XFERINFOFUNCTION, xferinfo);
+    curl_easy_setopt(ev->curl, CURLOPT_XFERINFODATA, ev);
+    curl_easy_setopt(ev->curl, CURLOPT_NOPROGRESS, 0L);
+
     if (e->cafile && *e->cafile) {
         rc = curl_easy_setopt(curl, CURLOPT_CAINFO, e->cafile);
         if (curl_check(ev, rc, "set CURLOPT_CAINFO") == -1)
             return -1;
-        rc = curl_easy_setopt(curl, CURLOPT_CAPATH, "/");
+        rc = curl_easy_setopt(curl, CURLOPT_CAPATH, NULL);
         if (curl_check(ev, rc, "set CURLOPT_CAPATH") == -1)
+            return -1;
+    }
+
+    if (e->disable_proxy) {
+        rc = curl_easy_setopt(curl, CURLOPT_PROXY, "");
+        if (curl_check(ev, rc, "set CURLOPT_PROXY") == -1)
             return -1;
     }
 
@@ -1006,154 +1654,36 @@ static int easy_set_default_opt(curl_events_t *e, curlev_t *ev)
     if (curl_check(ev,rc,"set sockoptfn") == -1)
         return -1;
 #endif
+    ev->verify_peer = 1;
     return 0;
 }
 
 typedef size_t (*write_cb_t)(char *ptr, size_t size, size_t nmemb, void *ctx);
 
-static struct host_info *get_host(curl_events_t *e, const char *host)
-{
-    struct host_info *info = NULL;
-    if (sxi_ht_get(e->hosts_map, host, strlen(host)+1, (void**)&info) || !info) {
-        info = calloc(1, sizeof(*info));
-        if (sxi_ht_add(e->hosts_map, host, strlen(host)+1, info)) {
-            /* it failed */
-            free(info);
-            return NULL;
-        }
-    }
-    return info;
-}
-
-static int ask_trust(sxc_client_t *sx, const char *cafile, X509 *x)
-{
-    if (cafile && *cafile) {
-        sxi_print_old_certificate_info(sx, cafile);
-        sxi_notice(sx, "The new CA certificate is:");
-    } else
-        sxi_notice(sx, "Warning: self-signed certificate:\n");
-    sxi_print_certificate_info(sx, x);
-
-    return sxi_confirm(sx, "Do you trust this SSL certificate?", 0) ? 0 : -1;
-}
-
-static const char *ssl_err(void)
-{
-    const char *s = ERR_reason_error_string(ERR_get_error());
-    return s ? s : "";
-}
-
-static int ssl_get_CA_cert(X509_STORE_CTX *ctx, void *arg)
-{
-    STACK_OF(X509) *sk;
-    int err, last_cert, ok;
-    BIO *out;
-    X509 *x;
-    curl_events_t *e = arg;
-    sxc_client_t *sx = sxi_conns_get_client(e->conns);
-    const char *name;
-    struct stat sb;
-
-    ok = X509_verify_cert(ctx);
-    sk = X509_STORE_CTX_get_chain(ctx);
-    if (!ok) {
-        err = X509_STORE_CTX_get_error(ctx);
-        if (e->savefile && (err == X509_V_ERR_SELF_SIGNED_CERT_IN_CHAIN || err == X509_V_ERR_DEPTH_ZERO_SELF_SIGNED_CERT)) {
-	    if(!e->quiet) {
-		if (ask_trust(sx, e->cafile, sk_X509_value(sk, 0)) == -1) {
-		    sxi_notice(sx, "Not trusting certificate");
-		    return 0;
-		}
-		sxi_notice(sx, "Trusting self-signed certificate");
-	    }
-            X509_STORE_CTX_set_error(ctx,X509_V_OK);
-        } else {
-            SXDEBUG("Failed to verify SSL certificate: %s\n", X509_verify_cert_error_string(err));
-            return 0;
-        }
-    }
-    if (!sk) {
-        sxi_seterr(sx, SXE_ECOMM, "No certificate chain?");
-        return 0;
-    }
-    x = sk_X509_value(sk, 0);
-    name = sxi_conns_get_sslname(e->conns) ? sxi_conns_get_sslname(e->conns) : sxi_conns_get_dnsname(e->conns);
-    if (sxi_verifyhost(sx, name, x) != CURLE_OK) {
-        if (!e->cafile) {
-            sxi_notice(sx, "Ignoring %s!", sxc_geterrmsg(sx));
-            return 1;
-        }
-        sxi_seterr(sx, SXE_ECOMM, "Hostname mismatch in certificate, expected: \"%s\"", name);
-        X509_STORE_CTX_set_error(ctx,X509_V_ERR_APPLICATION_VERIFICATION);
-        return 0;
-    }
-    if (!e->savefile)
-        return 1;
-    last_cert = sk_X509_num(sk) - 1;
-    if (last_cert < 0 || !(x = sk_X509_value(sk, last_cert))) {
-        sxi_seterr(sx, SXE_ECOMM, "Cannot retrieve root cert");
-        return 0;
-    }
-    ERR_clear_error();
-    if (!(out = BIO_new_file(e->savefile,"w"))) {
-        sxi_seterr(sx, SXE_EWRITE, "Cannot open file '%s' for writing: %s", e->savefile, ssl_err());
-        return 0;
-    }
-    if (!PEM_write_bio_X509(out, x)) {
-        sxi_seterr(sx, SXE_EWRITE, "Cannot write certificate to '%s': %s", e->savefile, ssl_err());
-        return 0;
-    }
-    if (!BIO_free(out)) {
-        sxi_seterr(sx, SXE_EWRITE, "Cannot close file '%s': %s", e->savefile, ssl_err());
-        return 0;
-    }
-    if (stat(e->savefile, &sb) == -1 || !sb.st_size) {
-        sxi_seterr(sx, SXE_EWRITE, "Cannot save certificate to file: %s", e->savefile);
-        return 0;
-    }
-    e->saved = 1;
-    SXDEBUG("root CA saved to %s", e->savefile);
-    return 1;/* ok */
-}
-
-static CURLcode sslctxfun_save_rootCA(CURL *curl, void *sslctx, void *parm)
-{
-    SSL_CTX *ctx = (SSL_CTX*)sslctx;
-    SSL_CTX_set_default_verify_paths(ctx);
-    SSL_CTX_set_cert_verify_callback(ctx, ssl_get_CA_cert, parm);
-    return CURLE_OK;
-}
-
-static void resolve(curlev_t *ev, const char *host)
+static void resolve(curlev_t *ev, const char *host, uint16_t port)
 {
 #if LIBCURL_VERSION_NUM >= 0x071503
     if (!ev || !host)
         return;
-    struct curl_slist *slist = NULL, *slist2 = NULL;
-    unsigned len = strlen(host) * 2 + 6;
+    struct curl_slist *slist;
+    unsigned len = strlen(host) * 2 + sizeof(":65535:");
     char *res = malloc(len);
     if (!res)
         return;
     /* avoid getaddrinfo */
-    snprintf(res, len, "%s:80:%s", host, host);
-    slist = curl_slist_append(slist, res);
-    if (!slist) {
-        free(res);
-        return;
-    }
-    snprintf(res, len, "%s:443:%s", host, host);
-    slist2 = curl_slist_append(slist, res);
+    snprintf(res, len, "%s:%u:%s", host, port, host);
+    slist = curl_slist_append(NULL, res);
     free(res);
-    if (!slist2) {
-        curl_slist_free_all(slist);
+    if (!slist)
         return;
-    }
-    ev->resolve = slist2;
+
+    ev->resolve = slist;
     curl_easy_setopt(ev->curl, CURLOPT_RESOLVE, ev->resolve);
 #endif
 }
 
 static int compute_headers_url(curl_events_t *e, curlev_t *ev, curlev_t *src);
+
 static int curlev_apply(curl_events_t *e, curlev_t *ev, curlev_t *src)
 {
     CURLcode rc;
@@ -1183,10 +1713,11 @@ static int curlev_apply(curl_events_t *e, curlev_t *ev, curlev_t *src)
             return -1;
         }
     }
+
     ev->curl = handle;
     do {
 	unsigned int contimeout;
-        resolve(ev, src->host);
+        resolve(ev, src->host, src->port);
         if (compute_headers_url(e, ev, src) == -1) {
             EVDEBUG(ev, "compute_headers_url failed");
             break;
@@ -1208,13 +1739,6 @@ static int curlev_apply(curl_events_t *e, curlev_t *ev, curlev_t *src)
 	    break;
 #endif
 
-        /* TODO: only if we're in ssl mode */
-        rc = curl_easy_setopt(ev->curl, CURLOPT_SSL_CTX_FUNCTION, sslctxfun_save_rootCA);
-        if (curl_check(ev, rc, "set CURLOPT_SSL_CTX_FUNCTION") == -1)
-            break;
-        rc = curl_easy_setopt(ev->curl, CURLOPT_SSL_CTX_DATA, e);
-        if (curl_check(ev, rc, "set CURLOPT_SSL_CTX_DATA") == -1)
-            break;
         rc = curl_easy_setopt(ev->curl, CURLOPT_PRIVATE, ev);
         if (curl_check(ev,rc,"set PRIVATE") == -1)
             break;
@@ -1264,6 +1788,22 @@ static int curlev_apply(curl_events_t *e, curlev_t *ev, curlev_t *src)
         rc = curl_easy_setopt(ev->curl, CURLOPT_HTTPHEADER, ev->slist);
         if (curl_check(ev, rc, "set headers"))
             break;
+        ev->ssl_verified = ev->ssl_ctx_called = 0;
+
+        if(e->bandwidth.global_limit) {
+            rc = curl_easy_setopt(ev->curl, CURLOPT_MAX_SEND_SPEED_LARGE, e->bandwidth.local_limit);
+            if (curl_check(ev,rc, "set CURLOPT_MAX_SEND_SPEED_LARGE") == -1) {
+                EVDEBUG(ev, "Could not set CURL max send seed");
+                break;
+            }
+
+            rc = curl_easy_setopt(ev->curl, CURLOPT_MAX_RECV_SPEED_LARGE, e->bandwidth.local_limit);
+            if (curl_check(ev,rc, "set CURLOPT_MAX_RECV_SPEED_LARGE") == -1) {
+                EVDEBUG(ev, "Could not set CURL max send seed");
+                break;
+            }
+        }
+
         ret = 0;
     } while(0);
     free(src->url);
@@ -1272,31 +1812,20 @@ static int curlev_apply(curl_events_t *e, curlev_t *ev, curlev_t *src)
     return ret;
 }
 
-static int hmac_update_str(sxc_client_t *sx, HMAC_CTX *ctx, const char *str) {
-    int r = sxi_hmac_update(ctx, (unsigned char *)str, strlen(str));
-    if(r)
-	r = sxi_hmac_update(ctx, (unsigned char *)"\n", 1);
-    if(!r) {
-	SXDEBUG("hmac_update failed for '%s'", str);
-	sxi_seterr(sx, SXE_ECRYPT, "Cluster query failed: HMAC calculation failed");
-    }
-    return r;
-}
-
-static int compute_date(sxc_client_t *sx, char buf[32], time_t diff, HMAC_CTX *hmac_ctx) {
+static int compute_date(curlev_context_t *cbdata, char buf[32], time_t diff, sxi_hmac_sha1_ctx *hmac_ctx) {
     const char *month[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
     const char *wkday[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
     time_t t = time(NULL) + diff;
     struct tm ts;
 
     if(!gmtime_r(&t, &ts)) {
-	SXDEBUG("failed to get time");
-	sxi_seterr(sx, SXE_EARG, "Cannot get current time: invalid argument");
+	CBDATADEBUG("failed to get time");
+	sxi_cbdata_seterr(cbdata, SXE_EARG, "Cannot get current time: Invalid argument");
 	return -1;
     }
     sprintf(buf, "%s, %02u %s %04u %02u:%02u:%02u GMT", wkday[ts.tm_wday], ts.tm_mday, month[ts.tm_mon], ts.tm_year + 1900, ts.tm_hour, ts.tm_min, ts.tm_sec);
 
-    if(!hmac_update_str(sx, hmac_ctx, buf))
+    if(!sxi_hmac_sha1_update_str(hmac_ctx, buf))
 	return -1;
     return 0;
 }
@@ -1326,7 +1855,7 @@ static int compute_headers_url(curl_events_t *e, curlev_t *ev, curlev_t *src)
     char datebuf[32];
     unsigned content_size;
     unsigned int keylen;
-    HMAC_CTX hmac_ctx;
+    sxi_hmac_sha1_ctx *hmac_ctx = NULL;
     sxi_conns_t *conns;
     sxc_client_t *sx;
     int rc;
@@ -1346,13 +1875,15 @@ static int compute_headers_url(curl_events_t *e, curlev_t *ev, curlev_t *src)
     sx = sxi_conns_get_client(conns);
     /* we sign request as late as possible to avoid
      * clock drift errors from the server */
-    HMAC_CTX_init(&hmac_ctx);
     do {
         const char *verb = verbstr(src->verb);
         const char *token = sxi_conns_get_auth(e->conns);
         const char *query;
         char *url;
 	rc = -1;
+        hmac_ctx = sxi_hmac_sha1_init();
+        if (!hmac_ctx)
+            break;
 
         content_size = src->body.size;
         content = src->body.data;
@@ -1369,71 +1900,84 @@ static int compute_headers_url(curl_events_t *e, curlev_t *ev, curlev_t *src)
         if (curl_check(ev, rc, "get URL"))
             break;
 
-        if (!strncmp(url, "http://", 7))
+        rc = -1;
+        if (!strncmp(url, "http://", 7)) {
             query = url + 7;
-        else if(!strncmp(url, "https://", 8))
+            ev->is_http = 1;
+        } else if(!strncmp(url, "https://", 8)) {
             query = url + 8;
-        else {
-            conns_err(SXE_EARG, "Invalid URL: %s", url);
+        } else {
+            sxi_cbdata_seterr(ev->ctx, SXE_EARG, "Invalid URL: %s", url);
             break;
         }
         query = strchr(query, '/');
         if (!query) {
-            conns_err(SXE_EARG, "Cluster query failed: Bad URL");
+            sxi_cbdata_seterr(ev->ctx, SXE_EARG, "Cluster query failed: Bad URL");
             break;
         }
         query++;
         if(sxi_b64_dec(sx, token, bintoken, &keylen) || keylen != AUTHTOK_BIN_LEN) {
             EVDEBUG(ev, "failed to decode the auth token");
-            conns_err(SXE_EAUTH, "Cluster query failed: invalid authentication token");
+            sxi_cbdata_restore_global_error(sx, ev->ctx);
             break;
         }
 
-        if(!sxi_hmac_init_ex(&hmac_ctx, bintoken + AUTH_UID_LEN, AUTH_KEY_LEN, EVP_sha1(), NULL)) {
+        if(!sxi_hmac_sha1_init_ex(hmac_ctx, bintoken + AUTH_UID_LEN, AUTH_KEY_LEN)) {
 	    EVDEBUG(ev, "failed to init hmac context");
-	    conns_err(SXE_ECRYPT, "Cluster query failed: HMAC calculation failed");
+	    sxi_cbdata_seterr(ev->ctx, SXE_ECRYPT, "Cluster query failed: HMAC calculation failed");
 	    break;
 	}
 
-	if(!hmac_update_str(sx, &hmac_ctx, verb) || !hmac_update_str(sx, &hmac_ctx, query))
+	if(!sxi_hmac_sha1_update_str(hmac_ctx, verb) || !sxi_hmac_sha1_update_str(hmac_ctx, query)) {
+            sxi_cbdata_seterr(ev->ctx, SXE_ECRYPT, "Cluster query failed: HMAC calculation failed");
 	    break;
+        }
 
-	if (compute_date(sx, datebuf, sxi_conns_get_timediff(e->conns), &hmac_ctx) == -1)
+	if (compute_date(ev->ctx, datebuf, sxi_conns_get_timediff(e->conns), hmac_ctx) == -1) {
+            sxi_cbdata_seterr(ev->ctx, SXE_ECRYPT, "Cluster query failed: Failed to compute date");
 	    break;
+        }
+
 	if(content_size) {
 	    char content_hash[41];
 	    unsigned char d[20];
-	    EVP_MD_CTX ch_ctx;
+            sxi_md_ctx *ch_ctx = sxi_md_init();
 
-	    if(!EVP_DigestInit(&ch_ctx, EVP_sha1())) {
+            if (!sxi_sha1_init(ch_ctx)) {
 		EVDEBUG(ev, "failed to init content digest");
-		conns_err(SXE_ECRYPT, "Cannot compute hash: unable to initialize crypto library");
+                sxi_md_cleanup(&ch_ctx);
+		sxi_cbdata_seterr(ev->ctx, SXE_ECRYPT, "Cannot compute hash: Unable to initialize crypto library");
 		break;
 	    }
-	    if(!EVP_DigestUpdate(&ch_ctx, content, content_size) || !EVP_DigestFinal(&ch_ctx, d, NULL)) {
+            if (!sxi_sha1_update(ch_ctx, content, content_size) || !sxi_sha1_final(ch_ctx, d, NULL)) {
 		EVDEBUG(ev, "failed to update content digest");
-		conns_err(SXE_ECRYPT, "Cannot compute hash: crypto library failure");
-		EVP_MD_CTX_cleanup(&ch_ctx);
+		sxi_cbdata_seterr(ev->ctx, SXE_ECRYPT, "Cannot compute hash: Crypto library failure");
+                sxi_md_cleanup(&ch_ctx);
 		break;
 	    }
-	    EVP_MD_CTX_cleanup(&ch_ctx);
+            sxi_md_cleanup(&ch_ctx);
 
 	    sxi_bin2hex(d, sizeof(d), content_hash);
 	    content_hash[sizeof(content_hash)-1] = '\0';
 
-	    if(!hmac_update_str(sx, &hmac_ctx, content_hash))
+	    if(!sxi_hmac_sha1_update_str(hmac_ctx, content_hash)) {
+                sxi_cbdata_seterr(ev->ctx, SXE_ECRYPT, "Cluster query failed: HMAC calculation failed");
 		break;
-	} else if(!hmac_update_str(sx, &hmac_ctx, "da39a3ee5e6b4b0d3255bfef95601890afd80709"))
+            }
+	} else if(!sxi_hmac_sha1_update_str(hmac_ctx, "da39a3ee5e6b4b0d3255bfef95601890afd80709")) {
+            sxi_cbdata_seterr(ev->ctx, SXE_ECRYPT, "Cluster query failed: HMAC calculation failed");
 	    break;
+        }
 
 	keylen = AUTH_KEY_LEN;
-	if(!sxi_hmac_final(&hmac_ctx, bintoken + AUTH_UID_LEN, &keylen) || keylen != AUTH_KEY_LEN) {
+	if(!sxi_hmac_sha1_final(hmac_ctx, bintoken + AUTH_UID_LEN, &keylen) || keylen != AUTH_KEY_LEN) {
 	    EVDEBUG(ev, "failed to finalize hmac calculation");
-	    conns_err(SXE_ECRYPT, "Cluster query failed: HMAC finalization failed");
+	    sxi_cbdata_seterr(ev->ctx, SXE_ECRYPT, "Cluster query failed: HMAC finalization failed");
 	    break;
 	}
         if(!(sendtok = sxi_b64_enc(sx, bintoken, AUTHTOK_BIN_LEN))) {
             EVDEBUG(ev, "failed to encode computed auth token");
+            sxi_cbdata_seterr(ev->ctx, SXE_ECRYPT, "failed to encode computed auth token");
             break;
         }
 
@@ -1446,85 +1990,136 @@ static int compute_headers_url(curl_events_t *e, curlev_t *ev, curlev_t *src)
 	rc = 0;
     } while(0);
     free(sendtok);
-    HMAC_CTX_cleanup(&hmac_ctx);
+    sxi_hmac_sha1_cleanup(&hmac_ctx);
     return rc;
 }
 
 static int enqueue_request(curl_events_t *e, curlev_t *ev, int re)
 {
-    struct host_info *info;
-    info = get_host(e, ev->host);
-    if (!info) {
-        ctx_err(ev->ctx, CURLE_OUT_OF_MEMORY, "out of mem allocing host info");
+    struct host_info *host = NULL;
+    sxc_client_t *sx = NULL;
+
+    if(!e || !ev) {
         return -1;
     }
 
-    if (info->active < MAX_ACTIVE_PER_HOST) {
+    sx = e->conn_pool->sx;
+
+    /* Store hosts list to be able to get information from single event */
+    ev->hosts = e->conn_pool->hosts;
+
+    /* Get information about active connections for each host */
+    if(sxi_ht_get(e->conn_pool->hosts, (void*)ev->host, strlen(ev->host), (void**)&host) || !host) {
+        /* Host could not be found, add given host */
+        host = host_active_info_new(ev->host);
+        if(!host) {
+            SXDEBUG("OOM Could not allocate memory for host");
+            return -1;
+        }
+        if(sxi_ht_add(e->conn_pool->hosts, (void*)ev->host, strlen(ev->host), (void*)host)) {
+            SXDEBUG("Could not add host to hashtable");
+            free(host->host);
+            free(host);
+            return -1;
+        }
+    }
+
+    if (e->conn_pool->active_count < e->conn_pool->max_active_total && host->active < e->conn_pool->max_active_per_host) {
         unsigned i;
         /* reuse previous easy handle to reuse the connection and prevent
          * TIME_WAIT issues */
 
         /* find free slot */
-        for (i=0;i<MAX_ACTIVE_PER_HOST;i++) {
-            curlev_t *o;
-            o = &info->reuse[i];
+        for (i=0;i<e->conn_pool->max_active_total;i++) {
+            curlev_t *o; 
+            o = &e->conn_pool->active[i];
             if (!o->ctx) {
                 /* free slot */
                 if (curlev_apply(e, o, ev) == -1) {
-                    EVDEBUG(ev,"curlev_apply failed");
+                    EVDEBUG(o,"curlev_apply failed");
                     return -1;
                 }
+
                 ev = o;
+
+                /* Update per-host active connections counters */
+                host->active++;                
                 break;
             }
         }
-        if (i == MAX_ACTIVE_PER_HOST) {
+        if (i == e->conn_pool->max_active_total) {
             EVDEBUG(ev,"no free hosts?");
             return -1;
         }
+
+        if(e->bandwidth.global_limit) {
+            /* Enqueuing new request needs to update bandwidth */
+            if(sxi_curlev_set_bandwidth_limit(e, e->bandwidth.global_limit, e->running+1)) {
+                EVDEBUG(ev, "sxi_curlev_set_bandwidth_limit failed");
+                return -1;
+            }
+        }
+
         /* less than 2 active requests: launch requests now */
         CURLMcode rcm = curl_multi_add_handle(e->multi, ev->curl);
         if (curlm_check(ev,rcm,"add_handle") == -1) {
-            EVDEBUG(ev,"add_handle failed: %s", sxc_geterrmsg(sxi_conns_get_client(ev->ctx->conns)));
+            EVDEBUG(ev,"add_handle failed: %s", sxi_cbdata_geterrmsg(ev->ctx));
             return -1;
         }
-        info->active++;
-        EVDEBUG(ev, "::add_handle %p, active now: %d", ev->curl, info->active);
+        e->conn_pool->active_count++;
+        EVDEBUG(ev, "::add_handle %p, active now: %d", ev->curl, e->conn_pool->active_count);
 
         if (re)
-            EVDEBUG(ev, "Started next waiting request for host %s (%d active)", ev->host, info->active);
+            EVDEBUG(ev, "Started next waiting request for host %s (%d active)", ev->host, e->conn_pool->active_count);
         else
-            EVDEBUG(ev, "Started new request to host %s (%d active)", ev->host, info->active);
+            EVDEBUG(ev, "Started new request to host %s (%d active)", ev->host, e->conn_pool->active_count);
     } else {
         /* has pending request for this host, chain request to avoid
          * pipelining timeout.
          * Note: this list is actually reversed, but we only request
          * hashes so it doesn't matter. */
-        fifo_put(&info->fifo, ev);
-        EVDEBUG(ev, "queued now: %d", fifo_count(&info->fifo));
+        if(ev_queue_add(e->conn_pool->queue, ev)) {
+           EVDEBUG(ev, "Could not add event to a queue");
+           return -1;
+        }
+        EVDEBUG(ev, "queued now: %d", ev_queue_length(e->conn_pool->queue));
         EVDEBUG(ev, "Enqueued request to existing host %s", ev->host);
     }
+
     return 0;
 }
 
-static int queue_next(curl_events_t *e, curlev_t *ev)
+/* Return 1 if event was dequeued, else 0 */
+static int queue_next_inactive(curl_events_t *e)
 {
-    struct host_info *info;
-    info = get_host(e, ev->host);
-    if (!info) {
-        ctx_err(ev->ctx, CURLE_OUT_OF_MEMORY, "out of mem allocing host info");
+    curlev_t *ev = NULL;
+
+    if(!e) {
         return -1;
     }
-    info->active--;
-    EVDEBUG(ev, "%s active: %d, queued: %d", ev->host, info->active, fifo_count(&info->fifo));
-    ev = fifo_get(&info->fifo);
+
+    /*
+     * If total connections limit is not higher than current active connections number,
+     * then do not dequeue event. Ohterwise it would be put here again.
+     */
+    if(e->conn_pool->active_count >= e->conn_pool->max_active_total) {
+        return 0;
+    }
+
+    ev = ev_queue_get(e->conn_pool->queue);
     if (!ev) {
         EVDEBUG(ev,"finished %s", ev->host);
         EVDEBUG(ev, "finished queued requests for host %s", ev->host);
         /* TODO: remove the host after a timeout of a few mins */
         return 0;
     }
-    return enqueue_request(e, ev, 1);
+    
+    if (enqueue_request(e, ev, 1) == -1) {
+        EVENTSDEBUG(e, "enqueue_request failed");
+        return 0;
+    }
+
+    return 1;
 }
 
 static int ev_add(curl_events_t *e,
@@ -1584,6 +2179,7 @@ static int ev_add(curl_events_t *e,
             ctx_err(ctx, CURLE_OUT_OF_MEMORY, "cannot dup hostname");
             break;
         }
+	ev->port = headers->port;
         ev->url = strdup(headers->url);
         if (!ev->url) {
             ctx_err(ctx, CURLE_OUT_OF_MEMORY, "cannot dup URL");
@@ -1592,8 +2188,9 @@ static int ev_add(curl_events_t *e,
         ev->verb = verb;
         if (enqueue_request(e, ev, 0) == -1) {
             /* TODO: remove all reuse[] handles if this fails */
-            EVDEBUG(ev, "enqueue_request failed");
-            return -1;
+            EVENTSDEBUG(e, "enqueue_request failed");
+            ev = NULL;
+            break;
         }
         e->used++;
         if (!e->depth)
@@ -1602,7 +2199,7 @@ static int ev_add(curl_events_t *e,
             e->added_notpolled = 1;
         return 0;
     } while(0);
-    EVDEBUG(ev, "ev_add failed");
+    EVENTSDEBUG(e, "ev_add failed");
     sxi_cbdata_finish(e, &ctx, headers->url, reply->headers.error);
     if (ev) {
         if (ev->slist) {
@@ -1623,8 +2220,7 @@ int sxi_curlev_add_get(curl_events_t *e, const request_headers_t *headers, const
 
 static int nobody(curlev_context_t *ctx, const unsigned char *data, size_t size)
 {
-    sxc_client_t *sx = ctx ? sxi_conns_get_client(ctx->conns) : NULL;
-    sxi_seterr(sx, SXE_EARG, "Body received on HEAD?\n");
+    sxi_cbdata_seterr(ctx, SXE_EARG, "Body received on HEAD?\n");
     return 0;
 }
 
@@ -1653,16 +2249,23 @@ int sxi_curlev_add_put(curl_events_t *e,
     return ev_add(e, req_headers, req_data, REQ_PUT, reply);
 }
 
+#define MAX_POLL_SEEP_TIME      100 /* 100ms */
 int sxi_curlev_poll(curl_events_t *e)
 {
     CURLMcode rc;
     int callbacks = 0;
     long timeout = -1;
+    int immediately_returned = 0;
+    double usleep_timeout = 0; 
     sxc_client_t *sx;
     if (!e) {
+        EVENTSDEBUG(e, "NULL argument");
         return -1;
     }
+
     do {
+        int numfds = 0;
+
         callbacks = 0;
         if (e->added_notpolled) {
             /* If we added new queries that haven't been launched yet,
@@ -1671,14 +2274,40 @@ int sxi_curlev_poll(curl_events_t *e)
              * */
             if ((callbacks += sxi_curlev_poll_immediate(e)) == -1)
                 return -1;
-        }
+        } 
         rc = curl_multi_timeout(e->multi, &timeout);
+
         if (curlm_check(NULL,rc,"set timeout") == -1)
             return -1;
 
-        rc = curl_multi_wait(e->multi, NULL, 0, timeout, NULL);
+        if (timeout < 0)
+            timeout = 2000;
+        rc = curl_multi_wait(e->multi, NULL, 0, timeout, &numfds);
+
         if (curlm_check(NULL,rc,"wait") == -1)
             return -1;
+
+        if(e->bandwidth.global_limit) {
+            if(!numfds && timeout > 0) {
+                immediately_returned++; 
+
+                /* 
+                 * Check if curl_multi_wait() returns too quickly more than 2 times in a row.
+                 * If true, usleep() and increase timeout.
+                 */
+                if(immediately_returned > 2) {
+                    usleep_timeout += 10; /* Add 10 ms */
+                    if(usleep_timeout > MAX_POLL_SEEP_TIME) 
+                        usleep_timeout = MAX_POLL_SEEP_TIME;
+
+                    usleep(usleep_timeout * 1000);
+                }
+            } else {
+                /* curl_multi_wait() did not return immediately, reset timeout */
+                usleep_timeout = 0;
+                immediately_returned = 0;
+            }
+        }
 
         if ((callbacks += sxi_curlev_poll_immediate(e)) == -1)
             return -1;
@@ -1700,10 +2329,19 @@ int sxi_curlev_poll_immediate(curl_events_t *e)
     CURLMsg *msg;
     int msgs;
     int callbacks = 0;
-
+    int last_running = e->running;
     do {
         rc = curl_multi_perform(e->multi, &e->running);
     } while (rc == CURLM_CALL_MULTI_PERFORM);
+
+    /* If number of running transfers has changed, recalculate bandwidth */
+    if(e->bandwidth.global_limit && last_running != e->running) {
+        if(sxi_curlev_set_bandwidth_limit(e, e->bandwidth.global_limit, e->running)) {
+            EVENTSDEBUG(e, "Could not set bandwidth limit");
+            return -1;
+        }
+    }
+    
     if (curlm_check(NULL,rc,"perform") == -1)
         return -1;
     e->added_notpolled = 0;
@@ -1714,12 +2352,16 @@ int sxi_curlev_poll_immediate(curl_events_t *e)
             if (msg->msg != CURLMSG_DONE) {
                 continue;
             }
+
             /* TODO: invoke callbacks */
             curl_easy_getinfo(msg->easy_handle, CURLINFO_PRIVATE, &priv);
             if (priv) {
                 const char *url;
+                char *urldup;
                 curlev_t *ev = (curlev_t*)priv;
                 struct recv_context *rctx = &ev->ctx->recv_ctx;
+                struct host_info *host = NULL;
+                int xfer_err = SXE_NOERROR;
 
                 curl_easy_getinfo(msg->easy_handle, CURLINFO_RESPONSE_CODE, &rctx->reply_status);
                 rctx->errbuf[sizeof(rctx->errbuf)-1] = 0;
@@ -1742,8 +2384,76 @@ int sxi_curlev_poll_immediate(curl_events_t *e)
                 e->used--;
                 curlev_context_t *ctx = ev->ctx;
                 ev->ctx = NULL;
-                queue_next(e, ev);/* modifies ev */
-                sxi_cbdata_finish(e, &ctx, url, ev->error);
+
+                /* 
+                 * For some transfers xferinfo() function can be not called when all bytes were 
+                 * transferred. But in this place we are sure that transfer has finished, so following
+                 * updates transfer information to satisfy progress information 
+                 */
+                switch(ctx->tag) {
+                    case CTX_DOWNLOAD: {
+                        /* Update file download to be finished */
+                        int64_t to_dl = sxi_file_download_get_xfer_to_send(ctx->u.download_ctx);
+                        if(to_dl)
+                            xfer_err = sxi_file_download_set_xfer_stat(ctx->u.download_ctx, to_dl, to_dl);
+                    } break;
+
+                    case CTX_UPLOAD_HOST: {
+                        /* Update file upload */
+                        int64_t to_ul = sxi_host_upload_get_xfer_to_send(ctx->u.host_ctx);
+                        if(to_ul)
+                            xfer_err = sxi_host_upload_set_xfer_stat(ctx->u.host_ctx, to_ul, to_ul);
+                    } break;
+
+                    case CTX_GENERIC: {
+                        switch(ev->verb) {
+                            case REQ_GET: {
+                                int64_t to_dl = sxi_generic_get_xfer_to_dl(ctx->u.generic_ctx);
+                                if(to_dl)
+                                    xfer_err = sxi_generic_set_xfer_stat(ctx->u.generic_ctx, to_dl, to_dl, 0, 0);
+                            } break;
+
+                            case REQ_PUT: {
+                                int64_t to_ul = sxi_generic_get_xfer_to_ul(ctx->u.generic_ctx);
+                                if(to_ul)
+                                    xfer_err = sxi_generic_set_xfer_stat(ctx->u.generic_ctx, 0, 0, to_ul, to_ul);
+                            } break;
+
+                            default:
+                                break;
+                        }
+                    } break;
+
+                    default: {
+                        /* Generic transfer updates */
+                    }
+                }
+
+                /* Check if user transfer callbacks did not return error message */
+                if(xfer_err != SXE_NOERROR) {
+                    if(xfer_err == SXE_ABORT)
+                        sxi_cbdata_seterr(ctx, xfer_err, "Transfer aborted");
+                    else
+                        sxi_cbdata_seterr(ctx, xfer_err, "Could not update progress information");
+                    e->depth--;
+                    return -1;
+                }
+
+                /* Look for host */
+                if(sxi_ht_get(e->conn_pool->hosts, (void*)ev->host, strlen(ev->host), (void **)&host) || !host) {
+                    EVDEBUG(ev, "Could not get host from hosts hash table");
+                    return -1;
+                }
+
+                /* Update per-host active connections counter */
+                host->active--;
+                /* Update global active connections counter */
+                e->conn_pool->active_count--;
+ 
+                urldup = strdup(url);
+                queue_next_inactive(e);
+                sxi_cbdata_finish(e, &ctx, urldup, ev->error);
+                free(urldup);
             } else {
                 EVENTSDEBUG(e,"WARNING: failed to find curl handle\n");
                 e->depth--;
@@ -1754,14 +2464,10 @@ int sxi_curlev_poll_immediate(curl_events_t *e)
     return callbacks;
 }
 
-int sxi_cbdata_result_fail(curlev_context_t* ctx)
-{
-    return !ctx || ctx->recv_ctx.rc != CURLE_OK;
-}
-
 /* message to display to user, in order of increasing priority */
 enum msg_prio {
     MSG_PRIO_NOERROR,
+    MSG_PRIO_SERVER_EAGAIN,
     MSG_PRIO_CURL,
     MSG_PRIO_SERVER,
     MSG_PRIO_AUTH,
@@ -1769,26 +2475,52 @@ enum msg_prio {
 };
 
 struct sxi_retry {
-    sxc_client_t *sx;
-    unsigned last_try;
+    void *ctx;
+    int last_try;
     int last_printed;
     int errnum;
     char errmsg[65536];
     enum msg_prio prio;
+
+    /* Error handling callbacks */
+    geterrmsg_cb geterrmsg;
+    geterrnum_cb geterrnum;
+    seterr_cb seterr;
+    setsyserr_cb setsyserr;
+    clearerr_cb clrerr;
 };
 
-sxi_retry_t* sxi_retry_init(sxc_client_t *sx)
-{
+static void retry_init_err_callbacks(sxi_retry_t *retry, retry_ctx_type_t ctx_type) {
+    switch(ctx_type) {
+        case RCTX_SX: {
+            retry->geterrmsg = (geterrmsg_cb)sxc_geterrmsg;
+            retry->geterrnum = (geterrnum_cb)sxc_geterrnum;
+            retry->seterr = (seterr_cb)sxi_seterr;
+            retry->setsyserr = (seterr_cb)sxi_setsyserr;
+            retry->clrerr = (clearerr_cb)sxc_clearerr;
+        } break;
+
+        case RCTX_CBDATA: {
+            retry->geterrmsg = (geterrmsg_cb)sxi_cbdata_geterrmsg;
+            retry->geterrnum = (geterrnum_cb)sxi_cbdata_geterrnum;
+            retry->seterr = (seterr_cb)sxi_cbdata_seterr;
+            retry->setsyserr = (seterr_cb)sxi_cbdata_setsyserr;
+            retry->clrerr = (clearerr_cb)sxi_cbdata_clearerr;
+        } break;
+    }
+}
+
+sxi_retry_t* sxi_retry_init(void *ctx, retry_ctx_type_t ctx_type) {
     sxi_retry_t *ret;
-    if (!sx)
+    if (!ctx)
         return NULL;
 
     ret = calloc(1, sizeof(*ret));
-    if (!ret) {
-        sxi_setsyserr(sx, SXE_EMEM, "OOM allocating retry struct");
+    if (!ret)
         return NULL;
-    }
-    ret->sx = sx;
+
+    retry_init_err_callbacks(ret, ctx_type);
+    ret->ctx = ctx;
     ret->last_printed = -1;
     return ret;
 }
@@ -1802,6 +2534,8 @@ static enum msg_prio classify_error(int errnum)
             return MSG_PRIO_CURL;
         case SXE_ECOMM:
             return MSG_PRIO_SERVER;
+        case SXE_EAGAIN:
+            return MSG_PRIO_SERVER_EAGAIN;
         case SXE_EAUTH:
             return MSG_PRIO_AUTH;
         default:
@@ -1814,17 +2548,14 @@ int sxi_retry_check(sxi_retry_t *retry, unsigned current_try)
     const char *errmsg;
     int errnum;
     enum msg_prio prio;
-    sxc_client_t *sx;
 
-    if (!retry)
+    if (!retry || !retry->ctx || !retry->geterrmsg || !retry->geterrnum)
         return -1;
-    sx = retry->sx;
-    errmsg = sxc_geterrmsg(sx);
-    errnum = sxc_geterrnum(sx);
+    errmsg = retry->geterrmsg(retry->ctx);
+    errnum = retry->geterrnum(retry->ctx);
     if (!errmsg)
         return -1;
     prio = classify_error(errnum);
-    SXDEBUG("prio: %d, stored prio: %d", prio, retry->prio);
     /* noerror can be overridden by anything, and in turn it can override
      * anything */
     if (prio > retry->prio || prio == MSG_PRIO_NOERROR) {
@@ -1832,36 +2563,27 @@ int sxi_retry_check(sxi_retry_t *retry, unsigned current_try)
         retry->prio = prio;
         retry->errnum = errnum;
         /* do not malloc/strdup so that we can store OOM messages too */
-        strncpy(retry->errmsg, errmsg, sizeof(retry->errmsg)-1);
-        retry->errmsg[sizeof(retry->errmsg)-1] = 0;
-        if (errnum == SXE_NOERROR)
-            SXDEBUG("cleared stored error message");
-        else
-            SXDEBUG("stored error message (prio %d): %s", prio, retry->errmsg);
+        sxi_strlcpy(retry->errmsg, errmsg, sizeof(retry->errmsg));
     }
-    if (prio == MSG_PRIO_LOCAL_FATAL) {
-        SXDEBUG("error is fatal, forbidding retry: %s", errmsg);
+    if (prio == MSG_PRIO_LOCAL_FATAL || prio == MSG_PRIO_AUTH) {
         return -1;/* do not retry */
     }
-    if (current_try != retry->last_try) {
-        sxc_clearerr(sx);
+    if ((int)current_try != retry->last_try) {
+        retry->clrerr(retry->ctx);
         retry->last_try = current_try;
-        SXDEBUG("cleared error for next retry");
     }
     return 0;
 }
 
-void sxi_retry_msg(sxi_retry_t *retry, const char *host)
+void sxi_retry_msg(sxc_client_t *sx, sxi_retry_t *retry, const char *host)
 {
-    sxc_client_t *sx;
     const char *op;
-    if (!retry)
+    if (!sx || !retry || !retry->ctx)
         return;
-    sx = retry->sx;
     op = sxi_get_operation(sx);
     SXDEBUG("op: %s", op ? op : "N/A");
     if (op && retry->errnum && retry->last_try != retry->last_printed) {
-        sxi_info(retry->sx, "%s, retrying %s%s%s ...", retry->errmsg, op,
+        sxi_info(sx, "%s, retrying %s%s%s ...", retry->errmsg, op,
                  host ? " on " : "",
                  host ? host : "");
         retry->last_printed = retry->last_try;
@@ -1870,16 +2592,285 @@ void sxi_retry_msg(sxi_retry_t *retry, const char *host)
 
 int sxi_retry_done(sxi_retry_t **retryptr)
 {
-    sxc_client_t *sx;
     sxi_retry_t *retry = retryptr ? *retryptr : NULL;
+    int ret;
     if (!retry)
         return -1;
-    sx = retry->sx;
-    SXDEBUG("in retry_done");
     sxi_retry_check(retry, retry->last_try+1);
     if (retry->errnum != SXE_NOERROR)
-        sxi_seterr(sx, retry->errnum, "%s", retry->errmsg);
+        retry->seterr(retry->ctx, retry->errnum, "%s", retry->errmsg);
+    ret = retry->geterrnum(retry->ctx) != SXE_NOERROR;
     free(retry);
     *retryptr = NULL;
-    return sxc_geterrnum(sx) != SXE_NOERROR;
+    return ret;
+}
+
+static const struct curl_certinfo *get_certinfo(curlev_t *ctx)
+{
+    const struct curl_slist *to_info = NULL;
+    int res = curl_easy_getinfo(ctx->curl, CURLINFO_CERTINFO, &to_info);
+    if (!res) {
+        const struct curl_certinfo *to_certinfo;
+        memcpy(&to_certinfo, &to_info, sizeof(to_info));
+        if (to_certinfo->num_of_certs > 0)
+            return to_certinfo;
+    }
+    return NULL;
+}
+
+static const char *get_certinfo_field(const struct curl_certinfo *cert, int i, const char *key)
+{
+    const struct curl_slist *slist;
+    unsigned keylen = strlen(key);
+    if (i < 0 || i >= cert->num_of_certs)
+        return NULL;
+    for (slist = cert->certinfo[i]; slist; slist = slist->next) {
+        const char *data = slist->data;
+        if (data && !strncmp(data, key, keylen) && data[keylen] == ':')
+            return data + keylen + 1;
+    }
+    return NULL;
+}
+
+static int print_certificate_info(curl_events_t *e, const struct curl_certinfo *info)
+{
+    sxc_client_t *sx = sxi_conns_get_client(e->conns);
+    if (!info)
+        return -1;
+    int ca = info->num_of_certs - 1;
+    if (ca < 0) {
+        sxi_seterr(sx, SXE_ECOMM, "Received 0 certificates");
+        return -1;
+    }
+
+    struct sxi_fmt fmt;
+    sxi_fmt_start(&fmt);
+    sxi_fmt_msg(&fmt, "Server certificate:\n");
+    sxi_fmt_msg(&fmt, "\tSubject: %s\n", get_certinfo_field(info, 0, "Subject"));
+    sxi_fmt_msg(&fmt, "\tIssuer: %s\n", get_certinfo_field(info, 0, "Issuer"));
+    if (ca > 0) {
+        sxi_fmt_msg(&fmt, "Certificate Authority:\n");
+        sxi_fmt_msg(&fmt, "\tSubject: %s\n", get_certinfo_field(info, ca, "Subject"));
+        sxi_fmt_msg(&fmt, "\tIssuer: %s\n", get_certinfo_field(info, ca, "Issuer"));
+    }
+    const char *rootcert = get_certinfo_field(info, ca, "Cert");
+    rootcert = strchr(rootcert, '\n');
+    if (rootcert) {
+        int ok = 0;
+        rootcert++;
+        unsigned i = 0;
+        unsigned rawbuf_len = 3 * strlen(rootcert) / 4;
+        unsigned char *rawbuf = calloc(1, rawbuf_len);
+        if (!rawbuf) {
+            sxi_setsyserr(sx, SXE_EMEM, "Cannot allocate memory");
+            return -1;
+        }
+        char *b64 = calloc(1, strlen(rootcert));
+        if (!b64) {
+            sxi_setsyserr(sx, SXE_EMEM, "Cannot allocate memory");
+            free(rawbuf);
+            return -1;
+        }
+        for (;*rootcert;rootcert++) {
+            unsigned char c = *rootcert;
+            if (c == ' ' || c == '\n' || c == '\r')
+                continue;
+            if (c == '-')
+                break;
+            b64[i++] = c;
+        }
+        b64[i] = '\0';
+        if (!sxi_b64_dec(sx, b64, rawbuf, &rawbuf_len)) {
+            char hash[SXI_SHA1_TEXT_LEN + 1];
+            if (!sxi_conns_hashcalc_core(sxi_conns_get_client(e->conns), NULL, 0, rawbuf, rawbuf_len, hash)) {
+                sxi_fmt_msg(&fmt, "\tSHA1 fingerprint: %s\n", hash);
+                sxi_notice(sx, "%s", fmt.buf);
+                ok = 1;
+            }
+        }
+        free(b64);
+        free(rawbuf);
+        if (ok)
+            return 0;
+    }
+
+    sxi_seterr(sx, SXE_ECOMM, "Invalid certificate: %s", rootcert);
+    return -1;
+}
+
+static int save_ca(curl_events_t *e, const struct curl_certinfo *certinfo)
+{
+    sxc_client_t *sx = sxi_conns_get_client(e->conns);
+    if (!certinfo)
+        return -1;
+    int ca = certinfo->num_of_certs - 1;
+    const char *subj = get_certinfo_field(certinfo, ca, "Subject");
+    const char *cert = get_certinfo_field(certinfo, ca, "Cert");
+    FILE *out;
+    int rc = 0;
+
+    if (!cert) {
+        sxi_seterr(sx, SXE_ECOMM, "Received 0 certificates");
+        return -1;
+    }
+    out = fopen(e->savefile, "w");
+    if (!out) {
+        sxi_setsyserr(sx, SXE_EWRITE, "Cannot open '%s' for writing", e->savefile);
+        return -1;
+    }
+    if (fputs(cert, out) < 0) {
+        sxi_setsyserr(sx, SXE_EWRITE, "Cannot save '%s'", e->savefile);
+        rc = -1;
+    }
+    if (fclose(out)) {
+        sxi_setsyserr(sx, SXE_EWRITE, "Cannot save(close) '%s'", e->savefile);
+        rc = -1;
+    }
+    if (!rc) {
+        e->saved = 1;
+        if (subj)
+            SXDEBUG("Saved root CA '%s' to '%s'", subj, e->savefile);
+    }
+    return rc;
+}
+
+int sxi_curlev_fetch_certificates(curl_events_t *e, const char *url, int quiet)
+{
+    int ok = 0;
+    CURLcode rc;
+    sxc_client_t *sx = sxi_conns_get_client(e->conns);
+    curlev_t ev;
+    curlev_context_t ctx;
+
+    memset(&ev, 0, sizeof(ev));
+    memset(&ctx, 0, sizeof(ctx));
+    ev.curl = curl_easy_init();
+    ev.ctx = &ctx;
+    ctx.conns = e->conns;
+    if (!ev.curl) {
+        sxi_seterr(sx, SXE_EMEM, "curl_easy_init failed");
+        return -1;
+    }
+    do {
+        sxi_curlev_set_cafile(e, NULL);
+        if (easy_set_default_opt(e, &ev))
+            break;
+        rc = curl_easy_setopt(ev.curl, CURLOPT_VERBOSE, 0L);
+        if (curl_check(&ev,rc, "set CURLOPT_VERBOSE") == -1)
+            break;
+        rc = curl_easy_setopt(ev.curl, CURLOPT_URL, url);
+        if (curl_check(&ev,rc, "set CURLOPT_URL") == -1)
+            break;
+        long contimeout = sxi_conns_get_timeout(e->conns, url);
+	rc = curl_easy_setopt(ev.curl, CURLOPT_CONNECTTIMEOUT_MS, contimeout);
+	if (curl_check(&ev, rc, "set CURLOPT_CONNECTTIMEOUT_MS") == -1)
+	    break;
+        rc = curl_easy_setopt(ev.curl, CURLOPT_CERTINFO, 1L);
+	if (curl_check(&ev, rc, "set CURLOPT_CERTINFO") == -1)
+	    break;
+        rc = curl_easy_setopt(ev.curl, CURLOPT_NOBODY, 1L);
+	if (curl_check(&ev, rc, "set CURLOPT_NOBODY") == -1)
+	    break;
+        /* this is a test connection, do not reuse */
+        rc = curl_easy_setopt(ev.curl, CURLOPT_FORBID_REUSE, 1L);
+	if (curl_check(&ev, rc, "set CURLOPT_FORBID_REUSE") == -1)
+	    break;
+        rc = curl_easy_setopt(ev.curl, CURLOPT_HEADERFUNCTION, (write_cb_t)headfn);
+        if (curl_check(&ev,rc, "set CURLOPT_HEADERFUNCTION") == -1)
+            break;
+        rc = curl_easy_setopt(ev.curl, CURLOPT_HEADERDATA, &ev);
+        if (curl_check(&ev,rc, "set CURLOPT_HEADERFUNCTION") == -1)
+            break;
+
+        ev.ssl_verified = 0;
+        /* Do a first connection with peer verification turned on,
+         * no questions asked if this succeeds.
+         * This is needed to find root CA certs in the system cert store.
+         * */
+        ev.verify_peer = 2;
+        rc = curl_easy_perform(ev.curl);
+        SXDEBUG("1st perform result: %d", rc);
+        if (rc == CURLE_OK) {
+            if (ev.ssl_verified != 1) {
+                sxi_seterr(sx, SXE_ECURL, "SSL certificate not verified");
+                break;
+            }
+            if (save_ca(e, get_certinfo(&ev)))
+                break;
+        } else if (rc == CURLE_SSL_CACERT) {
+            sxc_clearerr(sx);
+            /* Do a second try with verification turned off, and ask a question.
+             * this won't find root CA certs stored in system cert store */
+            ev.verify_peer = 0;
+            rc = curl_easy_setopt(ev.curl, CURLOPT_SSL_VERIFYPEER, 0L);
+            if (curl_check(&ev,rc,"set SSL_VERIFYPEER") == -1)
+                break;
+            ev.ssl_verified = ev.ssl_ctx_called = 0;
+            rc = curl_easy_perform(ev.curl);
+            SXDEBUG("2nd perform result: %d", rc);
+            if (rc == CURLE_OK || rc == CURLE_SSL_CACERT) {
+                if (ev.ssl_verified < 0) {
+                    sxi_seterr(sx, SXE_ECURL, "SSL certificate not verified");
+                    break;
+                }
+                const struct curl_certinfo *info = get_certinfo(&ev);
+                if (!quiet) {
+		    char ans;
+		    int inp;
+		    if (print_certificate_info(e, info))
+			break;
+                    inp = sxi_get_input(sx, SXC_INPUT_YN, "Do you trust this SSL certificate?", "n", &ans, 1);
+		    if(inp != 1 && ans != 'y') {
+                        sxi_seterr(sx, SXE_ECOMM, "User rejected the certificate");
+                        break;
+                    }
+                }
+                if (save_ca(e, info))
+                    break;
+            }
+        } else {
+            sxi_seterr(sx, SXE_ECOMM,"Cannot connect to %s: %s", url, curl_easy_strerror(rc));
+        }
+        /* try again, with newly saved CA and hostname verification on */
+        e->cafile = e->savefile;
+        if (easy_set_default_opt(e, &ev))
+            break;
+        rc = curl_easy_setopt(ev.curl, CURLOPT_VERBOSE, 0L);
+        if (curl_check(&ev,rc, "set CURLOPT_VERBOSE") == -1)
+            break;
+        rc = curl_easy_setopt(ev.curl, CURLOPT_SSL_VERIFYPEER, 1L);
+        if (curl_check(&ev,rc,"set SSL_VERIFYPEER") == -1)
+            break;
+        ev.ssl_verified = ev.ssl_ctx_called = 0;
+        rc = curl_easy_perform(ev.curl);
+        if (rc)
+            break;
+        ok = 1;
+    } while(0);
+    curl_easy_cleanup(ev.curl);
+    e->cafile = NULL;
+    return !ok;
+}
+
+sxi_conns_t *sxi_curlev_get_conns(curlev_t *ev)
+{
+    return ev && ev->ctx ? ev->ctx->conns : NULL;
+}
+
+void sxi_curlev_set_verified(curlev_t *ev, int value)
+{
+    ev->ssl_verified = value;
+}
+
+int sxi_curlev_verify_peer(curlev_t *ev)
+{
+    return ev->verify_peer;
+}
+
+int sxi_curlev_disable_proxy(curl_events_t *ev)
+{
+    if (!ev)
+        return -1;
+    ev->disable_proxy = 1;
+    return 0;
 }

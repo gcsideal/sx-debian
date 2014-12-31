@@ -1,6 +1,19 @@
 ACLOCAL_AMFLAGS = -I m4
+# https://www.gnu.org/software/libtool/manual/html_node/Updating-version-info.html
+LIBSX_VERSION=1:0:0
 
-SUBDIRS = libltdl
+SUBDIRS=
+if BUILD_LTDL
+SUBDIRS += libltdl
+endif
+if BUILD_CURL
+SUBDIRS += ../3rdparty/curl
+endif
+
+EXTRA_DIST=libltdl ../3rdparty/curl
+DIST_SUBDIRS=$(SUBDIRS)
+
+include_HEADERS = include/sx.h
 
 AM_CPPFLAGS = -I $(top_srcdir)/include -I $(top_srcdir)/src $(LTDLINCL)
 lib_LTLIBRARIES = src/libsx.la
@@ -9,10 +22,10 @@ src_libsx_la_SOURCES = \
 	include/default.h \
 	include/gnuc.h \
 	include/types.h \
-	src/cert.c \
-	src/cert.h \
+	include/version.h \
 	src/curlevents.c \
 	src/curlevents.h \
+	src/curlevents-common.h \
 	src/cluster.c \
 	src/cluster.h \
 	src/hostlist.c \
@@ -24,6 +37,7 @@ src_libsx_la_SOURCES = \
 	src/misc.c \
 	src/misc.h \
 	src/fileops.c \
+	src/fileops.h \
 	src/volops.c \
 	src/volops.h \
 	src/jobpoll.c \
@@ -38,15 +52,31 @@ src_libsx_la_SOURCES = \
 	src/sxproto.c \
 	src/sxreport.h \
 	src/sxreport.c \
-	src/version.c
+	src/version.c \
+	src/vcrypto.h \
+	src/vcryptocurl.h
+if BUILD_NFTW
+src_libsx_la_SOURCES += \
+	src/nftw.c \
+	src/sxftw.h
+endif
+if BUILD_NSS
+src_libsx_la_SOURCES += src/nss.c
+endif
+if BUILD_OPENSSL
+src_libsx_la_SOURCES += \
+	src/openssl.c\
+	src/cert.c \
+	src/cert.h
+endif
 
-src_libsx_la_LIBADD = @YAJL_LIBS@ @LIBCURL@ @CRYPTO_LIBS@ @LIBLTDL@ -lssl
+src_libsx_la_LIBADD = @YAJL_LIBS@ @LIBCURL@ @LIBLTDL@ @VCRYPTO_LIBS@
 # TODO: only sx_ should be exported not sxi_
-src_libsx_la_LDFLAGS = -no-undefined -export-symbols-regex sx.*
-src_libsx_la_CPPFLAGS = $(AM_CPPFLAGS) @YAJL_CPPFLAGS@ @LIBCURL_CPPFLAGS@ @CRYPTO_CFLAGS@ \
-			-DINFO_CPPFLAGS="\"$(AM_CPPFLAGS) $(CPPFLAGS) @FCGI_CPPFLAGS@ @CRYPTO_CFLAGS@ @YAJL_CPPFLAGS@\""\
+src_libsx_la_LDFLAGS = -no-undefined -export-symbols-regex sx.* -version-info $(LIBSX_VERSION)
+src_libsx_la_CPPFLAGS = $(AM_CPPFLAGS) @YAJL_CPPFLAGS@ @LIBCURL_CPPFLAGS@ @VCRYPTO_CFLAGS@ \
+			-DINFO_CPPFLAGS="\"$(AM_CPPFLAGS) $(CPPFLAGS) @YAJL_CPPFLAGS@ @LIBCURL_CPPFLAGS@ @OPENSSL_CFLAGS@ @NSS_CFLAGS@\""\
 			-DINFO_CFLAGS="\"$(AM_CFLAGS) $(CFLAGS)\""\
-			-DINFO_LDFLAGS="\"$(AM_LDFLAGS) $(LDFLAGS) @YAJL_LIBS@ @FCGI_LIBS@ @CRYPTO_LIBS@\""\
+			-DINFO_LDFLAGS="\"$(AM_LDFLAGS) $(LDFLAGS) @YAJL_LIBS@ @LIBCURL@ @LIBLTDL@ @VCRYPTO_LIBS@\""\
 			-DINFO_SYSCONFDIR="\"$(sysconfdir)\""\
 			-DINFO_BINDIR="\"$(bindir)\""\
 			-DINFO_LOCALSTATEDIR="\"$(localstatedir)\""\
@@ -60,15 +90,19 @@ include/extraversion.h: include/extraversion.h.tmp
 
 #if exported via git archvie the COMMITVER is a commit hash otherwise it is a meaningless 'ormat:%h'
 include/extraversion.h.tmp:
-	$(AM_V_GEN) LANG=C \
-	    VER="$$(cd $(top_srcdir) && git describe --always --dirty=+ 2>/dev/null)" &&\
-	    echo "#define SRC_EXTRA_VERSION \".$$VER\"" >$@ ||\
+	$(AM_V_GEN) \
+	    (VER="$$(LANG=C git -C $(top_srcdir) describe --exact-match 2>/dev/null)" &&\
+	    echo "#define SRC_VERSION \"$$VER\"" >$@) ||\
+	    (VER="$$(LANG=C git -C $(top_srcdir) describe --always --dirty=+ 2>/dev/null)" &&\
+	    echo "#define SRC_VERSION \"$$VER\"" >$@) ||\
 	    (COMMITVER=$Format:%h$ && test "$$COMMITVER" != "ormat:%h" && \
-	    echo "#define SRC_EXTRA_VERSION \".$$COMMITVER\"" >$@) ||\
-	    echo "#define SRC_EXTRA_VERSION \"\"" >$@
+	    echo "#define SRC_VERSION SRC_DEFAULT_VERSION\".$$COMMITVER\"" >$@) ||\
+	    echo "#define SRC_VERSION SRC_DEFAULT_VERSION" >$@
 
 .PHONY: include/extraversion.h.tmp
 CLEANFILES = include/extraversion.h include/extraversion.h.tmp
 
+if RUN_LDCONFIG
 install-exec-hook:
 	test -n "$$DESTDIR" || PATH="$$PATH:/sbin" ldconfig $(libdir) || true;
+endif

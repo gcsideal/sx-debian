@@ -26,7 +26,6 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
-#include <openssl/sha.h>
 
 #include "libsx-int.h"
 #include "misc.h"
@@ -37,8 +36,10 @@
 #include "filter.h"
 #include "sxproto.h"
 #include "jobpoll.h"
+#include "volops.h"
+#include "vcrypto.h"
 
-int sxc_volume_add(sxc_cluster_t *cluster, const char *name, int64_t size, unsigned int replica, sxc_meta_t *metadata, const char *owner)
+int sxc_volume_add(sxc_cluster_t *cluster, const char *name, int64_t size, unsigned int replica, unsigned int revisions, sxc_meta_t *metadata, const char *owner)
 {
     sxc_client_t *sx = sxi_cluster_get_client(cluster);
     sxi_query_t *proto;
@@ -51,15 +52,79 @@ int sxc_volume_add(sxc_cluster_t *cluster, const char *name, int64_t size, unsig
 	return 1;
     }
 
-    proto = sxi_volumeadd_proto(sx, name, owner, size, replica, metadata);
+    proto = sxi_volumeadd_proto(sx, name, owner, size, replica, revisions, metadata);
     if(!proto) {
 	SXDEBUG("Cannot allocate request");
 	return 1;
     }
     sxi_set_operation(sx, "add volume", sxi_cluster_get_name(cluster), name, NULL);
-    qret = sxi_job_submit_and_poll(sxi_cluster_get_conns(cluster), NULL, proto->path, proto->content, proto->content_len);
+    qret = sxi_job_submit_and_poll(sxi_cluster_get_conns(cluster), NULL, proto->verb, proto->path, proto->content, proto->content_len);
     sxi_query_free(proto);
     return qret;
+}
+
+int sxc_volume_remove(sxc_cluster_t *cluster, const char *name) {
+    sxc_client_t *sx = sxi_cluster_get_client(cluster);
+    sxi_hostlist_t volhosts;
+    char *enc_vol;
+    int ret;
+
+    sxc_clearerr(sx);
+
+    sxi_hostlist_init(&volhosts);
+    if(sxi_locate_volume(sxi_cluster_get_conns(cluster), name, &volhosts, NULL, NULL)) {
+	sxi_hostlist_empty(&volhosts);
+	return 1;
+    }
+
+    enc_vol = sxi_urlencode(sx, name, 0);
+    if(!enc_vol) {
+	SXDEBUG("Cannot encode volume name");
+	sxi_hostlist_empty(&volhosts);
+	return 1;
+    }
+
+    sxi_set_operation(sx, "remove volume", sxi_cluster_get_name(cluster), name, NULL);
+    ret = sxi_job_submit_and_poll(sxi_cluster_get_conns(cluster), &volhosts, REQ_DELETE, enc_vol, NULL, 0);
+
+    sxi_hostlist_empty(&volhosts);
+    free(enc_vol);
+    return ret;
+}
+
+int sxc_volume_modify(sxc_cluster_t *cluster, const char *volume, const char *newowner, int64_t newsize) {
+    sxc_client_t *sx;
+    sxi_hostlist_t volhosts;
+    sxi_query_t *query = NULL;
+    int ret = -1;
+
+    if(!cluster)
+        return -1;
+    sx = sxi_cluster_get_client(cluster);
+
+    if(!volume) {
+        sxi_seterr(sx, SXE_EARG, "Failed to change volume size: invalid argument");
+        return -1;
+    }
+
+    sxc_clearerr(sx);
+    sxi_hostlist_init(&volhosts);
+    if(sxi_locate_volume(sxi_cluster_get_conns(cluster), volume, &volhosts, NULL, NULL))
+        goto sxc_volume_modify_err;
+
+    query = sxi_volume_mod_proto(sx, volume, newowner, newsize);
+    if(!query) {
+        sxi_seterr(sx, SXE_EMEM, "Failed to prepare volume chown query");
+        goto sxc_volume_modify_err;
+    }
+
+    sxi_set_operation(sx, "modify volume", sxi_cluster_get_name(cluster), volume, NULL);
+    ret = sxi_job_submit_and_poll(sxi_cluster_get_conns(cluster), &volhosts, REQ_PUT, query->path, query->content, query->content_len);
+
+sxc_volume_modify_err:
+    sxi_hostlist_empty(&volhosts);
+    sxi_query_free(query);
+    return ret;
 }
 
 int sxi_volume_cfg_store(sxc_client_t *sx, sxc_cluster_t *cluster, const char *vname, const char *filter_uuid, const unsigned char *filter_cfg, unsigned int filter_cfglen)
@@ -113,13 +178,17 @@ int sxi_volume_cfg_store(sxc_client_t *sx, sxc_cluster_t *cluster, const char *v
 	free(path);
 	return 1;
     }
-    if(write(fd, filter_uuid, strlen(filter_uuid)) != strlen(filter_uuid)) {
+    if(write(fd, filter_uuid, strlen(filter_uuid)) != (ssize_t) strlen(filter_uuid)) {
 	sxi_seterr(sx, SXE_EWRITE, "Can't write to %s", path);
 	free(path);
 	close(fd);
 	return 1;
     }
-    close(fd);
+    if(close(fd)) {
+	sxi_seterr(sx, SXE_EWRITE, "Can't close file %s", path);
+	free(path);
+	return 1;
+    }
 
     sprintf(path, "%s/volumes/%s/%s", confdir, vname, filter_uuid);
     if(access(path, F_OK)) {
@@ -131,7 +200,7 @@ int sxi_volume_cfg_store(sxc_client_t *sx, sxc_cluster_t *cluster, const char *v
     }
 
     if(filter_cfg) {
-	SHA256(filter_cfg, filter_cfglen, digest);
+	sxi_sha256(filter_cfg, filter_cfglen, digest);
 	sprintf(path, "%s/volumes/%s/%s/.sx-chksum", confdir, vname, filter_uuid);
 	fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
 	if(fd == -1) {
@@ -145,7 +214,12 @@ int sxi_volume_cfg_store(sxc_client_t *sx, sxc_cluster_t *cluster, const char *v
 	    close(fd);
 	    return 1;
 	}
-	close(fd);
+	if(close(fd)) {
+	    sxi_seterr(sx, SXE_EWRITE, "Can't close file %s", path);
+	    free(path);
+	    return 1;
+	}
+
     }
 
     free(path);
@@ -304,7 +378,7 @@ int sxi_volume_cfg_check(sxc_client_t *sx, sxc_cluster_t *cluster, sxc_meta_t *v
 	    sxi_seterr(sx, SXE_EFILTER, "Remote volume reports no filter config, local settings report filter config");
 	    return 1;
 	} else if(!nocluster && cfgval) {
-	    SHA256(cfgval, cfgval_len, remote_digest);
+	    sxi_sha256(cfgval, cfgval_len, remote_digest);
 	    if(memcmp(local_digest, remote_digest, sizeof(local_digest))) {
 		bigerr(cluster, vname);
 		sxi_seterr(sx, SXE_EFILTER, "Remote volume reports different filter config than local settings");
@@ -380,8 +454,7 @@ static const char *acl_loop(struct user_iter *iter, const char **ptr)
         sxi_setsyserr(iter->sx, SXE_EMEM, "OOM on allocating username");
         return NULL;
     }
-    strncpy(iter->user, q, n);
-    iter->user[n] = '\0';
+    sxi_strlcpy(iter->user, q, n+1);
     return iter->user;
 }
 
@@ -456,14 +529,14 @@ int sxc_volume_acl(sxc_cluster_t *cluster, const char *url,
     free(user_iter.user);
 
     sxi_set_operation(sxi_cluster_get_client(cluster), "modify volume acl", sxi_cluster_get_name(cluster), url, NULL);
-    rc = sxi_job_submit_and_poll(sxi_cluster_get_conns(cluster), NULL, proto->path, proto->content, proto->content_len);
+    rc = sxi_job_submit_and_poll(sxi_cluster_get_conns(cluster), NULL, proto->verb, proto->path, proto->content, proto->content_len);
     sxi_query_free(proto);
     return rc;
 }
 
-// {"volumeList":{"vol":{"replicaCount":1,"sizeBytes":10737418240},"volxxx":{"replicaCount":1,"sizeBytes":10737418240}}
+// {"volumeList":{"vol":{"replicaCount":1,"revisions":4,"privs":"rw","sizeBytes":10737418240,"volumeMeta":{"key1":"val1","key2":"val2"}},"volxxx":{"replicaCount":1,"revisions":2,"privs":"r-","sizeBytes":10737418240,"volumeMeta":{"key1":"val1","key2":"val2"}}}
 struct cb_listvolumes_ctx {
-    sxc_client_t *sx;
+    curlev_context_t *cbdata;
     yajl_callbacks yacb;
     yajl_handle yh;
     struct cb_error_ctx errctx;
@@ -471,28 +544,35 @@ struct cb_listvolumes_ctx {
     char *volname;
     struct cbl_volume_t {
 	int64_t size;
+        int64_t used_size;
 	unsigned int replica_count;
+        unsigned int revisions;
 	unsigned int namelen;
+        char privs[3];
     } voldata;
 
-    enum listvolumes_state { LV_ERROR, LV_BEGIN, LV_BASE, LV_VOLUMES, LV_NAME, LV_VALUES, LV_VALNAME, LV_REPLICA, LV_SIZE, LV_DONE, LV_COMPLETE } state;
+    sxc_meta_t *meta;
+    unsigned int meta_count;
+    char *curkey;
+    enum listvolumes_state { LV_ERROR, LV_BEGIN, LV_BASE, LV_VOLUMES, LV_NAME, LV_VALUES, LV_VALNAME,
+			     LV_REPLICA, LV_REVISIONS, LV_PRIVS, LV_USEDSIZE, LV_SIZE, LV_META, LV_META_KEY, LV_META_VALUE, LV_DONE, LV_COMPLETE } state;
 };
-#define CBDEBUG(...) do{ sxc_client_t *sx = yactx->sx; SXDEBUG(__VA_ARGS__); } while(0)
 #define expect_state(expst) do { if(yactx->state != (expst)) { CBDEBUG("bad state (in %d, expected %d)", yactx->state, expst); return 0; } } while(0)
 
 static int yacb_listvolumes_start_map(void *ctx) {
     struct cb_listvolumes_ctx *yactx = (struct cb_listvolumes_ctx *)ctx;
     if(!ctx)
 	return 0;
-
     if(yactx->state == LV_BEGIN)
 	yactx->state = LV_BASE;
     else if(yactx->state == LV_VOLUMES)
 	yactx->state = LV_NAME;
     else if(yactx->state == LV_VALUES)
 	yactx->state = LV_VALNAME;
+    else if(yactx->state == LV_META)
+        yactx->state = LV_META_KEY;
     else {
-	CBDEBUG("bad state (in %d, expected %d, %d or %d)", yactx->state, LV_BEGIN, LV_VOLUMES, LV_VALUES);
+	CBDEBUG("bad state (in %d, expected %d, %d, %d or %d)", yactx->state, LV_BEGIN, LV_VOLUMES, LV_VALUES, LV_META);
 	return 0;
     }
     return 1;
@@ -502,29 +582,69 @@ static int yacb_listvolumes_end_map(void *ctx) {
     struct cb_listvolumes_ctx *yactx = (struct cb_listvolumes_ctx *)ctx;
     if(!ctx)
 	return 0;
-
     if (yactx->state == LV_ERROR)
         return yacb_error_end_map(&yactx->errctx);
     if(yactx->state == LV_DONE)
 	yactx->state = LV_COMPLETE;
     else if(yactx->state == LV_NAME)
 	yactx->state = LV_DONE;
+    else if(yactx->state == LV_META_KEY)
+        yactx->state = LV_VALNAME;
     else if(yactx->state == LV_VALNAME) {
-	if(yactx->voldata.replica_count < 1 || yactx->voldata.size < 0 || !yactx->volname || !yactx->voldata.namelen) {
+        unsigned int i;
+
+	if(yactx->voldata.replica_count < 1 || yactx->voldata.used_size < 0 || yactx->voldata.size < 0 || !yactx->volname || !yactx->voldata.namelen) {
 	    CBDEBUG("incomplete entry");
 	    return 0;
 	}
 	if(!fwrite(&yactx->voldata, sizeof(yactx->voldata), 1, yactx->f) || !fwrite(yactx->volname, yactx->voldata.namelen, 1, yactx->f)) {
 	    CBDEBUG("failed to save file attributes to temporary file");
-	    sxi_setsyserr(yactx->sx, SXE_EWRITE, "Failed to write to temporary file");
+	    sxi_cbdata_setsyserr(yactx->cbdata, SXE_EWRITE, "Failed to write to temporary file");
 	    return 0;
 	}
 	free(yactx->volname);
 	yactx->volname = NULL;
 	yactx->voldata.namelen = 0;
 	yactx->state = LV_NAME;
+
+        /* Handle meta */
+        if(!fwrite(&yactx->meta_count, sizeof(yactx->meta_count), 1, yactx->f)) {
+            CBDEBUG("Failed to save meta count to temporary file");
+            sxi_cbdata_setsyserr(yactx->cbdata, SXE_EWRITE, "Failed to save meta count to temporary file");
+            return 0;
+        }
+
+        /* Iterate over all metas and write them to temp file */
+        for(i = 0; i < sxc_meta_count(yactx->meta); i++) {
+            const char *key = NULL;
+            unsigned int key_len = 0;
+            const void *value = NULL;
+            unsigned int value_len = 0;
+            if(sxc_meta_getkeyval(yactx->meta, i, &key, &value, &value_len)) {
+                sxc_client_t *sx = sxi_conns_get_client(sxi_cbdata_get_conns(yactx->cbdata));
+                CBDEBUG("Could not get meta key-value pair: %s", sxc_geterrmsg(sxi_conns_get_client(sxi_cbdata_get_conns(yactx->cbdata))));
+                /* FIXME: Do not store errors in global buffer (bb#751) */
+                sxi_cbdata_restore_global_error(sx, yactx->cbdata);
+                return 0;
+            }
+
+            key_len = strlen(key);
+            if(!fwrite(&key_len, sizeof(key_len), 1, yactx->f) || !fwrite(key, key_len, 1, yactx->f)) {
+                CBDEBUG("Failed to save meta key to temporary file");
+                sxi_cbdata_setsyserr(yactx->cbdata, SXE_EWRITE, "Failed to save meta key to temporary file");
+                return 0;
+            }
+            if(!fwrite(&value_len, sizeof(value_len), 1, yactx->f) || !fwrite(value, value_len, 1, yactx->f)) {
+                CBDEBUG("Failed to save meta value to temporary file");
+		sxi_cbdata_setsyserr(yactx->cbdata, SXE_EWRITE, "Failed to save meta value to temporary file");
+                return 0;
+            }
+        }
+        sxc_meta_free(yactx->meta);
+        yactx->meta = NULL;
+        yactx->meta_count = 0;
     } else {
-	CBDEBUG("bad state (in %d, expected %d, %d or %d)", yactx->state, LV_DONE, LV_NAME, LV_VALNAME);
+	CBDEBUG("bad state (in %d, expected %d, %d, %d or %d)", yactx->state, LV_DONE, LV_NAME, LV_META_KEY, LV_VALNAME);
 	return 0;
     }
     return 1;
@@ -534,6 +654,31 @@ static int yacb_listvolumes_string(void *ctx, const unsigned char *s, size_t l) 
     struct cb_listvolumes_ctx *yactx = (struct cb_listvolumes_ctx *)ctx;
     if (yactx->state == LV_ERROR)
         return yacb_error_string(&yactx->errctx, s, l);
+    if(yactx->state == LV_META_VALUE) {
+        if(sxc_meta_setval_fromhex(yactx->meta, yactx->curkey, (const char *)s, l)) {
+            sxc_client_t *sx = sxi_conns_get_client(sxi_cbdata_get_conns(yactx->cbdata));
+            CBDEBUG("failed to add meta value: %s", sxc_geterrmsg(sx));
+            /* FIXME: Do not store errors in global buffer (bb#751) */
+            sxi_cbdata_restore_global_error(sx, yactx->cbdata);
+            return 0;
+        }
+        free(yactx->curkey);
+        yactx->curkey = NULL;
+        yactx->state = LV_META_KEY;
+        yactx->meta_count++;
+        return 1;
+    }
+    if(yactx->state == LV_PRIVS) {
+        if(l != 2 || (s[0] != 'r' && s[0] != '-') || (s[1] != 'w' && s[1] != '-')) {
+            CBDEBUG("Bad privs string");
+            return 0;
+        }
+
+        memcpy(yactx->voldata.privs, s, l);
+        yactx->state = LV_VALNAME;
+        return 1;
+    }
+
     return 0;
 }
 
@@ -544,7 +689,7 @@ static int yacb_listvolumes_map_key(void *ctx, const unsigned char *s, size_t l)
     if (yactx->state == LV_ERROR)
         return yacb_error_map_key(&yactx->errctx, s, l);
     if (yactx->state == LV_DONE || yactx->state == LV_BASE) {
-        if (ya_check_error(yactx->sx, &yactx->errctx, s, l)) {
+        if (ya_check_error(yactx->cbdata, &yactx->errctx, s, l)) {
             yactx->state = LV_ERROR;
             return 1;
         }
@@ -564,17 +709,19 @@ static int yacb_listvolumes_map_key(void *ctx, const unsigned char *s, size_t l)
 	    CBDEBUG("Inconsistent state");
 	    return 0;
 	}
-	yactx->volname = malloc(l);
+	yactx->voldata.namelen = l;
+	yactx->volname = malloc(yactx->voldata.namelen);
 	if(!yactx->volname) {
 	    CBDEBUG("OOM duplicating volume name '%.*s'", (unsigned)l, s);
-	    sxi_seterr(yactx->sx, SXE_EMEM, "Out of memory");
+	    sxi_cbdata_seterr(yactx->cbdata, SXE_EMEM, "Out of memory");
 	    return 0;
 	}
-	memcpy(yactx->volname, s, l);
+	memcpy(yactx->volname, s, yactx->voldata.namelen);
 	yactx->voldata.replica_count = 0;
+        yactx->voldata.revisions = 0;
+        yactx->voldata.used_size = -1;
 	yactx->voldata.size = -1;
-	yactx->voldata.namelen = l;
-
+        yactx->voldata.privs[0] = '\0';
 	yactx->state = LV_VALUES;
 	return 1;
     }
@@ -584,15 +731,52 @@ static int yacb_listvolumes_map_key(void *ctx, const unsigned char *s, size_t l)
 	    yactx->state = LV_REPLICA;
 	    return 1;
 	}
+        if(l == lenof("maxRevisions") && !memcmp(s, "maxRevisions", lenof("maxRevisions"))) {
+            yactx->state = LV_REVISIONS;
+            return 1;
+        }
+        if(l == lenof("privs") && !memcmp(s, "privs", lenof("privs"))) {
+            yactx->state = LV_PRIVS;
+            return 1;
+        }
+        if(l == lenof("usedSize") && !memcmp(s, "usedSize", lenof("usedSize"))) {
+            yactx->state = LV_USEDSIZE;
+            return 1;
+        }
 	if(l == lenof("sizeBytes") && !memcmp(s, "sizeBytes", lenof("sizeBytes"))) {
 	    yactx->state = LV_SIZE;
 	    return 1;
 	}
+        if(l == lenof("volumeMeta") && !memcmp(s, "volumeMeta", lenof("volumeMeta"))) {
+            sxc_client_t *sx = sxi_conns_get_client(sxi_cbdata_get_conns(yactx->cbdata));
+            yactx->state = LV_META;
+            yactx->meta = sxc_meta_new(sx);
+	    if(!yactx->meta) {
+		CBDEBUG("OOM Allocating meta");
+                /* FIXME: Do not store errors in global buffer (bb#751) */
+                sxi_cbdata_restore_global_error(sx, yactx->cbdata);
+		return 0;
+	    }
+            return 1;
+        }
 	CBDEBUG("unexpected voldata key '%.*s'", (unsigned)l, s);
 	return 0;
     }
 
-    CBDEBUG("bad state (in %d, expected %d, %d or %d)", yactx->state, LV_BASE, LV_NAME, LV_VALNAME);
+    if(yactx->state == LV_META_KEY) {
+        yactx->curkey = malloc(l + 1);
+        if(!yactx->curkey) {
+            CBDEBUG("OOM Allocating temporary meta key '%.*s'", (unsigned)l, s);
+            sxi_cbdata_seterr(yactx->cbdata, SXE_EMEM, "Out of memory");
+            return 0;
+        }
+        memcpy(yactx->curkey, s, l);
+        yactx->curkey[l] = '\0';
+        yactx->state = LV_META_VALUE;
+        return 1;
+    }
+
+    CBDEBUG("bad state (in %d, expected %d, %d, %d or %d)", yactx->state, LV_BASE, LV_NAME, LV_VALNAME, LV_META_KEY);
     return 0;
 }
 
@@ -618,6 +802,42 @@ static int yacb_listvolumes_number(void *ctx, const char *s, size_t l) {
 	    CBDEBUG("invalid number '%.*s'", (unsigned)l, s);
 	    return 0;
 	}
+    } else if(yactx->state == LV_REVISIONS) {
+        if(yactx->voldata.revisions) {
+            CBDEBUG("Revisions limit already received: %d", yactx->voldata.revisions);
+            return 0;
+        }
+        if(l < 1 || l > 10) {
+            CBDEBUG("Invalid revisions limit '%.*s'", (unsigned)l, s);
+            return 0;
+        }
+        memcpy(numb, s, l);
+        numb[l] = '\0';
+        yactx->voldata.revisions = strtol(numb, &enumb, 10);
+        if(*enumb || yactx->voldata.revisions < 1) {
+            CBDEBUG("invalid number '%.*s'", (unsigned)l, s);
+            return 0;
+        }
+    } else if(yactx->state == LV_USEDSIZE){
+        if(yactx->voldata.used_size > 0) {
+            CBDEBUG("Volume used size already received: %lld", (long long)yactx->voldata.used_size);
+            return 0;
+        }
+        if(l < 1 || l > 20) {
+            CBDEBUG("Invalid volume used size '%.*s'", (unsigned)l, s);
+            return 0;
+        }
+        memcpy(numb, s, l);
+        numb[l] = '\0';
+        yactx->voldata.used_size = strtoll(numb, &enumb, 10);
+        if(*enumb) {
+            CBDEBUG("invalid number '%.*s'", (unsigned)l, s);
+            return 0;
+        }
+        if(yactx->voldata.used_size < 0) {
+            CBDEBUG("Current volume size is less than 0: %lld, falling back to 0", (long long)yactx->voldata.used_size);
+            yactx->voldata.used_size = 0;
+        }
     } else if(yactx->state == LV_SIZE){
 	if(yactx->voldata.size > 0) {
 	    CBDEBUG("Volume size already received");
@@ -643,16 +863,16 @@ static int yacb_listvolumes_number(void *ctx, const char *s, size_t l) {
     return 1;
 }
 
-static int listvolumes_setup_cb(sxi_conns_t *conns, void *ctx, const char *host) {
+static int listvolumes_setup_cb(curlev_context_t *cbdata, void *ctx, const char *host) {
     struct cb_listvolumes_ctx *yactx = (struct cb_listvolumes_ctx *)ctx;
-    sxc_client_t *sx = sxi_conns_get_client(conns);
 
     if(yactx->yh)
 	yajl_free(yactx->yh);
 
+    yactx->cbdata = cbdata;
     if(!(yactx->yh  = yajl_alloc(&yactx->yacb, NULL, yactx))) {
-	SXDEBUG("failed to allocate yajl structure");
-	sxi_seterr(sx, SXE_EMEM, "List volumes failed: out of memory");
+	CBDEBUG("failed to allocate yajl structure");
+	sxi_cbdata_seterr(cbdata, SXE_EMEM, "List volumes failed: Out of memory");
 	return 1;
     }
 
@@ -660,17 +880,23 @@ static int listvolumes_setup_cb(sxi_conns_t *conns, void *ctx, const char *host)
     yactx->volname = NULL;
     rewind(yactx->f);
     yactx->state = LV_BEGIN;
-    yactx->sx = sx;
+
+    /* Meta handling */
+    sxc_meta_free(yactx->meta);
+    free(yactx->curkey);
+    yactx->meta = NULL;
+    yactx->curkey = NULL;
+    yactx->meta_count = 0;
 
     return 0;
 }
 
-static int listvolumes_cb(sxi_conns_t *conns, void *ctx, const void *data, size_t size) {
+static int listvolumes_cb(curlev_context_t *cbdata, void *ctx, const void *data, size_t size) {
     struct cb_listvolumes_ctx *yactx = (struct cb_listvolumes_ctx *)ctx;
     if(yajl_parse(yactx->yh, data, size) != yajl_status_ok) {
         if (yactx->state != LV_ERROR) {
-            CBDEBUG("failed to parse JSON data");
-            sxi_seterr(sxi_conns_get_client(conns), SXE_ECOMM, "communication error");
+            CBDEBUG("failed to parse JSON data: %s", sxi_cbdata_geterrmsg(yactx->cbdata));
+            sxi_cbdata_seterr(yactx->cbdata, SXE_ECOMM, "communication error");
         }
 	return 1;
     }
@@ -684,7 +910,7 @@ struct _sxc_cluster_lv_t {
     char *fname;
 };
 
-sxc_cluster_lv_t *sxc_cluster_listvolumes(sxc_cluster_t *cluster) {
+sxc_cluster_lv_t *sxc_cluster_listvolumes(sxc_cluster_t *cluster, int get_meta) {
     sxc_client_t *sx = sxi_cluster_get_client(cluster);
     struct cb_listvolumes_ctx yctx;
     yajl_callbacks *yacb = &yctx.yacb;
@@ -693,7 +919,7 @@ sxc_cluster_lv_t *sxc_cluster_listvolumes(sxc_cluster_t *cluster) {
     int qret;
 
     sxc_clearerr(sx);
-
+    memset(&yctx, 0, sizeof(yctx));
     ya_init(yacb);
     yacb->yajl_start_map = yacb_listvolumes_start_map;
     yacb->yajl_map_key = yacb_listvolumes_map_key;
@@ -701,19 +927,18 @@ sxc_cluster_lv_t *sxc_cluster_listvolumes(sxc_cluster_t *cluster) {
     yacb->yajl_number = yacb_listvolumes_number;
     yacb->yajl_end_map = yacb_listvolumes_end_map;
 
-    yctx.yh = NULL;
-    yctx.volname = NULL;
-
     if(!(fname = sxi_make_tempfile(sx, NULL, &yctx.f))) {
 	CFGDEBUG("failed to create temporary storage for volume list");
 	return NULL;
     }
 
     sxi_set_operation(sx, "list volumes", sxi_cluster_get_name(cluster), NULL, NULL);
-    qret = sxi_cluster_query(sxi_cluster_get_conns(cluster), NULL, REQ_GET, "?volumeList", NULL, 0, listvolumes_setup_cb, listvolumes_cb, &yctx);
+    qret = sxi_cluster_query(sxi_cluster_get_conns(cluster), NULL, REQ_GET, get_meta ? "?volumeList&volumeMeta":"?volumeList", NULL, 0, listvolumes_setup_cb, listvolumes_cb, &yctx);
     if(qret != 200) {
 	CFGDEBUG("query returned %d", qret);
 	free(yctx.volname);
+	sxc_meta_free(yctx.meta);
+	free(yctx.curkey);
 	if(yctx.yh)
 	    yajl_free(yctx.yh);
 	fclose(yctx.f);
@@ -725,9 +950,11 @@ sxc_cluster_lv_t *sxc_cluster_listvolumes(sxc_cluster_t *cluster) {
     if(yajl_complete_parse(yctx.yh) != yajl_status_ok || yctx.state != LV_COMPLETE) {
         if (yctx.state != LV_ERROR) {
             CFGDEBUG("JSON parsing failed");
-            cluster_err(SXE_ECOMM, "List volumes failed: communication error");
+            cluster_err(SXE_ECOMM, "List volumes failed: Communication error");
         }
 	free(yctx.volname);
+	sxc_meta_free(yctx.meta);
+	free(yctx.curkey);
 	if(yctx.yh)
 	    yajl_free(yctx.yh);
 	fclose(yctx.f);
@@ -737,13 +964,15 @@ sxc_cluster_lv_t *sxc_cluster_listvolumes(sxc_cluster_t *cluster) {
     }
 
     free(yctx.volname);
+    sxc_meta_free(yctx.meta);
+    free(yctx.curkey);
     if(yctx.yh)
 	yajl_free(yctx.yh);
 
     ret = malloc(sizeof(*ret));
     if(!ret) {
 	CFGDEBUG("OOM allocating results");
-	cluster_err(SXE_EMEM, "Volume list failed: out of memory");
+	cluster_err(SXE_EMEM, "Volume list failed: Out of memory");
 	fclose(yctx.f);
 	unlink(fname);
 	free(fname);
@@ -758,38 +987,47 @@ sxc_cluster_lv_t *sxc_cluster_listvolumes(sxc_cluster_t *cluster) {
     return ret;
 }
 
-int sxc_cluster_listvolumes_next(sxc_cluster_lv_t *lv, char **volume_name, int64_t *volume_size, unsigned int *replica_count) {
+int sxc_cluster_listvolumes_next(sxc_cluster_lv_t *lv, char **volume_name, int64_t *volume_used_size, int64_t *volume_size, unsigned int *replica_count, unsigned int *revisions, char privs[3], sxc_meta_t **meta) {
     struct cbl_volume_t volume;
     sxc_client_t *sx = lv->sx;
+    unsigned int meta_count = 0;
+    unsigned int i = 0;
+    char *key = NULL;
+    void *value = NULL;
 
     if(!fread(&volume, sizeof(volume), 1, lv->f)) {
 	if(ferror(lv->f)) {
 	    SXDEBUG("error reading attributes from results file");
-	    sxi_setsyserr(sx, SXE_EREAD, "Failed to retrieve next volume: read item from cache failed");
+	    sxi_setsyserr(sx, SXE_EREAD, "Failed to retrieve next volume: Read item from cache failed");
 	    return -1;
 	}
 	return 0;
     }
 
+    if(volume.namelen & 0x80000000) {
+	SXDEBUG("Invalid volume name length");
+	sxi_seterr(sx, SXE_EREAD, "Failed to retrieve next volume: Bad data from cache file");
+	return -1;
+    }
+
     if(volume_name) {
 	*volume_name = malloc(volume.namelen + 1);
 	if(!*volume_name) {
-	    SXDEBUG("OOM allocating result file name (%u bytes)", (unsigned)volume.namelen);
-	    sxi_seterr(sx, SXE_EMEM, "Failed to retrieve next volume: out of memory");
+	    SXDEBUG("OOM allocating result file name (%u bytes)", volume.namelen);
+	    sxi_seterr(sx, SXE_EMEM, "Failed to retrieve next volume: Out of memory");
 	    return -1;
 	}
 	if(!fread(*volume_name, volume.namelen, 1, lv->f)) {
 	    SXDEBUG("error reading name from results file");
-	    sxi_setsyserr(sx, SXE_EREAD, "Failed to retrieve next volume: read item from cache failed");
+	    sxi_setsyserr(sx, SXE_EREAD, "Failed to retrieve next volume: Read item from cache failed");
 	    return -1;
 	}
         (*volume_name)[volume.namelen] = '\0';
         if(sxi_is_debug_enabled(sx)) {
             sxi_hostlist_t nodes;
             sxi_hostlist_init(&nodes);
-            if (!sxi_locate_volume(lv->cluster, *volume_name, &nodes,NULL)) {
+            if (!sxi_locate_volume(sxi_cluster_get_conns(lv->cluster), *volume_name, &nodes, NULL, NULL)) {
                 unsigned n = sxi_hostlist_get_count(&nodes);
-                unsigned i;
                 SXDEBUG("Volume %s master nodes:", *volume_name);
                 for (i=0;i<n;i++)
                     SXDEBUG("\t%s", sxi_hostlist_get_host(&nodes,
@@ -800,11 +1038,113 @@ int sxc_cluster_listvolumes_next(sxc_cluster_lv_t *lv, char **volume_name, int64
     } else
 	fseek(lv->f, volume.namelen, SEEK_CUR);
 
+    if(volume_used_size)
+        *volume_used_size = volume.used_size;
+
     if(volume_size)
 	*volume_size = volume.size;
 
     if(replica_count)
 	*replica_count = volume.replica_count;
+
+    if(revisions)
+        *revisions = volume.revisions;
+
+    if(privs)
+        memcpy(privs, volume.privs, 2);
+
+    if(!fread(&meta_count, sizeof(meta_count), 1, lv->f)) {
+        SXDEBUG("error reading meta count from results file");
+        sxi_setsyserr(sx, SXE_EREAD, "error reading meta count from results file");
+        return -1; /* TODO: free sth? */
+    }
+
+    if(meta) {
+        *meta = sxc_meta_new(sx);
+        if(!*meta) {
+            SXDEBUG("OOM could not allocate meta");
+            sxi_setsyserr(sx, SXE_EMEM, "OOM could not allocate meta");
+            return -1;
+        }
+    }
+
+    for(i = 0; i < meta_count; i++) {
+	unsigned int key_len, value_len;
+	key = value = NULL;
+
+        if(!fread(&key_len, sizeof(key_len), 1, lv->f)) {
+            SXDEBUG("error reading meta key length from results file");
+            sxi_setsyserr(sx, SXE_EREAD, "error reading meta key length from results file");
+            break;
+        }
+	if(key_len & 0x80000000) {
+            SXDEBUG("invalid meta key length from results file");
+            sxi_setsyserr(sx, SXE_EREAD, "invalid meta key length from results file");
+            break;
+        }
+
+	if(meta) {
+	    key = calloc(key_len + 1, sizeof(char));
+	    if(!key) {
+		SXDEBUG("OOM could not allocate memory for meta key");
+		sxi_setsyserr(sx, SXE_EMEM, "OOM could not allocate memory for meta key");
+		break;
+	    }
+
+	    if(!fread(key, key_len, 1, lv->f)) {
+		SXDEBUG("error reading meta key length from results file");
+		sxi_setsyserr(sx, SXE_EREAD, "error reading meta key length from results file");
+		break;
+	    }
+	} else
+	    fseek(lv->f, key_len, SEEK_CUR);
+
+        if(!fread(&value_len, sizeof(value_len), 1, lv->f)) {
+            SXDEBUG("error reading meta key length from results file");
+            sxi_setsyserr(sx, SXE_EREAD, "error reading meta key length from results file");
+            break;
+        }
+	if(value_len & 0x80000000) {
+            SXDEBUG("invalid meta value length from results file");
+            sxi_setsyserr(sx, SXE_EREAD, "invalid meta value length from results file");
+            break;
+        }
+
+	if(meta) {
+	    value = calloc(value_len + 1, sizeof(char));
+	    if(!value) {
+		SXDEBUG("OOM could not allocate memory for meta value");
+		sxi_setsyserr(sx, SXE_EMEM, "OOM could not allocate memory for meta value");
+		break;
+	    }
+
+	    if(!fread(value, value_len, 1, lv->f)) {
+		SXDEBUG("error reading meta value length from results file");
+		sxi_setsyserr(sx, SXE_EREAD, "error reading meta value length from results file");
+		break;
+	    }
+
+	    /* Value and key are read, add them to meta if needed */
+	    if(sxc_meta_setval(*meta, key, value, value_len)) {
+		SXDEBUG("Could not add meta key-value pair: %s", sxc_geterrmsg(sx));
+		break;
+	    }
+
+	    free(key);
+	    free(value);
+	} else
+	    fseek(lv->f, value_len, SEEK_CUR);
+    }
+
+    if(i != meta_count) {
+	if(meta) {
+	    free(key);
+	    free(value);
+	    sxc_meta_free(*meta);
+	    *meta = NULL;
+	}
+	return -1;
+    }
 
     return 1;
 }
@@ -815,11 +1155,10 @@ void sxc_cluster_listvolumes_free(sxc_cluster_lv_t *lv) {
     free(lv->fname);
     free(lv);
 }
-#define CBDEBUG(...) do{ sxc_client_t *sx = yactx->sx; SXDEBUG(__VA_ARGS__); } while(0)
 #define expect_state(expst) do { if(yactx->state != (expst)) { CBDEBUG("bad state (in %d, expected %d)", yactx->state, expst); return 0; } } while(0)
 
 struct cb_listusers_ctx {
-    sxc_client_t *sx;
+    curlev_context_t *cbdata;
     yajl_callbacks yacb;
     yajl_handle yh;
     struct cb_error_ctx errctx;
@@ -863,7 +1202,7 @@ static int yacb_listusers_end_map(void *ctx) {
     else if(yactx->state == LU_VALNAME) {
 	if(!fwrite(&yactx->usrdata, sizeof(yactx->usrdata), 1, yactx->f) || !fwrite(yactx->usrname, yactx->usrdata.namelen, 1, yactx->f)) {
 	    CBDEBUG("failed to save file attributes to temporary file");
-	    sxi_setsyserr(yactx->sx, SXE_EWRITE, "Failed to write to temporary file");
+	    sxi_cbdata_setsyserr(yactx->cbdata, SXE_EWRITE, "Failed to write to temporary file");
 	    return 0;
 	}
 	free(yactx->usrname);
@@ -885,7 +1224,7 @@ static int yacb_listusers_map_key(void *ctx, const unsigned char *s, size_t l) {
     if (yactx->state == LU_ERROR)
         return yacb_error_map_key(&yactx->errctx, s, l);
     if (yactx->state == LU_NAME) {
-        if (ya_check_error(yactx->sx, &yactx->errctx, s, l)) {
+        if (ya_check_error(yactx->cbdata, &yactx->errctx, s, l)) {
             yactx->state = LU_ERROR;
             return 1;
         }
@@ -895,16 +1234,15 @@ static int yacb_listusers_map_key(void *ctx, const unsigned char *s, size_t l) {
 	    CBDEBUG("Inconsistent state");
 	    return 0;
 	}
-	yactx->usrname = malloc(l);
+	yactx->usrdata.namelen = l;
+	yactx->usrname = malloc(yactx->usrdata.namelen);
 	if(!yactx->usrname) {
 	    CBDEBUG("OOM duplicating user name '%.*s'", (unsigned)l, s);
-	    sxi_seterr(yactx->sx, SXE_EMEM, "Out of memory");
+	    sxi_cbdata_seterr(yactx->cbdata, SXE_EMEM, "Out of memory");
 	    return 0;
 	}
-	memcpy(yactx->usrname, s, l);
+	memcpy(yactx->usrname, s, yactx->usrdata.namelen);
 	yactx->usrdata.is_admin = 0;
-	yactx->usrdata.namelen = l;
-
 	yactx->state = LU_VALUES;
 	return 1;
     }
@@ -946,16 +1284,16 @@ static int yacb_listusers_string(void *ctx, const unsigned char *s, size_t l) {
 }
 
 
-static int listusers_setup_cb(sxi_conns_t *conns, void *ctx, const char *host) {
+static int listusers_setup_cb(curlev_context_t *cbdata, void *ctx, const char *host) {
     struct cb_listusers_ctx *yactx = (struct cb_listusers_ctx *)ctx;
-    sxc_client_t *sx = sxi_conns_get_client(conns);
 
     if(yactx->yh)
 	yajl_free(yactx->yh);
 
+    yactx->cbdata = cbdata;
     if(!(yactx->yh  = yajl_alloc(&yactx->yacb, NULL, yactx))) {
-	SXDEBUG("failed to allocate yajl structure");
-	sxi_seterr(sx, SXE_EMEM, "List users failed: out of memory");
+	CBDEBUG("failed to allocate yajl structure");
+	sxi_cbdata_seterr(cbdata, SXE_EMEM, "List users failed: Out of memory");
 	return 1;
     }
 
@@ -963,17 +1301,16 @@ static int listusers_setup_cb(sxi_conns_t *conns, void *ctx, const char *host) {
     yactx->usrname = NULL;
     rewind(yactx->f);
     yactx->state = LU_BEGIN;
-    yactx->sx = sx;
 
     return 0;
 }
 
-static int listusers_cb(sxi_conns_t *conns, void *ctx, const void *data, size_t size) {
+static int listusers_cb(curlev_context_t *cbdata, void *ctx, const void *data, size_t size) {
     struct cb_listusers_ctx *yactx = (struct cb_listusers_ctx *)ctx;
     if(yajl_parse(yactx->yh, data, size) != yajl_status_ok) {
         if (yactx->state != LU_ERROR) {
-            CBDEBUG("failed to parse JSON data");
-            sxi_seterr(sxi_conns_get_client(conns), SXE_ECOMM, "communication error");
+            CBDEBUG("failed to parse JSON data: %s", sxi_cbdata_geterrmsg(yactx->cbdata));
+            sxi_cbdata_seterr(yactx->cbdata, SXE_ECOMM, "communication error");
         }
 	return 1;
     }
@@ -1027,7 +1364,7 @@ sxc_cluster_lu_t *sxc_cluster_listusers(sxc_cluster_t *cluster) {
     if(yajl_complete_parse(yctx.yh) != yajl_status_ok || yctx.state != LU_COMPLETE) {
         if (yctx.state != LU_ERROR) {
             CFGDEBUG("JSON parsing failed: %d", yctx.state);
-            cluster_err(SXE_ECOMM, "List users failed: communication error");
+            cluster_err(SXE_ECOMM, "List users failed: Communication error");
         }
 	free(yctx.usrname);
 	if(yctx.yh)
@@ -1045,7 +1382,7 @@ sxc_cluster_lu_t *sxc_cluster_listusers(sxc_cluster_t *cluster) {
     ret = malloc(sizeof(*ret));
     if(!ret) {
 	CFGDEBUG("OOM allocating results");
-	cluster_err(SXE_EMEM, "Volume list failed: out of memory");
+	cluster_err(SXE_EMEM, "Volume list failed: Out of memory");
 	fclose(yctx.f);
 	unlink(fname);
 	free(fname);
@@ -1069,27 +1406,29 @@ int sxc_cluster_listusers_next(sxc_cluster_lu_t *lu, char **user_name, int *is_a
     if(!fread(&user, sizeof(user), 1, lu->f)) {
 	if(ferror(lu->f)) {
 	    SXDEBUG("error reading attributes from results file");
-	    sxi_setsyserr(sx, SXE_EREAD, "Failed to retrieve next user: read item from cache failed");
+	    sxi_setsyserr(sx, SXE_EREAD, "Failed to retrieve next user: Read item from cache failed");
 	    return -1;
 	}
 	return 0;
     }
+    if(user.namelen & 0x80000000) {
+        SXDEBUG("Invalid user name length");
+        sxi_seterr(sx, SXE_EREAD, "Failed to retrieve next user: Bad data from cache file");
+        return -1;
+    }
 
-    if(user_name) {
-	*user_name = malloc(user.namelen + 1);
-	if(!*user_name) {
-	    SXDEBUG("OOM allocating result file name (%u bytes)", (unsigned)user.namelen);
-	    sxi_seterr(sx, SXE_EMEM, "Failed to retrieve next user: out of memory");
-	    return -1;
-	}
-	if(!fread(*user_name, user.namelen, 1, lu->f)) {
-	    SXDEBUG("error reading name from results file");
-	    sxi_setsyserr(sx, SXE_EREAD, "Failed to retrieve next user: read item from cache failed");
-	    return -1;
-	}
-	(*user_name)[user.namelen] = '\0';
-    } else
-	fseek(lu->f, user.namelen, SEEK_CUR);
+    *user_name = malloc(user.namelen + 1);
+    if(!*user_name) {
+        SXDEBUG("OOM allocating result file name (%u bytes)", user.namelen);
+        sxi_seterr(sx, SXE_EMEM, "Failed to retrieve next user: Out of memory");
+        return -1;
+    }
+    if(!fread(*user_name, user.namelen, 1, lu->f)) {
+        SXDEBUG("error reading name from results file");
+        sxi_setsyserr(sx, SXE_EREAD, "Failed to retrieve next user: Read item from cache failed");
+        return -1;
+    }
+    (*user_name)[user.namelen] = '\0';
 
     *is_admin = user.is_admin;
     return 1;
@@ -1108,12 +1447,11 @@ struct cbl_acluser_t {
     int can_read;
     int can_write;
     int is_owner;
-    int is_admin;
     unsigned int namelen;
 };
 
 struct cb_listaclusers_ctx {
-    sxc_client_t *sx;
+    curlev_context_t *cbdata;
     yajl_callbacks yacb;
     yajl_handle yh;
     struct cb_error_ctx errctx;
@@ -1150,22 +1488,22 @@ static int yacb_listaclusers_map_key(void *ctx, const unsigned char *s, size_t l
     if (yactx->state == LA_ERROR)
         return yacb_error_map_key(&yactx->errctx, s, l);
     if (yactx->state == LA_ACLUSER) {
-        if (ya_check_error(yactx->sx, &yactx->errctx, s, l)) {
+        if (ya_check_error(yactx->cbdata, &yactx->errctx, s, l)) {
             yactx->state = LA_ERROR;
             return 1;
         }
     }
     if(yactx->state == LA_ACLUSER) {
 	yactx->state = LA_PRIVS;
-	yactx->fname = malloc(l+1);
-	if(!yactx->fname) {
-	    CBDEBUG("OOM duplicating acluser name '%.*s'", (unsigned)l, s);
-	    sxi_seterr(yactx->sx, SXE_EMEM, "Out of memory");
-	    return 0;
-	}
-	memcpy(yactx->fname, s, l);
         memset(&yactx->acluser, 0, sizeof(yactx->acluser));
 	yactx->acluser.namelen = l;
+	yactx->fname = malloc(yactx->acluser.namelen);
+	if(!yactx->fname) {
+	    CBDEBUG("OOM duplicating acluser name '%.*s'", (unsigned)l, s);
+	    sxi_cbdata_seterr(yactx->cbdata, SXE_EMEM, "Out of memory");
+	    return 0;
+	}
+	memcpy(yactx->fname, s, yactx->acluser.namelen);
 	yactx->naclusers++;
 	return 1;
     }
@@ -1183,8 +1521,6 @@ static int yacb_listaclusers_string(void *ctx, const unsigned char *s, size_t l)
             yactx->acluser.can_write = 1;
 	else if(l == lenof("owner") && !memcmp(s, "owner", lenof("owner")))
 	    yactx->acluser.is_owner = 1;
-        else if (l == lenof("admin") && !memcmp(s, "admin", lenof("admin")))
-            yactx->acluser.is_admin = 1;
 	else {
 	    CBDEBUG("unexpected attribute '%.*s' in LA_PRIVS", (unsigned)l, s);
 	    return 0;
@@ -1205,7 +1541,7 @@ static int yacb_listaclusers_end_array(void *ctx) {
     if(yactx->state == LA_PRIVS) {
 	if(!fwrite(&yactx->acluser, sizeof(yactx->acluser), 1, yactx->f) || !fwrite(yactx->fname, yactx->acluser.namelen, 1, yactx->f)) {
 	    CBDEBUG("failed to save acluser attributes to temporary acluser");
-	    sxi_setsyserr(yactx->sx, SXE_EWRITE, "Failed to write temporary file");
+	    sxi_cbdata_setsyserr(yactx->cbdata, SXE_EWRITE, "Failed to write temporary file");
 	    return 0;
 	}
 	free(yactx->fname);
@@ -1234,21 +1570,20 @@ static int yacb_listaclusers_end_map(void *ctx) {
 }
 
 
-static int listaclusers_setup_cb(sxi_conns_t *conns, void *ctx, const char *host) {
+static int listaclusers_setup_cb(curlev_context_t *cbdata, void *ctx, const char *host) {
     struct cb_listaclusers_ctx *yactx = (struct cb_listaclusers_ctx *)ctx;
-    sxc_client_t *sx = sxi_conns_get_client(conns);
 
     if(yactx->yh)
 	yajl_free(yactx->yh);
 
+    yactx->cbdata = cbdata;
     if(!(yactx->yh  = yajl_alloc(&yactx->yacb, NULL, yactx))) {
-	SXDEBUG("failed to allocate yajl structure");
-	sxi_seterr(sx, SXE_EMEM, "List failed: out of memory");
+	CBDEBUG("failed to allocate yajl structure");
+	sxi_cbdata_seterr(cbdata, SXE_EMEM, "List failed: Out of memory");
 	return 1;
     }
 
     yactx->state = LA_BEGIN;
-    yactx->sx = sx;
     rewind(yactx->f);
     yactx->volume_size = 0;
     yactx->replica = 0;
@@ -1260,13 +1595,12 @@ static int listaclusers_setup_cb(sxi_conns_t *conns, void *ctx, const char *host
     return 0;
 }
 
-static int listaclusers_cb(sxi_conns_t *conns, void *ctx, const void *data, size_t size) {
-    struct cb_listaclusers_ctx *yctx = (struct cb_listaclusers_ctx *)ctx;
-    if(yajl_parse(yctx->yh, data, size) != yajl_status_ok) {
-        if (yctx->state != LA_ERROR) {
-            sxc_client_t *sx = sxi_conns_get_client(conns);
-            SXDEBUG("failed to parse JSON data");
-            sxi_seterr(sxi_conns_get_client(conns), SXE_ECOMM, "communication error");
+static int listaclusers_cb(curlev_context_t *cbdata, void *ctx, const void *data, size_t size) {
+    struct cb_listaclusers_ctx *yactx = (struct cb_listaclusers_ctx *)ctx;
+    if(yajl_parse(yactx->yh, data, size) != yajl_status_ok) {
+        if (yactx->state != LA_ERROR) {
+            CBDEBUG("failed to parse JSON data: %s", sxi_cbdata_geterrmsg(yactx->cbdata));
+            sxi_cbdata_seterr(yactx->cbdata, SXE_ECOMM, "communication error");
         }
 	return 1;
     }
@@ -1294,7 +1628,7 @@ sxc_cluster_la_t *sxc_cluster_listaclusers(sxc_cluster_t *cluster, const char *v
     sxc_clearerr(sx);
 
     sxi_hostlist_init(&volhosts);
-    if(sxi_locate_volume(cluster, volume, &volhosts, NULL)) {
+    if(sxi_locate_volume(sxi_cluster_get_conns(cluster), volume, &volhosts, NULL, NULL)) {
 	sxi_hostlist_empty(&volhosts);
 	return NULL;
     }
@@ -1309,7 +1643,7 @@ sxc_cluster_la_t *sxc_cluster_listaclusers(sxc_cluster_t *cluster, const char *v
 
     if(!(url = malloc(len))) {
 	CFGDEBUG("OOM allocating url (%u bytes)", len);
-	cluster_err(SXE_EMEM, "List failed: out of memory");
+	cluster_err(SXE_EMEM, "List failed: Out of memory");
 	sxi_hostlist_empty(&volhosts);
 	free(enc_vol);
 	return NULL;
@@ -1353,7 +1687,7 @@ sxc_cluster_la_t *sxc_cluster_listaclusers(sxc_cluster_t *cluster, const char *v
     if(yajl_complete_parse(yctx.yh) != yajl_status_ok || yctx.state != LA_COMPLETE) {
         if (yctx.state != LA_ERROR) {
             CFGDEBUG("JSON parsing failed");
-            cluster_err(SXE_ECOMM, "List failed: communication error");
+            cluster_err(SXE_ECOMM, "List failed: Communication error");
         }
 	if(yctx.yh)
 	    yajl_free(yctx.yh);
@@ -1369,7 +1703,7 @@ sxc_cluster_la_t *sxc_cluster_listaclusers(sxc_cluster_t *cluster, const char *v
     if(fflush(yctx.f) ||
        ftruncate(fileno(yctx.f), ftell(yctx.f)) ||
        fseek(yctx.f, 0L, SEEK_SET)) {
-	cluster_err(SXE_EWRITE, "List failed: failed to write temporary data");
+	cluster_err(SXE_EWRITE, "List failed: Failed to write temporary data");
 	fclose(yctx.f);
 	unlink(fname);
 	free(fname);
@@ -1379,7 +1713,7 @@ sxc_cluster_la_t *sxc_cluster_listaclusers(sxc_cluster_t *cluster, const char *v
     ret = malloc(sizeof(*ret));
     if(!ret) {
 	CFGDEBUG("OOM allocating results");
-	cluster_err(SXE_EMEM, "List failed: out of memory");
+	cluster_err(SXE_EMEM, "List failed: Out of memory");
 	fclose(yctx.f);
 	unlink(fname);
 	free(fname);
@@ -1392,7 +1726,7 @@ sxc_cluster_la_t *sxc_cluster_listaclusers(sxc_cluster_t *cluster, const char *v
     return ret;
 }
 
-int sxc_cluster_listaclusers_next(sxc_cluster_la_t *la, char **acluser_name, int *can_read, int *can_write, int *is_owner, int *is_admin) {
+int sxc_cluster_listaclusers_next(sxc_cluster_la_t *la, char **acluser_name, int *can_read, int *can_write, int *is_owner) {
     struct cbl_acluser_t acluser;
     sxc_client_t *sx;
 
@@ -1402,32 +1736,33 @@ int sxc_cluster_listaclusers_next(sxc_cluster_la_t *la, char **acluser_name, int
     if(!fread(&acluser, sizeof(acluser), 1, la->f)) {
 	if(ferror(la->f)) {
 	    SXDEBUG("error reading attributes from results acluser");
-	    sxi_setsyserr(sx, SXE_EREAD, "Failed to retrieve next acluser: read item from cache failed");
+	    sxi_setsyserr(sx, SXE_EREAD, "Failed to retrieve next acluser: Read item from cache failed");
 	    return -1;
 	}
 	return 0;
     }
+    if(acluser.namelen & 0x80000000) {
+        SXDEBUG("Invalid acluser name length");
+        sxi_seterr(sx, SXE_EREAD, "Failed to retrieve next acluser: Bad data from cache file");
+        return -1;
+    }
 
-    if(acluser_name) {
-	*acluser_name = malloc(acluser.namelen + 1);
-	if(!*acluser_name) {
-	    SXDEBUG("OOM allocating result acluser name (%u bytes)", (unsigned)acluser.namelen);
-	    sxi_seterr(sx, SXE_EMEM, "Failed to retrieve next acluser: out of memory");
-	    return -1;
-	}
-	if(!fread(*acluser_name, acluser.namelen, 1, la->f)) {
-	    SXDEBUG("error reading name from results acluser");
-	    sxi_setsyserr(sx, SXE_EREAD, "Failed to retrieve next acluser: read item from cache failed");
-	    return -1;
-	}
-	(*acluser_name)[acluser.namelen] = '\0';
-    } else
-	fseek(la->f, acluser.namelen, SEEK_CUR);
+    *acluser_name = malloc(acluser.namelen + 1);
+    if(!*acluser_name) {
+        SXDEBUG("OOM allocating result acluser name (%u bytes)", acluser.namelen);
+        sxi_seterr(sx, SXE_EMEM, "Failed to retrieve next acluser: Out of memory");
+        return -1;
+    }
+    if(!fread(*acluser_name, acluser.namelen, 1, la->f)) {
+        SXDEBUG("error reading name from results acluser");
+        sxi_setsyserr(sx, SXE_EREAD, "Failed to retrieve next acluser: Read item from cache failed");
+        return -1;
+    }
+    (*acluser_name)[acluser.namelen] = '\0';
 
     *can_read = acluser.can_read;
     *can_write = acluser.can_write;
     *is_owner = acluser.is_owner;
-    *is_admin = acluser.is_admin;
 
     return 1;
 }

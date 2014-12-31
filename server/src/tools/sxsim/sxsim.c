@@ -31,7 +31,6 @@
 #include <string.h>
 #include <dirent.h>
 #include <sys/stat.h>
-#include <openssl/evp.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
@@ -42,6 +41,8 @@
 #include "hdist.h"
 #include "utils.h"
 #include "linenoise.h"
+#include "../../../../libsx/src/vcrypto.h"
+#include "../../../../libsx/src/misc.h"
 
 #define MBVAL 1048576
 #define MINSIZE (10 * MBVAL)
@@ -84,7 +85,7 @@ struct sxcluster {
     unsigned int bsize_cnt[3];
     unsigned int node_cnt;
     struct sxnode *node;
-    unsigned int loaded, need_update, tid;
+    unsigned int need_update, tid;
 
     uint64_t capacity;
     uint64_t read;
@@ -114,17 +115,19 @@ static void free_cluster(struct sxcluster *cluster)
     free(cluster->node);
     cluster->node = NULL;
     cluster->node_cnt = 0;
-    if(sxi_hdist_version(cluster->hdist) && !cluster->loaded)
-	sxi_hdist_free(cluster->hdist);
+    sxi_hdist_free(cluster->hdist);
 }
 
+/*
 static int save_cluster(const struct sxcluster *cluster, const char *file)
 {
 	int fd;
 	unsigned int i, j;
-	int ret = 0;
+	int ret = 1;
 	const struct sxnode *node;
 	char path[1024], *newfile = NULL;
+	unsigned int cfg_len;
+	const void *cfg;
 
     if(!access(file, R_OK) || errno != ENOENT) {
 	for(i = 1; i < 1000; i++) {
@@ -149,35 +152,46 @@ static int save_cluster(const struct sxcluster *cluster, const char *file)
 
     if(write(fd, cluster, sizeof(struct sxcluster)) != sizeof(struct sxcluster)) {
 	printf("ERROR: Can't write to %s\n", file);
-	close(fd);
-	unlink(file);
-	return 1;
+	goto save_err;
     }
 
     for(i = 0; i < cluster->node_cnt; i++) {
 	node = &cluster->node[i];
 	if(write(fd, node, sizeof(struct sxnode)) != sizeof(struct sxnode)) {
 	    printf("ERROR: Can't write to %s\n", file);
-	    ret = 1;
-	    break;
+	    goto save_err;
 	}
 	for(j = 0; j < node->block_cnt; j++) {
 	    if(write(fd, &node->block[j], sizeof(struct sxblock)) != sizeof(struct sxblock)) {
 		printf("ERROR: Can't write to %s\n", file);
-		ret = 1;
-		break;
+		goto save_err;
 	    }
 	}
-	if(ret)
-	    break;
+    }
+
+    if(sxi_hdist_get_cfg(cluster->hdist, &cfg, &cfg_len)) {
+	printf("ERROR: Can't get hdist config\n");
+	goto save_err;
+    }
+
+    if(write(fd, &cfg_len, sizeof(cfg_len)) != sizeof(cfg_len)) {
+	printf("ERROR: Can't write hdist size to %s\n", file);
+	goto save_err;
+    }
+
+    if(write(fd, cfg, cfg_len) != cfg_len) {
+	printf("ERROR: Can't write hdist config to %s\n", file);
+	goto save_err;
     }
 
     if(write(fd, &cluster->magic, sizeof(cluster->magic)) != sizeof(cluster->magic)) {
 	printf("ERROR: Can't write to %s\n", file);
-	ret = 1;
+	goto save_err;
     }
 
-    close(fd);
+    ret = 0;
+save_err:
+    ret |= close(fd);
     if(ret)
 	unlink(file);
     else
@@ -189,8 +203,10 @@ static int load_cluster(struct sxcluster *cluster, const char *file)
 {
 	int fd;
 	unsigned int i, j;
-	int ret = 0;
+	int ret = 1;
 	struct sxnode *node;
+	unsigned int cfg_len;
+	void *cfg = NULL;
 
     fd = open(file, O_RDONLY);
     if(fd == -1) {
@@ -211,7 +227,7 @@ static int load_cluster(struct sxcluster *cluster, const char *file)
 	memset(cluster, 0, sizeof(struct sxcluster));
 	return 1;
     }
-    cluster->loaded = 1;
+    cluster->hdist = NULL;
 
     cluster->node = (struct sxnode *) calloc(cluster->node_cnt, sizeof(struct sxnode));
     if(!cluster->node) {
@@ -224,46 +240,65 @@ static int load_cluster(struct sxcluster *cluster, const char *file)
 	node = &cluster->node[i];
 	if(read(fd, node, sizeof(struct sxnode)) != sizeof(struct sxnode)) {
 	    printf("ERROR: Can't read %s\n", file);
-	    ret = 1;
 	    node->block_cnt = 0;
-	    break;
+	    goto load_err;
 	}
 	node->block_avail = 0;
 	node->block = (struct sxblock *) malloc(node->block_cnt * sizeof(struct sxblock));
 	if(!node->block) {
 	    printf("ERROR: Out of memory\n");
-	    ret = 1;
 	    node->block_cnt = 0;
-	    break;
+	    goto load_err;
 	}
 
 	for(j = 0; j < node->block_cnt; j++) {
 	    if(read(fd, &node->block[j], sizeof(struct sxblock)) != sizeof(struct sxblock)) {
-		printf("ERROR: Can't read %s\n", file);
-		ret = 1;
-		break;
+		printf("ERROR: Can't load block from %s\n", file);
+		goto load_err;
 	    }
 	}
-	if(ret)
-	    break;
     }
 
-    if(!ret) {
-	if(read(fd, &cluster->magic, sizeof(cluster->magic)) != sizeof(cluster->magic)) {
-	    printf("ERROR: Can't write to %s\n", file);
-	    ret = 1;
-	}
-	if(cluster->magic != MAGIC) {
-	    printf("ERROR: Broken cluster data in %s\n", file);
-	    ret = 1;
-	}
+    if(read(fd, &cfg_len, sizeof(cfg_len)) != sizeof(cfg_len)) {
+	printf("ERROR: Can't load hdist size from %s\n", file);
+	goto load_err;
     }
 
+    if(!(cfg = malloc(cfg_len))) {
+	printf("ERROR: Can't allocate memoryfor hdist config\n");
+	goto load_err;
+    }
+
+    if(read(fd, cfg, cfg_len) != cfg_len) {
+	printf("ERROR: Can't write hdist config to %s\n", file);
+	goto load_err;
+    }
+
+    cluster->hdist = sxi_hdist_from_cfg(cfg, cfg_len);
+    if(!cluster->hdist) {
+	printf("ERROR: Can't initialize hdist from config\n");
+	goto load_err;
+    }
+
+    if(read(fd, &cluster->magic, sizeof(cluster->magic)) != sizeof(cluster->magic)) {
+	printf("ERROR: Can't read from %s\n", file);
+	goto load_err;
+    }
+
+    if(cluster->magic != MAGIC) {
+	printf("ERROR: Broken cluster data in %s\n", file);
+	goto load_err;
+    }
+
+    ret = 0;
+load_err:
     close(fd);
+    free(cfg);
     if(ret)
 	free_cluster(cluster);
     return ret;
 }
+*/
 
 static int dump_cluster(struct sxcluster *cluster, FILE *file)
 {
@@ -289,6 +324,15 @@ static int dump_cluster(struct sxcluster *cluster, FILE *file)
     return 0;
 }
 
+static int savecmds(const struct sxcluster *cluster, const char *file)
+{
+    if(linenoiseHistorySave(file)) {
+	printf("ERROR: Can't save commands to %s\n", file);
+	return -1;
+    }
+    return 0;
+}
+
 static int update(struct sxcluster *cluster)
 {
 	unsigned int i;
@@ -296,12 +340,11 @@ static int update(struct sxcluster *cluster)
     if(!cluster->need_update)
 	return 0;
 
-    if(!cluster->hdist || cluster->loaded) {
+    if(!cluster->hdist) {
 	if(!(cluster->hdist = sxi_hdist_new(SEED, MAXBUILDS, NULL))) {
 	    printf("ERROR: sxi_hdist_new failed\n");
 	    return -1;
 	}
-	cluster->loaded = 0;
     } else {
 	if(sxi_hdist_buildcnt(cluster->hdist) == MAXBUILDS) {
 	    printf("%u changes to cluster already, rebalance is required\n", MAXBUILDS);
@@ -314,7 +357,7 @@ static int update(struct sxcluster *cluster)
     }
 
     for(i = 0; i < cluster->node_cnt; i++) {
-	if(!cluster->node[i].del_flag && sxi_hdist_addnode(cluster->hdist, &cluster->node[i].uuid, "0.0.0.0", "0.0.0.0", cluster->node[i].capacity) != OK) {
+	if(!cluster->node[i].del_flag && sxi_hdist_addnode(cluster->hdist, &cluster->node[i].uuid, "0.0.0.0", "0.0.0.0", cluster->node[i].capacity, NULL) != OK) {
 	    printf("ERROR: Can't add new node to hdist\n");
 	    return -1;
 	}
@@ -343,7 +386,7 @@ static struct sxnode *getnode(struct sxcluster *cluster, const sx_uuid_t *uuid)
 
 static int rebalance(struct sxcluster *cluster)
 {
-	unsigned int i, j, k, cfg_len, ret;
+	unsigned int i, j, k, cfg_len;
 	struct sxnode *node;
 	struct sxcluster newcluster;
 	const void *cfg;
@@ -353,8 +396,8 @@ static int rebalance(struct sxcluster *cluster)
 	return -1;
     }
 
-    if((ret = update(cluster)) < 0)
-	return ret;
+    if(update(cluster))
+	return -1;
 
     if(sxi_hdist_buildcnt(cluster->hdist) < 2) {
 	printf("No rebalance required\n");
@@ -382,7 +425,7 @@ static int rebalance(struct sxcluster *cluster)
 	    uint64_t datamoved = 0;
 	    struct sxblock *block;
 	    int stays;
-	    sx_nodelist_t *nl_cur, *nl_old;
+	    sx_nodelist_t *nl_cur;
 
 	node = &cluster->node[i];
 	if(node->del_flag == 2 || (node->del_flag == 1 && !node->stored))
@@ -397,12 +440,13 @@ static int rebalance(struct sxcluster *cluster)
 	    if(!block->hash)
 		continue;
 
+	    nl_cur = sxi_hdist_locate(newcluster.hdist, block->hash, block->replica_cnt, 0);
+	    if(!nl_cur) {
+		printf("ERROR: rebalance: Can't calculate destination nodes (bidx: 0)\n");
+		return -1;
+	    }
+
 	    if(!block->origin) {
-		nl_cur = sxi_hdist_locate(newcluster.hdist, block->hash, block->replica_cnt, 0);
-		if(!nl_cur) {
-		    printf("ERROR: rebalance: Can't calculate destination nodes (bidx: 0)\n");
-		    return -1;
-		}
 		stays = 0;
 		for(k = 0; k < block->replica_cnt; k++) {
 		    const sx_node_t *n = sx_nodelist_get(nl_cur, k);
@@ -411,9 +455,9 @@ static int rebalance(struct sxcluster *cluster)
 			break;
 		    }
 		}
-		sx_nodelist_delete(nl_cur);
 		if(!stays)
 		    datamoved += block->bs;
+		sx_nodelist_delete(nl_cur);
 		continue;
 	    }
 
@@ -422,28 +466,21 @@ static int rebalance(struct sxcluster *cluster)
 		printf("--- DUMP OF PARTIALLY REBALANCED CLUSTER ---\n");
 		print_cluster(&newcluster);
 		printf("--- END OF DUMP ---\n");
-		return -1;
-	    }
-
-	    nl_old = sxi_hdist_locate(cluster->hdist, block->hash, block->replica_cnt, 1);
-	    if(!nl_old) {
-		printf("ERROR: rebalance: Can't calculate destination nodes (bidx: 1)\n");
+		sx_nodelist_delete(nl_cur);
 		return -1;
 	    }
 
 	    stays = 0;
 	    for(k = 0; k < block->replica_cnt; k++) {
-		const sx_node_t *n = sx_nodelist_get(nl_old, k);
+		const sx_node_t *n = sx_nodelist_get(nl_cur, k);
 		if(!memcmp(&node->uuid, sx_node_uuid(n), sizeof(node->uuid))) {
 		    stays = 1;
 		    break;
 		}
 	    }
-	    sx_nodelist_delete(nl_old);
-	    if(!stays) {
+	    sx_nodelist_delete(nl_cur);
+	    if(!stays)
 		datamoved += block->bs;
-		printf("no-stays(2)\n");
-	    }
 	}
 	printf("Data moved from node '%s': %llu MB (%.1f%%)\n", node->host, (long long unsigned) datamoved / MBVAL, 100.0 * datamoved / node->stored);
 	if(cluster->node[i].del_flag == 1)
@@ -724,7 +761,7 @@ static int addnode(struct sxcluster *cluster, const char *host, uint64_t capacit
     }
     cluster->node = node_new;
     memset(&cluster->node[cluster->node_cnt], 0, sizeof(struct sxnode));
-    strncpy(cluster->node[cluster->node_cnt].host, host, sizeof(cluster->node[cluster->node_cnt].host));
+    sxi_strlcpy(cluster->node[cluster->node_cnt].host, host, sizeof(cluster->node[cluster->node_cnt].host));
     cluster->node[cluster->node_cnt].capacity = capacity;
     cluster->capacity += capacity;
     if(!uuid)
@@ -916,20 +953,12 @@ static int dedup(struct sxcluster *cluster)
 }
 
 static uint64_t hashcalc(struct sxcluster *cluster, const void *buffer, unsigned int len) {
-	unsigned char d[20];
-	EVP_MD_CTX ctx;
+    unsigned char d[20];
 
-    if(!EVP_DigestInit(&ctx, EVP_sha1())) {
-	printf("ERROR: Cannot compute hash: unable to initialize crypto library\n");
-	return 0;
-    }
-
-    if(!EVP_DigestUpdate(&ctx, buffer, len) || !EVP_DigestFinal(&ctx, d, NULL)) {
+    if (sxi_sha1_calc(NULL, 0, buffer, len, d)) {
 	printf("ERROR: Cannot compute hash: crypto library failure\n");
-	EVP_MD_CTX_cleanup(&ctx);
 	return 0;
     }
-    EVP_MD_CTX_cleanup(&ctx);
 
     return MurmurHash64(d, sizeof(d), SEED);
 }
@@ -938,7 +967,7 @@ static void shutdown(struct sxcluster *cluster, int ret)
 {
     free_cluster(cluster);
     cmdline_parser_free(&args);
-    EVP_cleanup();
+    sxi_vcrypto_cleanup();
     exit(ret);
 }
 
@@ -997,7 +1026,7 @@ void manage_completion(const char *line, linenoiseCompletions *lc)
 	unsigned int len, i;
 	char *commands[] = { "addnode", "help", "info", "debug", "blkstats", "resize",
 			     "rebalance", /* "rebalanceV2", */ "continue", "save",
-			     "dump", "exit" };
+			     "savecmds", "dump", "exit" };
 
     while(*line == ' ')
 	line++;
@@ -1011,7 +1040,7 @@ void interactive_completion(const char *line, linenoiseCompletions *lc)
 {
 	unsigned int len, i;
 	char *commands[] = { "addnode", "delnode", "help", "info", "debug", "blkstats", "resize",
-			     "rebalance", /* "rebalanceV2", */ "store", "save",
+			     "rebalance", /* "rebalanceV2", */ "store", "save", "savecmds",
 			     "load", "dump", "reset", "execute", "exit" };
 
     while(*line == ' ')
@@ -1040,10 +1069,8 @@ static int runcmd(struct sxcluster *cluster, int mode, char *line)
 	printf("\n");
 	if(mode == IA)
 	printf("  store		-> store data from PATH with optional replica count N\n");
-	if(mode == IA)
-	printf("  load		-> load cluster data from file\n");
-	printf("  save		-> save cluster data to file\n");
 	printf("  dump		-> dump cluster content to file in CSV format\n");
+	printf("  savecmds	-> save commands executed in this session to file\n");
 	if(mode == IA)
 	printf("  reset		-> reset cluster\n");
 	if(mode == CL)
@@ -1099,11 +1126,11 @@ static int runcmd(struct sxcluster *cluster, int mode, char *line)
 		}
 		found = 1;
 		node->del_flag = 1;
+		cluster->need_update = 1;
 		if(!node->stored) {
 		    cluster->capacity -= node->capacity;
-		    cluster->need_update = 1;
 		} else {
-		    if(!sxi_hdist_version(cluster->hdist) || cluster->loaded) {
+		    if(!sxi_hdist_version(cluster->hdist)) {
 			printf("Updating distribution model...\n");
 			update(cluster);
 		    }
@@ -1176,7 +1203,7 @@ static int runcmd(struct sxcluster *cluster, int mode, char *line)
 		printf("Null cluster, use 'addnode' to add new nodes\n");
 		return 0;
 	    }
-	    if(!sxi_hdist_version(cluster->hdist) || cluster->loaded) {
+	    if(!sxi_hdist_version(cluster->hdist)) {
 		printf("Updating distribution model...\n");
 		update(cluster);
 	    }
@@ -1216,7 +1243,7 @@ static int runcmd(struct sxcluster *cluster, int mode, char *line)
 	    return 0;
 	}
 
-	if(!sxi_hdist_version(cluster->hdist) || cluster->loaded || cluster->need_update) {
+	if(!sxi_hdist_version(cluster->hdist) || cluster->need_update) {
 	    printf("Updating distribution model...\n");
 	    update(cluster);
 	}
@@ -1225,6 +1252,7 @@ static int runcmd(struct sxcluster *cluster, int mode, char *line)
 	if(process_data(cluster, path, replica_count, IA) == -2)
 	    printf("Not enough space - please add more space/nodes and try again\n");
 
+/*
     } else if(mode == IA && !strncmp(line, "load", 4)) {
 	    struct sxcluster newcluster;
 
@@ -1238,7 +1266,13 @@ static int runcmd(struct sxcluster *cluster, int mode, char *line)
 	    memcpy(cluster, &newcluster, sizeof(newcluster));
 	    printf("Cluster data loaded from '%s'\n", &line[5]);
 	}
-
+*/
+    } else if(!strncmp(line, "savecmds", 8)) {
+	if(strlen(line) < 10)
+	    printf("Usage: savecmds FILE\n");
+	else
+	    savecmds(cluster, &line[9]);
+/*
     } else if(!strncmp(line, "save", 4)) {
 	if(strlen(line) < 6)
 	    printf("Usage: save FILE\n");
@@ -1250,7 +1284,7 @@ static int runcmd(struct sxcluster *cluster, int mode, char *line)
 		save_cluster(cluster, &line[5]);
 	    }
 	}
-
+*/
     } else if(!strncmp(line, "dump", 4)) {
 	if(strlen(line) < 6) {
 	    printf("Usage: dump FILE/-\n");
@@ -1267,8 +1301,10 @@ static int runcmd(struct sxcluster *cluster, int mode, char *line)
 			return 0;
 		    }
 		    dump_cluster(cluster, file);
-		    fclose(file);
-		    printf("Cluster data dumped to '%s'\n", &line[5]);
+		    if(fclose(file))
+			printf("ERROR: Failed to close file '%s'\n", &line[5]);
+		    else
+			printf("Cluster data dumped to '%s'\n", &line[5]);
 		}
 	    }
 	}
@@ -1327,6 +1363,7 @@ static int execute(struct sxcluster *cluster, const char *fname)
 	runcmd(cluster, IA, cmd);
     }
     fclose(file);
+    linenoiseHistoryLoad(fname);
     return 0;
 }
 
@@ -1584,7 +1621,6 @@ static void print_debug(struct sxcluster *cluster)
     printf("* Cluster:\n");
     printf(" - magic: 0x%x\n", cluster->magic);
     printf(" - nodes: %u\n", cluster->node_cnt);
-    printf(" - loaded: %u\n", cluster->loaded);
     printf(" - need update: %u\n", cluster->need_update);
     printf(" - transaction ID: %u\n", cluster->tid);
     printf(" - capacity: %llu\n", (unsigned long long) cluster->capacity);
@@ -1592,8 +1628,9 @@ static void print_debug(struct sxcluster *cluster)
     printf(" - stored: %llu\n", (unsigned long long) cluster->stored);
     printf(" - deduped: %llu\n", (unsigned long long) cluster->deduped);
     printf("* Distribution model:\n");
+    printf(" - Version: %u\n", sxi_hdist_version(cluster->hdist));
+    printf(" - Number of builds: %u, max: %u\n", sxi_hdist_buildcnt(cluster->hdist), MAXBUILDS);
     printf(" - Checksum: %llu\n", (unsigned long long) sxi_hdist_checksum(cluster->hdist));
-    printf(" - Number of builds: %d, max: %d\n", sxi_hdist_buildcnt(cluster->hdist), MAXBUILDS);
     printf(" - Seed: 0x%x\n", SEED);
 }
 
@@ -1658,7 +1695,6 @@ int main(int argc, char **argv)
 	    cmdline_parser_free(&args);
 	    return 1;
 	}
-	OpenSSL_add_all_digests();
 	memset(&cluster, 0, sizeof(cluster));
 	if(args.execute_given && execute(&cluster, args.execute_arg))
 	    shutdown(&cluster, 1);
@@ -1688,21 +1724,21 @@ int main(int argc, char **argv)
 	}
     }
 
-    OpenSSL_add_all_digests();
-
     memset(&cluster, 0, sizeof(cluster));
 
     if(args.dump_cluster_given) {
+	/*
 	if(load_cluster(&cluster, args.dump_cluster_arg))
 	    shutdown(&cluster, 1);
+	*/
 	ret = dump_cluster(&cluster, stdout);
 	shutdown(&cluster, ret ? 1 : 0);
     }
-
+/*
     if(args.load_cluster_given)
 	if(load_cluster(&cluster, args.load_cluster_arg))
 	    shutdown(&cluster, 1);
-
+*/
     if(args.node_list_given)
 	if(read_nodes(&cluster) < 0)
 	    shutdown(&cluster, 1);
@@ -1723,10 +1759,9 @@ int main(int argc, char **argv)
 	printf("ERROR: sxi_hdist_new failed\n");
 	shutdown(&cluster, 1);
     }
-    cluster.loaded = 0;
 
     for(i = 0; i < cluster.node_cnt; i++) {
-	if(sxi_hdist_addnode(cluster.hdist, &cluster.node[i].uuid, "0.0.0.0", "0.0.0.0", cluster.node[i].capacity) != OK) {
+	if(sxi_hdist_addnode(cluster.hdist, &cluster.node[i].uuid, "0.0.0.0", "0.0.0.0", cluster.node[i].capacity, NULL) != OK) {
 	    printf("ERROR: Can't add new node to hdist\n");
 	    shutdown(&cluster, 1);
 	}
@@ -1768,8 +1803,9 @@ int main(int argc, char **argv)
     if(args.blkstats_given)
 	print_blkstats(&cluster);
 
+/*
     if(args.save_cluster_given)
 	save_cluster(&cluster, args.save_cluster_arg);
-
+*/
     shutdown(&cluster, ret ? 1 : 0);
 }

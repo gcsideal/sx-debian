@@ -1,0 +1,43 @@
+.TH SXACL "1" "September 2014" "sxacl @VERSION@" "Skylable SX Manual"
+.SH NAME
+sxacl \- manage users and permissions
+.SH SYNOPSIS
+.B sxacl
+\fI\,<command> \/\fR[\fI\,OPTIONS\/\fR]...
+.SH DESCRIPTION
+sxacl manages users and permissions for SX clusters and volumes.
+.SH COMMANDS
+The available commands are listed below. To get more information about a specific command run \fB'man sxacl COMMAND'\fR.
+.TP
+.B useradd
+Create a new user.
+.TP
+.B userdel
+Remove an existing user.
+.TP
+.B userlist
+List users.
+.TP
+.B usergetkey
+Retrieve the authentication key of a user.
+.TP
+.B usernewkey
+Change the authentication key of a user.
+.TP
+.B volperm
+Manage volume permissions.
+.TP
+.B volshow
+Display volume permissions.
+.TP
+.B whoami
+Show the username associated with the current auth key.
+.SH OPTIONS
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help and exit
+.TP
+\fB\-V\fR, \fB\-\-version\fR
+Print version and exit
+.SH SEE ALSO
+\fBsxvol\fR(1), \fBsxinit\fR(1)

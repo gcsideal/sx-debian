@@ -6,14 +6,20 @@ set -x
 # we might miss essential utilities like chown
 PATH=`getconf PATH`
 
+# Disable proxies
+unset HTTP_PROXY
+unset http_proxy
+unset HTTPS_PROXY
+unset https_proxy
+
 prefix=`mktemp -d $PWD/sx-test-valgrind-XXXXXXXX`
 cleanup () {
-    (cd ../3rdparty/sxhttpd && make clean && make -j5)
+    make -C sxscripts clean
     rm -rf $prefix
 }
 trap cleanup EXIT INT
 
-make -C ../3rdparty/sxhttpd install-sbinSCRIPTS install-nobase_sysconfDATA install-data prefix=$prefix -s
+make -C sxscripts clean install prefix="$prefix" -s
 touch src/fcgi/fcgi-server.c && make all prefix=$prefix -s && touch src/fcgi/fcgi-server.c
 mkdir -p $prefix/bin
 mkdir -p $prefix/sbin
@@ -49,7 +55,7 @@ SXLOGFILE=$prefix/var/log/sxserver/sxfcgi.log
 EOF
 
 sh -x $prefix/sbin/sxsetup </dev/null
-sed -e "s|listen .*443|listen 127.0.0.1:8443|g" -e "s|listen .*80|listen 127.0.0.1:8013|g" -e "s|/tmp/sx|$prefix/tmp/sx|g" $prefix/etc/sxserver/sxhttpd.conf >$prefix/etc/sxserver/sxhttpd.conf.1
+sed -e "s|^user.*|user `whoami`;|" -e "s|listen .*443|listen 127.0.0.1:8443|g" -e "s|listen .*80|listen 127.0.0.1:8013|g" -e "s|/tmp/sx|$prefix/tmp/sx|g" $prefix/etc/sxserver/sxhttpd.conf >$prefix/etc/sxserver/sxhttpd.conf.1
 mv $prefix/etc/sxserver/sxhttpd.conf.1 $prefix/etc/sxserver/sxhttpd.conf
 cat >>$prefix/etc/sxserver/sxfcgi.conf <<EOF
 children=2
@@ -63,7 +69,7 @@ cleanup () {
     rm -f valgrind.$ID.*.log
     cat /tmp/valgrind.$ID.log
     ls -lh /tmp/valgrind.$ID.log
-    (cd ../3rdparty/sxhttpd && make clean && make -j5)
+    make -C sxscripts clean
 }
 trap cleanup EXIT INT
 sh $prefix/sbin/sxserver start </dev/null

@@ -44,13 +44,10 @@
 #include <netdb.h>
 #include <unistd.h>
 #include <ftw.h>
-#include <openssl/rand.h>
-#include <openssl/hmac.h>
-#include <openssl/err.h>
-#include <openssl/evp.h>
 #include "isaac.h"
-#include "3rdparty/valgrind/valgrind/memcheck.h"
 #include "../libsx/src/misc.h"
+#include "../libsx/src/vcrypto.h"
+#include "version.h"
 
 static const char hexchar[16] = "0123456789abcdef";
 int bin2hex(const void *src, uint32_t src_len, char *dst, uint32_t dst_len)
@@ -289,7 +286,7 @@ void uuid_generate(sx_uuid_t *u) {
     unsigned int i, seed;
     isaac_ctx is;
 
-    VALGRIND_MAKE_MEM_DEFINED(&is, sizeof(is));
+    memset(&is, 0, sizeof(is));
     gettimeofday(&t, NULL);
     seed = t.tv_sec ^ (t.tv_usec << 7) ^ (getpid() << 19) ^ ((uint64_t)(&seed) >> 4);
     isaac_seed(&is, seed);
@@ -314,6 +311,8 @@ void uuid_generate(sx_uuid_t *u) {
 }
 
 int uuid_from_string(sx_uuid_t *u, const char *s) {
+    if(!u || !s)
+	return 1;
     if(strlen(s) != 36 ||
        hex2bin(s, 8, u->binary, 4) ||
        s[8] != '-' ||
@@ -341,14 +340,8 @@ void uuid_from_binary(sx_uuid_t *u, const void *b) {
 
 int gen_key(unsigned char *buf, int num)
 {
-    char namebuf[1024];
-    const char *file = RAND_file_name(namebuf, sizeof(namebuf));
-    if (file)
-        RAND_load_file(file, -1);
-    if (RAND_status() == 1 && RAND_bytes(buf, num) == 1) {
-        RAND_write_file(file);
+    if (sxi_rand_bytes(buf, num))
         return 0;
-    }
     return -1;
 }
 
@@ -361,25 +354,26 @@ int derive_key(const unsigned char *salt, unsigned slen,
                unsigned char *buf, int blen)
 {
     /* RFC5869 */
-    uint8_t prk[EVP_MAX_MD_SIZE], md[EVP_MAX_MD_SIZE];
-    HMAC_CTX hmac_ctx;
+    uint8_t prk[SXI_SHA1_BIN_LEN], md[SXI_SHA1_BIN_LEN];
     unsigned int mdlen = sizeof(prk);
-    HMAC_CTX_init(&hmac_ctx);
+    sxi_hmac_sha1_ctx *hmac_ctx = sxi_hmac_sha1_init();
+    if (!hmac_ctx)
+        return -1;
 
-    if (!sxi_hmac_init_ex(&hmac_ctx, salt, slen, EVP_sha1(), NULL) ||
-        !sxi_hmac_update(&hmac_ctx, ikm, ilen) || /* Input Keying Material */
-        !sxi_hmac_final(&hmac_ctx, prk, &mdlen)) {
+    if (!sxi_hmac_sha1_init_ex(hmac_ctx, salt, slen) ||
+        !sxi_hmac_sha1_update(hmac_ctx, ikm, ilen) || /* Input Keying Material */
+        !sxi_hmac_sha1_final(hmac_ctx, prk, &mdlen)) {
         /*SSLERR();*/
         return -1;
     }
-    if (!sxi_hmac_init_ex(&hmac_ctx, prk, mdlen, EVP_sha1(), NULL) || /* PRK */
-        !sxi_hmac_update(&hmac_ctx, (const unsigned char*)info, strlen(info)) || /* T(0) || info */
-        !sxi_hmac_update(&hmac_ctx, (const unsigned char*)"\x1", 1) || /* || 0x01 */
-        !sxi_hmac_final(&hmac_ctx, md, &mdlen)) {
+    if (!sxi_hmac_sha1_init_ex(hmac_ctx, prk, mdlen) || /* PRK */
+        !sxi_hmac_sha1_update(hmac_ctx, (const unsigned char*)info, strlen(info)) || /* T(0) || info */
+        !sxi_hmac_sha1_update(hmac_ctx, (const unsigned char*)"\x1", 1) || /* || 0x01 */
+        !sxi_hmac_sha1_final(hmac_ctx, md, &mdlen)) {
         /*SSLERR();*/
         return -1;
     }
-    HMAC_CTX_cleanup(&hmac_ctx);
+    sxi_hmac_sha1_cleanup(&hmac_ctx);
     if (blen != mdlen) {
         WARN("bad hash length");
         return -1;
@@ -504,13 +498,7 @@ double timediff(struct timeval *time_start, struct timeval *time_end) {
 
 int ssl_version_check(void)
 {
-    uint32_t runtime_ver = SSLeay();
-    uint32_t compile_ver = SSLEAY_VERSION_NUMBER;
-    if((runtime_ver & 0xff0000000) != (compile_ver & 0xff0000000)) {
-	CRIT("OpenSSL major version mismatch: %x vs %x", runtime_ver, compile_ver);
-        return -1;
-    }
-    return 0;
+    return sxi_crypto_check_ver(&logger);
 }
 
 static const struct passwd *getuser(const char *name)
@@ -533,39 +521,76 @@ static const struct group *getgroup(const char *name)
     return getgrnam(name);
 }
 
-int runas(char *usergroup)
+int parse_usergroup(const char *usergroup, uid_t *uid, gid_t *gid)
 {
-    if (!usergroup) {
+    char *cpy, *group;
+    const struct passwd *p;
+
+    if(!usergroup || !uid || !gid) {
         NULLARG();
         return -1;
     }
-    char *group = strchr(usergroup,':');
-    if (group)
-        *group++ = '\0';
-    if (!*usergroup && (!group || !*group)) {
-        WARN("Keeping user:group");
-        return 0;/* keep current user */
+    cpy = strdup(usergroup);
+    if(!cpy) {
+	CRIT("OOM");
+	return -1;
     }
-    const struct passwd *p = getuser(usergroup);
-    if (!p) {
-        CRIT("Unknown user '%s': %s", usergroup, strerror(errno));
+    group = strchr(cpy,':');
+    if(group)
+        *group++ = '\0';
+    if(!*cpy && (!group || !*group)) {
+	CRIT("Can't parse group in '%s'\n", usergroup);
+	free(cpy);
+	return -1;
+    }
+    p = getuser(cpy);
+    if(!p) {
+        CRIT("Unknown user '%s'", cpy);
+	free(cpy);
         endpwent();
         return -1;
     }
-    uid_t uid = p->pw_uid;
-    gid_t gid;
-    if (!group || !*group) {
-        gid = p->pw_gid;
+    *uid = p->pw_uid;
+    if(!group || !*group) {
+        *gid = p->pw_gid;
     } else {
         const struct group *g = getgroup(group);
-        if (!g) {
-            CRIT("Unknown group '%s': %s", group, strerror(errno));
+        if(!g) {
+            CRIT("Unknown group '%s'", group);
+	    free(cpy);
             endgrent();
+	    endpwent();
             return -1;
         }
-        gid = g->gr_gid;
+        *gid = g->gr_gid;
+        endgrent();
     }
+    free(cpy);
+    endpwent();
+    return 0;
+}
 
+int runas(const char *usergroup)
+{
+    uid_t uid;
+    gid_t gid;
+    const struct passwd *p;
+
+    if(parse_usergroup(usergroup, &uid, &gid))
+	return -1;
+
+    if (getuid() == uid && geteuid() == uid &&
+        getgid() == gid && getegid() == gid) {
+        INFO("Already running as %d:%d, request to change user:group ignored",
+             uid, gid);
+        return 0;
+    }
+#ifdef HAVE_SETGROUPS
+    if(setgroups(1, &gid) == -1) {
+        CRIT("setgroups failed: %s", strerror(errno));
+        return -1;
+    }
+#endif
     if (setgid(gid) == -1) {
         CRIT("Cannot set groupid to %d: %s", gid, strerror(errno));
         return -1;
@@ -577,7 +602,7 @@ int runas(char *usergroup)
 
     p = getpwuid(uid);
     const struct group *g = getgrgid(gid);
-    INFO("Switched to %s:%s (%d:%d)",
+    DEBUG("Switched to %s:%s (%d:%d)",
          p ? p->pw_name : "N/A",
          g ? g->gr_name : "N/A",
          uid, gid);
@@ -655,14 +680,14 @@ const char *strptimegm(const char *s, const char *format, time_t *t) {
     return ret;
 }
 
-int wait_trigger(int pipe, unsigned max_wait_sec, int *forced_awake)
+int wait_trigger(int pipe, float max_wait_sec, int *forced_awake)
 {
     struct timeval tv;
     fd_set rfds;
     int sl;
 
-    tv.tv_sec = max_wait_sec;
-    tv.tv_usec = 0;
+    tv.tv_sec = (int)max_wait_sec;
+    tv.tv_usec = (max_wait_sec - tv.tv_sec) * 1000000.0;
     FD_ZERO(&rfds);
     FD_SET(pipe, &rfds);
     if (forced_awake)
@@ -690,3 +715,20 @@ int wait_trigger(int pipe, unsigned max_wait_sec, int *forced_awake)
         return -1;
     return 0;
 }
+
+const char *src_version(void)
+{
+    return SRC_VERSION;
+}
+
+int gc_interval;
+int gc_max_batch;
+float blockmgr_delay;
+/* used outside of fcgi */
+int db_min_passive_wal_pages=5000;
+int db_max_passive_wal_pages=10000;
+int db_max_restart_wal_pages=20000;
+int db_idle_restart=60;
+int db_busy_timeout=20;
+int worker_max_wait;
+int worker_max_requests;

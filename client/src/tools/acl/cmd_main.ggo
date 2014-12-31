@@ -2,14 +2,17 @@ package "sxacl"
 args "--no-handle-version --no-handle-error --no-handle-help --file-name=cmd_main --func-name=main_cmdline_parser --arg-struct-name=main_args_info"
 usage "sxacl <command> [OPTIONS]..."
 
-purpose "This tool manages users and permissions."
+purpose "Manage SX users and their permissions"
 
 text "\nAvailable commands:\n\n"
 
 text "  useradd     Create a new user\n"
+text "  userdel     Remove an existing user (and gain ownership of its volumes)\n"
 text "  userlist    List users\n"
 text "  usergetkey  Retrieve the auth key of a user\n"
-text "  perm        Manage volume permissions\n"
-text "  list        List volume permissions\n"
+text "  usernewkey  Change the auth key of a user\n"
+text "  volperm     Manage volume permissions\n"
+text "  volshow     Show all ACLs on a volume\n"
+text "  whoami      Show the username associated with the current auth key\n"
 
 text "\nSee 'sxacl <command> --help' for more information on a specific command.\n"

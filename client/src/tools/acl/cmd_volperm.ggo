@@ -1,0 +1,19 @@
+package "sxacl"
+args "--unamed-opts --no-handle-version --no-handle-error --file-name=cmd_volperm --func-name=volperm_cmdline_parser --arg-struct-name=volperm_args_info"
+usage "sxacl volperm [OPTIONS] user sx://[profile@]cluster/volume"
+
+section "Volume permission modification options"
+
+option "grant" - "Grant a privilege on the volume to the user" string typestr="<privilege>" optional
+
+option  "revoke" - "Revoke a privilege on the volume from the user" string
+    typestr="<privilege>" optional
+
+text "where <privilege> can be any of \"read\", \"write\" or \"read,write\""
+
+section "Common options"
+
+option  "config-dir"		c "Path to SX configuration directory"
+        string typestr="PATH" optional hidden
+
+option  "debug"		D "Enable debug messages" flag off

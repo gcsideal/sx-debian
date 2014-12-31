@@ -40,6 +40,7 @@
 
 #include "sx.h"
 #include "../../../../libsx/src/sxreport.h"
+#include "../../../../libsx/src/misc.h"
 #include "version.h"
 
 static int filter_list(sxc_client_t *sx)
@@ -55,7 +56,7 @@ static int filter_list(sxc_client_t *sx)
     for(i = 0; i < count; i++) {
         const sxc_filter_t *f = sxc_get_filter(&filters[i]);
         sxi_info(sx, "'%s' filter details:", f->shortname);
-        sxi_info(sx,"\tFull name: %s", f->fullname);
+        sxi_info(sx,"\tShort description: %s", f->shortdesc);
         sxi_info(sx,"\tSummary: %s", f->summary);
         sxi_info(sx,"\tOptions: %s", f->options ? f->options : "No options");
         sxi_info(sx,"\tUUID: %s", f->uuid);
@@ -71,7 +72,7 @@ static const char *get_filter_dir(sxc_client_t *sx, const char *fdir)
     const char *pt;
     if(fdir)
         return fdir;
-    pt = getenv("SX_FILTER_DIR");
+    pt = sxi_getenv("SX_FILTER_DIR");
     if(pt)
         return pt;
     return SX_FILTER_DIR;
@@ -99,10 +100,11 @@ int main(int argc, char **argv) {
 	snprintf(file, sizeof(file), "sxreport-client-%ld.log", (long)time(NULL));
 
     umask(077);
-    if(!(sx = sxc_init(SRC_VERSION, sxc_file_logger(&log, argv[0], file, 1), NULL))) {
+    if(!(sx = sxc_init(SRC_VERSION, sxc_file_logger(&log, argv[0], file, 1), NULL, NULL))) {
 	cmdline_parser_free(&args);
 	return 1;
     }
+    sxc_set_confdir(sx, args.config_dir_arg);
     sxc_set_verbose(sx, 1);
 
     filter_dir = get_filter_dir(sx, args.filter_dir_arg);

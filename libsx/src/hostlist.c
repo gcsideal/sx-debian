@@ -27,6 +27,7 @@
 
 #include "hostlist.h"
 #include "libsx-int.h"
+#include "misc.h"
 
 void sxi_hostlist_init(sxi_hostlist_t *list) {
     if(list)
@@ -90,7 +91,7 @@ int sxi_hostlist_add_host(sxc_client_t *sx, sxi_hostlist_t *list, const char *ho
 
     if(!list || !sxi_is_valid_host(host)) {
 	SXDEBUG("called with %s", list ? "invalid host" : "NULL list");
-	sxi_seterr(sx, SXE_EARG, "Cannot add host '%s' to list: invalid %s argument", host, list ? "host" : "hostlistlist");
+	sxi_seterr(sx, SXE_EARG, "Cannot add host '%s' to list: Invalid %s argument", host, list ? "host" : "hostlistlist");
 	return 1;
     }
 
@@ -100,13 +101,13 @@ int sxi_hostlist_add_host(sxc_client_t *sx, sxi_hostlist_t *list, const char *ho
     newarr = realloc(list->hosts, (list->nhosts+1) * sizeof(char *));
     if(!newarr) {
 	SXDEBUG("OOM reallocating list");
-	sxi_seterr(sx, SXE_EMEM, "Cannot add host to list: out of memory");
+	sxi_seterr(sx, SXE_EMEM, "Cannot add host to list: Out of memory");
 	return 1;
     }
     list->hosts = newarr;
     if(!(list->hosts[list->nhosts] = strdup(host))) {
 	SXDEBUG("OOM duplicating host");
-	sxi_seterr(sx, SXE_EMEM, "Cannot add host to list: out of memory");
+	sxi_seterr(sx, SXE_EMEM, "Cannot add host to list: Out of memory");
 	return 1;
     }
     list->nhosts++;
@@ -119,7 +120,7 @@ int sxi_hostlist_add_list(sxc_client_t *sx, sxi_hostlist_t *list, const sxi_host
 
     if(!list) {
 	SXDEBUG("called NULL list");
-	sxi_seterr(sx, SXE_EARG, "Cannot add host list to list: invalid list argument");
+	sxi_seterr(sx, SXE_EARG, "Cannot add host list to list: Invalid list argument");
 	return 1;
     }
     if(!other)
@@ -147,7 +148,7 @@ void sxi_hostlist_shuffle(sxi_hostlist_t *list) {
     if(!list || list->nhosts<2)
 	return;
     for(i=list->nhosts-1; i>=1; i--) {
-	unsigned int r = rand() % (i+1);
+	unsigned int r = sxi_rand() % (i+1);
 	char *t;
 
 	if(i == r)

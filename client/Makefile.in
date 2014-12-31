@@ -79,19 +79,40 @@ POST_UNINSTALL = :
 build_triplet = @build@
 host_triplet = @host@
 bin_PROGRAMS = src/tools/init/sxinit$(EXEEXT) \
-	src/tools/ls/sxls$(EXEEXT) src/tools/cp/sxcp$(EXEEXT) \
-	src/tools/cat/sxcat$(EXEEXT) src/tools/vol/sxvol$(EXEEXT) \
-	src/tools/acl/sxacl$(EXEEXT) \
+	src/tools/ls/sxls$(EXEEXT) src/tools/mv/sxmv$(EXEEXT) \
+	src/tools/cp/sxcp$(EXEEXT) src/tools/cat/sxcat$(EXEEXT) \
+	src/tools/vol/sxvol$(EXEEXT) src/tools/acl/sxacl$(EXEEXT) \
 	src/tools/sxreport-client/sxreport-client$(EXEEXT) \
-	src/tools/rm/sxrm$(EXEEXT)
+	src/tools/rm/sxrm$(EXEEXT) src/tools/rev/sxrev$(EXEEXT)
 subdir = .
 DIST_COMMON = $(srcdir)/Makefile.in $(srcdir)/Makefile.am \
 	$(top_srcdir)/configure $(am__configure_deps) \
-	$(srcdir)/config.h.in $(top_srcdir)/build-aux/depcomp \
-	build-aux/ar-lib build-aux/compile build-aux/config.guess \
-	build-aux/config.sub build-aux/depcomp build-aux/install-sh \
-	build-aux/missing build-aux/ltmain.sh \
-	$(top_srcdir)/build-aux/ar-lib $(top_srcdir)/build-aux/compile \
+	$(srcdir)/config.h.in $(top_srcdir)/man/sxacl.1.in \
+	$(top_srcdir)/man/sxacl-useradd.1.in \
+	$(top_srcdir)/man/sxacl-userdel.1.in \
+	$(top_srcdir)/man/sxacl-userlist.1.in \
+	$(top_srcdir)/man/sxacl-usergetkey.1.in \
+	$(top_srcdir)/man/sxacl-usernewkey.1.in \
+	$(top_srcdir)/man/sxacl-volperm.1.in \
+	$(top_srcdir)/man/sxacl-volshow.1.in \
+	$(top_srcdir)/man/sxacl-whoami.1.in \
+	$(top_srcdir)/man/sxcat.1.in $(top_srcdir)/man/sxrm.1.in \
+	$(top_srcdir)/man/sxls.1.in $(top_srcdir)/man/sxmv.1.in \
+	$(top_srcdir)/man/sxcp.1.in $(top_srcdir)/man/sxinit.1.in \
+	$(top_srcdir)/man/sxreport-client.1.in \
+	$(top_srcdir)/man/sxvol.1.in \
+	$(top_srcdir)/man/sxvol-create.1.in \
+	$(top_srcdir)/man/sxvol-modify.1.in \
+	$(top_srcdir)/man/sxvol-remove.1.in \
+	$(top_srcdir)/man/sxvol-filter.1.in \
+	$(top_srcdir)/man/sxrev.1.in $(top_srcdir)/man/sxrev-list.1.in \
+	$(top_srcdir)/man/sxrev-copy.1.in \
+	$(top_srcdir)/man/sxrev-delete.1.in \
+	$(top_srcdir)/build-aux/depcomp build-aux/ar-lib \
+	build-aux/compile build-aux/config.guess build-aux/config.sub \
+	build-aux/depcomp build-aux/install-sh build-aux/missing \
+	build-aux/ltmain.sh $(top_srcdir)/build-aux/ar-lib \
+	$(top_srcdir)/build-aux/compile \
 	$(top_srcdir)/build-aux/config.guess \
 	$(top_srcdir)/build-aux/config.sub \
 	$(top_srcdir)/build-aux/install-sh \
@@ -112,18 +133,29 @@ am__CONFIG_DISTCLEAN_FILES = config.status config.cache config.log \
  configure.lineno config.status.lineno
 mkinstalldirs = $(install_sh) -d
 CONFIG_HEADER = config.h
-CONFIG_CLEAN_FILES =
+CONFIG_CLEAN_FILES = man/sxacl.1 man/sxacl-useradd.1 \
+	man/sxacl-userdel.1 man/sxacl-userlist.1 \
+	man/sxacl-usergetkey.1 man/sxacl-usernewkey.1 \
+	man/sxacl-volperm.1 man/sxacl-volshow.1 man/sxacl-whoami.1 \
+	man/sxcat.1 man/sxrm.1 man/sxls.1 man/sxmv.1 man/sxcp.1 \
+	man/sxinit.1 man/sxreport-client.1 man/sxvol.1 \
+	man/sxvol-create.1 man/sxvol-modify.1 man/sxvol-remove.1 \
+	man/sxvol-filter.1 man/sxrev.1 man/sxrev-list.1 \
+	man/sxrev-copy.1 man/sxrev-delete.1
 CONFIG_CLEAN_VPATH_FILES =
-am__installdirs = "$(DESTDIR)$(bindir)"
+am__installdirs = "$(DESTDIR)$(bindir)" "$(DESTDIR)$(man1dir)"
 PROGRAMS = $(bin_PROGRAMS)
 am__dirstamp = $(am__leading_dot)dirstamp
 am_src_tools_acl_sxacl_OBJECTS = src/tools/acl/sxacl.$(OBJEXT) \
 	src/tools/acl/cmd_main.$(OBJEXT) \
-	src/tools/acl/cmd_perm.$(OBJEXT) \
-	src/tools/acl/cmd_list.$(OBJEXT) \
+	src/tools/acl/cmd_whoami.$(OBJEXT) \
+	src/tools/acl/cmd_volperm.$(OBJEXT) \
+	src/tools/acl/cmd_volshow.$(OBJEXT) \
 	src/tools/acl/cmd_useradd.$(OBJEXT) \
+	src/tools/acl/cmd_userdel.$(OBJEXT) \
 	src/tools/acl/cmd_userlist.$(OBJEXT) \
-	src/tools/acl/cmd_usergetkey.$(OBJEXT)
+	src/tools/acl/cmd_usergetkey.$(OBJEXT) \
+	src/tools/acl/cmd_usernewkey.$(OBJEXT)
 src_tools_acl_sxacl_OBJECTS = $(am_src_tools_acl_sxacl_OBJECTS)
 src_tools_acl_sxacl_DEPENDENCIES =  \
 	$(top_builddir)/../libsx/src/libsx.la
@@ -151,6 +183,19 @@ am_src_tools_ls_sxls_OBJECTS = src/tools/ls/sxls.$(OBJEXT) \
 src_tools_ls_sxls_OBJECTS = $(am_src_tools_ls_sxls_OBJECTS)
 src_tools_ls_sxls_DEPENDENCIES =  \
 	$(top_builddir)/../libsx/src/libsx.la
+am_src_tools_mv_sxmv_OBJECTS = src/tools/mv/sxmv.$(OBJEXT) \
+	src/tools/mv/cmdline.$(OBJEXT)
+src_tools_mv_sxmv_OBJECTS = $(am_src_tools_mv_sxmv_OBJECTS)
+src_tools_mv_sxmv_DEPENDENCIES =  \
+	$(top_builddir)/../libsx/src/libsx.la
+am_src_tools_rev_sxrev_OBJECTS = src/tools/rev/sxrev.$(OBJEXT) \
+	src/tools/rev/cmd_main.$(OBJEXT) \
+	src/tools/rev/cmd_list.$(OBJEXT) \
+	src/tools/rev/cmd_copy.$(OBJEXT) \
+	src/tools/rev/cmd_delete.$(OBJEXT)
+src_tools_rev_sxrev_OBJECTS = $(am_src_tools_rev_sxrev_OBJECTS)
+src_tools_rev_sxrev_DEPENDENCIES =  \
+	$(top_builddir)/../libsx/src/libsx.la
 am_src_tools_rm_sxrm_OBJECTS = src/tools/rm/sxrm.$(OBJEXT) \
 	src/tools/rm/cmdline.$(OBJEXT)
 src_tools_rm_sxrm_OBJECTS = $(am_src_tools_rm_sxrm_OBJECTS)
@@ -165,7 +210,9 @@ src_tools_sxreport_client_sxreport_client_DEPENDENCIES =  \
 am_src_tools_vol_sxvol_OBJECTS = src/tools/vol/sxvol.$(OBJEXT) \
 	src/tools/vol/cmd_main.$(OBJEXT) \
 	src/tools/vol/cmd_create.$(OBJEXT) \
-	src/tools/vol/cmd_filter.$(OBJEXT)
+	src/tools/vol/cmd_remove.$(OBJEXT) \
+	src/tools/vol/cmd_filter.$(OBJEXT) \
+	src/tools/vol/cmd_modify.$(OBJEXT)
 src_tools_vol_sxvol_OBJECTS = $(am_src_tools_vol_sxvol_OBJECTS)
 src_tools_vol_sxvol_DEPENDENCIES =  \
 	$(top_builddir)/../libsx/src/libsx.la
@@ -206,12 +253,14 @@ am__v_CCLD_1 =
 SOURCES = $(src_tools_acl_sxacl_SOURCES) \
 	$(src_tools_cat_sxcat_SOURCES) $(src_tools_cp_sxcp_SOURCES) \
 	$(src_tools_init_sxinit_SOURCES) $(src_tools_ls_sxls_SOURCES) \
+	$(src_tools_mv_sxmv_SOURCES) $(src_tools_rev_sxrev_SOURCES) \
 	$(src_tools_rm_sxrm_SOURCES) \
 	$(src_tools_sxreport_client_sxreport_client_SOURCES) \
 	$(src_tools_vol_sxvol_SOURCES)
 DIST_SOURCES = $(src_tools_acl_sxacl_SOURCES) \
 	$(src_tools_cat_sxcat_SOURCES) $(src_tools_cp_sxcp_SOURCES) \
 	$(src_tools_init_sxinit_SOURCES) $(src_tools_ls_sxls_SOURCES) \
+	$(src_tools_mv_sxmv_SOURCES) $(src_tools_rev_sxrev_SOURCES) \
 	$(src_tools_rm_sxrm_SOURCES) \
 	$(src_tools_sxreport_client_sxreport_client_SOURCES) \
 	$(src_tools_vol_sxvol_SOURCES)
@@ -228,6 +277,36 @@ am__can_run_installinfo = \
     n|no|NO) false;; \
     *) (install-info --version) >/dev/null 2>&1;; \
   esac
+am__vpath_adj_setup = srcdirstrip=`echo "$(srcdir)" | sed 's|.|.|g'`;
+am__vpath_adj = case $$p in \
+    $(srcdir)/*) f=`echo "$$p" | sed "s|^$$srcdirstrip/||"`;; \
+    *) f=$$p;; \
+  esac;
+am__strip_dir = f=`echo $$p | sed -e 's|^.*/||'`;
+am__install_max = 40
+am__nobase_strip_setup = \
+  srcdirstrip=`echo "$(srcdir)" | sed 's/[].[^$$\\*|]/\\\\&/g'`
+am__nobase_strip = \
+  for p in $$list; do echo "$$p"; done | sed -e "s|$$srcdirstrip/||"
+am__nobase_list = $(am__nobase_strip_setup); \
+  for p in $$list; do echo "$$p $$p"; done | \
+  sed "s| $$srcdirstrip/| |;"' / .*\//!s/ .*/ ./; s,\( .*\)/[^/]*$$,\1,' | \
+  $(AWK) 'BEGIN { files["."] = "" } { files[$$2] = files[$$2] " " $$1; \
+    if (++n[$$2] == $(am__install_max)) \
+      { print $$2, files[$$2]; n[$$2] = 0; files[$$2] = "" } } \
+    END { for (dir in files) print dir, files[dir] }'
+am__base_list = \
+  sed '$$!N;$$!N;$$!N;$$!N;$$!N;$$!N;$$!N;s/\n/ /g' | \
+  sed '$$!N;$$!N;$$!N;$$!N;s/\n/ /g'
+am__uninstall_files_from_dir = { \
+  test -z "$$files" \
+    || { test ! -d "$$dir" && test ! -f "$$dir" && test ! -r "$$dir"; } \
+    || { echo " ( cd '$$dir' && rm -f" $$files ")"; \
+         $(am__cd) "$$dir" && rm -f $$files; }; \
+  }
+man1dir = $(mandir)/man1
+NROFF = nroff
+MANS = $(man_MANS)
 RECURSIVE_CLEAN_TARGETS = mostlyclean-recursive clean-recursive	\
   distclean-recursive maintainer-clean-recursive
 am__recursive_targets = \
@@ -366,6 +445,7 @@ SED = @SED@
 SET_MAKE = @SET_MAKE@
 SHELL = @SHELL@
 STRIP = @STRIP@
+SX_FILTER_DIR = @SX_FILTER_DIR@
 VERSION = @VERSION@
 ZCOMP_LIBS = @ZCOMP_LIBS@
 abs_builddir = @abs_builddir@
@@ -421,8 +501,10 @@ top_build_prefix = @top_build_prefix@
 top_builddir = @top_builddir@
 top_srcdir = @top_srcdir@
 ACLOCAL_AMFLAGS = -I m4
-SUBDIRS = src/filters/null src/filters/zcomp src/filters/attribs src/filters/aes256
-AM_CPPFLAGS = -I $(top_srcdir)/../libsx/include -I $(top_srcdir)/../ -DSX_FILTER_DIR=\"$(pkglibdir)\"
+SUBDIRS = src/filters/zcomp src/filters/attribs src/filters/aes256 src/filters/undelete
+AM_CPPFLAGS = -I $(top_srcdir)/../libsx/include -I $(top_srcdir)/../ -I $(top_srcdir)/src/common -DSX_FILTER_DIR=\"$(pkglibdir)\"
+EXTRA_DIST = man/*.in
+man_MANS = man/sxacl.1 man/sxacl-useradd.1 man/sxacl-userdel.1 man/sxacl-userlist.1 man/sxacl-usergetkey.1 man/sxacl-usernewkey.1 man/sxacl-volperm.1 man/sxacl-volshow.1 man/sxacl-whoami.1 man/sxcat.1 man/sxrm.1 man/sxls.1 man/sxmv.1 man/sxcp.1 man/sxinit.1 man/sxreport-client.1 man/sxvol.1 man/sxvol-create.1 man/sxvol-modify.1 man/sxvol-remove.1 man/sxvol-filter.1 man/sxrev.1 man/sxrev-list.1 man/sxrev-copy.1 man/sxrev-delete.1
 src_tools_init_sxinit_SOURCES = \
 	src/tools/init/sxinit.c \
 	src/tools/init/cmdline.c \
@@ -449,6 +531,12 @@ src_tools_ls_sxls_SOURCES = \
 	src/tools/ls/cmdline.h
 
 src_tools_ls_sxls_LDADD = $(top_builddir)/../libsx/src/libsx.la
+src_tools_mv_sxmv_SOURCES = \
+	src/tools/mv/sxmv.c \
+	src/tools/mv/cmdline.c \
+	src/tools/mv/cmdline.h
+
+src_tools_mv_sxmv_LDADD = $(top_builddir)/../libsx/src/libsx.la
 src_tools_cp_sxcp_SOURCES = \
 	src/tools/cp/sxcp.c \
 	src/tools/cp/cmdline.c \
@@ -467,23 +555,34 @@ src_tools_vol_sxvol_SOURCES = \
 	src/tools/vol/cmd_main.h \
 	src/tools/vol/cmd_create.c \
 	src/tools/vol/cmd_create.h \
+	src/tools/vol/cmd_remove.c \
+	src/tools/vol/cmd_remove.h \
 	src/tools/vol/cmd_filter.c \
-	src/tools/vol/cmd_filter.h
+	src/tools/vol/cmd_filter.h \
+	src/tools/vol/cmd_modify.c \
+	src/tools/vol/cmd_modify.h
 
 src_tools_vol_sxvol_LDADD = $(top_builddir)/../libsx/src/libsx.la
 src_tools_acl_sxacl_SOURCES = \
 	src/tools/acl/sxacl.c \
 	src/tools/acl/cmd_main.c \
-	src/tools/acl/cmd_perm.c \
-	src/tools/acl/cmd_list.c \
+	src/tools/acl/cmd_whoami.c \
+	src/tools/acl/cmd_volperm.c \
+	src/tools/acl/cmd_volshow.c \
 	src/tools/acl/cmd_useradd.c \
+	src/tools/acl/cmd_userdel.c \
 	src/tools/acl/cmd_userlist.c \
 	src/tools/acl/cmd_usergetkey.c \
+	src/tools/acl/cmd_usernewkey.c \
 	src/tools/acl/cmd_main.h \
-	src/tools/acl/cmd_perm.h \
-	src/tools/acl/cmd_list.h \
+	src/tools/acl/cmd_whoami.h \
+	src/tools/acl/cmd_volperm.h \
+	src/tools/acl/cmd_volshow.h \
 	src/tools/acl/cmd_useradd.h \
-	src/tools/acl/cmd_userlist.h
+	src/tools/acl/cmd_userdel.h \
+	src/tools/acl/cmd_userlist.h \
+	src/tools/acl/cmd_usergetkey.h \
+	src/tools/acl/cmd_usernewkey.h
 
 src_tools_acl_sxacl_LDADD = $(top_builddir)/../libsx/src/libsx.la
 src_tools_rm_sxrm_SOURCES = \
@@ -492,6 +591,19 @@ src_tools_rm_sxrm_SOURCES = \
 	src/tools/rm/cmdline.h
 
 src_tools_rm_sxrm_LDADD = $(top_builddir)/../libsx/src/libsx.la
+src_tools_rev_sxrev_SOURCES = \
+        src/common/bcrumbs.h \
+	src/tools/rev/sxrev.c \
+	src/tools/rev/cmd_main.c \
+	src/tools/rev/cmd_main.h \
+	src/tools/rev/cmd_list.c \
+	src/tools/rev/cmd_list.h \
+	src/tools/rev/cmd_copy.c \
+	src/tools/rev/cmd_copy.h \
+	src/tools/rev/cmd_delete.c \
+	src/tools/rev/cmd_delete.h
+
+src_tools_rev_sxrev_LDADD = $(top_builddir)/../libsx/src/libsx.la
 all: config.h
 	$(MAKE) $(AM_MAKEFLAGS) all-recursive
 
@@ -546,6 +658,56 @@ $(srcdir)/config.h.in: @MAINTAINER_MODE_TRUE@ $(am__configure_deps)
 
 distclean-hdr:
 	-rm -f config.h stamp-h1
+man/sxacl.1: $(top_builddir)/config.status $(top_srcdir)/man/sxacl.1.in
+	cd $(top_builddir) && $(SHELL) ./config.status $@
+man/sxacl-useradd.1: $(top_builddir)/config.status $(top_srcdir)/man/sxacl-useradd.1.in
+	cd $(top_builddir) && $(SHELL) ./config.status $@
+man/sxacl-userdel.1: $(top_builddir)/config.status $(top_srcdir)/man/sxacl-userdel.1.in
+	cd $(top_builddir) && $(SHELL) ./config.status $@
+man/sxacl-userlist.1: $(top_builddir)/config.status $(top_srcdir)/man/sxacl-userlist.1.in
+	cd $(top_builddir) && $(SHELL) ./config.status $@
+man/sxacl-usergetkey.1: $(top_builddir)/config.status $(top_srcdir)/man/sxacl-usergetkey.1.in
+	cd $(top_builddir) && $(SHELL) ./config.status $@
+man/sxacl-usernewkey.1: $(top_builddir)/config.status $(top_srcdir)/man/sxacl-usernewkey.1.in
+	cd $(top_builddir) && $(SHELL) ./config.status $@
+man/sxacl-volperm.1: $(top_builddir)/config.status $(top_srcdir)/man/sxacl-volperm.1.in
+	cd $(top_builddir) && $(SHELL) ./config.status $@
+man/sxacl-volshow.1: $(top_builddir)/config.status $(top_srcdir)/man/sxacl-volshow.1.in
+	cd $(top_builddir) && $(SHELL) ./config.status $@
+man/sxacl-whoami.1: $(top_builddir)/config.status $(top_srcdir)/man/sxacl-whoami.1.in
+	cd $(top_builddir) && $(SHELL) ./config.status $@
+man/sxcat.1: $(top_builddir)/config.status $(top_srcdir)/man/sxcat.1.in
+	cd $(top_builddir) && $(SHELL) ./config.status $@
+man/sxrm.1: $(top_builddir)/config.status $(top_srcdir)/man/sxrm.1.in
+	cd $(top_builddir) && $(SHELL) ./config.status $@
+man/sxls.1: $(top_builddir)/config.status $(top_srcdir)/man/sxls.1.in
+	cd $(top_builddir) && $(SHELL) ./config.status $@
+man/sxmv.1: $(top_builddir)/config.status $(top_srcdir)/man/sxmv.1.in
+	cd $(top_builddir) && $(SHELL) ./config.status $@
+man/sxcp.1: $(top_builddir)/config.status $(top_srcdir)/man/sxcp.1.in
+	cd $(top_builddir) && $(SHELL) ./config.status $@
+man/sxinit.1: $(top_builddir)/config.status $(top_srcdir)/man/sxinit.1.in
+	cd $(top_builddir) && $(SHELL) ./config.status $@
+man/sxreport-client.1: $(top_builddir)/config.status $(top_srcdir)/man/sxreport-client.1.in
+	cd $(top_builddir) && $(SHELL) ./config.status $@
+man/sxvol.1: $(top_builddir)/config.status $(top_srcdir)/man/sxvol.1.in
+	cd $(top_builddir) && $(SHELL) ./config.status $@
+man/sxvol-create.1: $(top_builddir)/config.status $(top_srcdir)/man/sxvol-create.1.in
+	cd $(top_builddir) && $(SHELL) ./config.status $@
+man/sxvol-modify.1: $(top_builddir)/config.status $(top_srcdir)/man/sxvol-modify.1.in
+	cd $(top_builddir) && $(SHELL) ./config.status $@
+man/sxvol-remove.1: $(top_builddir)/config.status $(top_srcdir)/man/sxvol-remove.1.in
+	cd $(top_builddir) && $(SHELL) ./config.status $@
+man/sxvol-filter.1: $(top_builddir)/config.status $(top_srcdir)/man/sxvol-filter.1.in
+	cd $(top_builddir) && $(SHELL) ./config.status $@
+man/sxrev.1: $(top_builddir)/config.status $(top_srcdir)/man/sxrev.1.in
+	cd $(top_builddir) && $(SHELL) ./config.status $@
+man/sxrev-list.1: $(top_builddir)/config.status $(top_srcdir)/man/sxrev-list.1.in
+	cd $(top_builddir) && $(SHELL) ./config.status $@
+man/sxrev-copy.1: $(top_builddir)/config.status $(top_srcdir)/man/sxrev-copy.1.in
+	cd $(top_builddir) && $(SHELL) ./config.status $@
+man/sxrev-delete.1: $(top_builddir)/config.status $(top_srcdir)/man/sxrev-delete.1.in
+	cd $(top_builddir) && $(SHELL) ./config.status $@
 install-binPROGRAMS: $(bin_PROGRAMS)
 	@$(NORMAL_INSTALL)
 	@list='$(bin_PROGRAMS)'; test -n "$(bindir)" || list=; \
@@ -621,15 +783,21 @@ src/tools/acl/sxacl.$(OBJEXT): src/tools/acl/$(am__dirstamp) \
 	src/tools/acl/$(DEPDIR)/$(am__dirstamp)
 src/tools/acl/cmd_main.$(OBJEXT): src/tools/acl/$(am__dirstamp) \
 	src/tools/acl/$(DEPDIR)/$(am__dirstamp)
-src/tools/acl/cmd_perm.$(OBJEXT): src/tools/acl/$(am__dirstamp) \
+src/tools/acl/cmd_whoami.$(OBJEXT): src/tools/acl/$(am__dirstamp) \
 	src/tools/acl/$(DEPDIR)/$(am__dirstamp)
-src/tools/acl/cmd_list.$(OBJEXT): src/tools/acl/$(am__dirstamp) \
+src/tools/acl/cmd_volperm.$(OBJEXT): src/tools/acl/$(am__dirstamp) \
+	src/tools/acl/$(DEPDIR)/$(am__dirstamp)
+src/tools/acl/cmd_volshow.$(OBJEXT): src/tools/acl/$(am__dirstamp) \
 	src/tools/acl/$(DEPDIR)/$(am__dirstamp)
 src/tools/acl/cmd_useradd.$(OBJEXT): src/tools/acl/$(am__dirstamp) \
+	src/tools/acl/$(DEPDIR)/$(am__dirstamp)
+src/tools/acl/cmd_userdel.$(OBJEXT): src/tools/acl/$(am__dirstamp) \
 	src/tools/acl/$(DEPDIR)/$(am__dirstamp)
 src/tools/acl/cmd_userlist.$(OBJEXT): src/tools/acl/$(am__dirstamp) \
 	src/tools/acl/$(DEPDIR)/$(am__dirstamp)
 src/tools/acl/cmd_usergetkey.$(OBJEXT): src/tools/acl/$(am__dirstamp) \
+	src/tools/acl/$(DEPDIR)/$(am__dirstamp)
+src/tools/acl/cmd_usernewkey.$(OBJEXT): src/tools/acl/$(am__dirstamp) \
 	src/tools/acl/$(DEPDIR)/$(am__dirstamp)
 
 src/tools/acl/sxacl$(EXEEXT): $(src_tools_acl_sxacl_OBJECTS) $(src_tools_acl_sxacl_DEPENDENCIES) $(EXTRA_src_tools_acl_sxacl_DEPENDENCIES) src/tools/acl/$(am__dirstamp)
@@ -691,6 +859,40 @@ src/tools/ls/cmdline.$(OBJEXT): src/tools/ls/$(am__dirstamp) \
 src/tools/ls/sxls$(EXEEXT): $(src_tools_ls_sxls_OBJECTS) $(src_tools_ls_sxls_DEPENDENCIES) $(EXTRA_src_tools_ls_sxls_DEPENDENCIES) src/tools/ls/$(am__dirstamp)
 	@rm -f src/tools/ls/sxls$(EXEEXT)
 	$(AM_V_CCLD)$(LINK) $(src_tools_ls_sxls_OBJECTS) $(src_tools_ls_sxls_LDADD) $(LIBS)
+src/tools/mv/$(am__dirstamp):
+	@$(MKDIR_P) src/tools/mv
+	@: > src/tools/mv/$(am__dirstamp)
+src/tools/mv/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) src/tools/mv/$(DEPDIR)
+	@: > src/tools/mv/$(DEPDIR)/$(am__dirstamp)
+src/tools/mv/sxmv.$(OBJEXT): src/tools/mv/$(am__dirstamp) \
+	src/tools/mv/$(DEPDIR)/$(am__dirstamp)
+src/tools/mv/cmdline.$(OBJEXT): src/tools/mv/$(am__dirstamp) \
+	src/tools/mv/$(DEPDIR)/$(am__dirstamp)
+
+src/tools/mv/sxmv$(EXEEXT): $(src_tools_mv_sxmv_OBJECTS) $(src_tools_mv_sxmv_DEPENDENCIES) $(EXTRA_src_tools_mv_sxmv_DEPENDENCIES) src/tools/mv/$(am__dirstamp)
+	@rm -f src/tools/mv/sxmv$(EXEEXT)
+	$(AM_V_CCLD)$(LINK) $(src_tools_mv_sxmv_OBJECTS) $(src_tools_mv_sxmv_LDADD) $(LIBS)
+src/tools/rev/$(am__dirstamp):
+	@$(MKDIR_P) src/tools/rev
+	@: > src/tools/rev/$(am__dirstamp)
+src/tools/rev/$(DEPDIR)/$(am__dirstamp):
+	@$(MKDIR_P) src/tools/rev/$(DEPDIR)
+	@: > src/tools/rev/$(DEPDIR)/$(am__dirstamp)
+src/tools/rev/sxrev.$(OBJEXT): src/tools/rev/$(am__dirstamp) \
+	src/tools/rev/$(DEPDIR)/$(am__dirstamp)
+src/tools/rev/cmd_main.$(OBJEXT): src/tools/rev/$(am__dirstamp) \
+	src/tools/rev/$(DEPDIR)/$(am__dirstamp)
+src/tools/rev/cmd_list.$(OBJEXT): src/tools/rev/$(am__dirstamp) \
+	src/tools/rev/$(DEPDIR)/$(am__dirstamp)
+src/tools/rev/cmd_copy.$(OBJEXT): src/tools/rev/$(am__dirstamp) \
+	src/tools/rev/$(DEPDIR)/$(am__dirstamp)
+src/tools/rev/cmd_delete.$(OBJEXT): src/tools/rev/$(am__dirstamp) \
+	src/tools/rev/$(DEPDIR)/$(am__dirstamp)
+
+src/tools/rev/sxrev$(EXEEXT): $(src_tools_rev_sxrev_OBJECTS) $(src_tools_rev_sxrev_DEPENDENCIES) $(EXTRA_src_tools_rev_sxrev_DEPENDENCIES) src/tools/rev/$(am__dirstamp)
+	@rm -f src/tools/rev/sxrev$(EXEEXT)
+	$(AM_V_CCLD)$(LINK) $(src_tools_rev_sxrev_OBJECTS) $(src_tools_rev_sxrev_LDADD) $(LIBS)
 src/tools/rm/$(am__dirstamp):
 	@$(MKDIR_P) src/tools/rm
 	@: > src/tools/rm/$(am__dirstamp)
@@ -733,7 +935,11 @@ src/tools/vol/cmd_main.$(OBJEXT): src/tools/vol/$(am__dirstamp) \
 	src/tools/vol/$(DEPDIR)/$(am__dirstamp)
 src/tools/vol/cmd_create.$(OBJEXT): src/tools/vol/$(am__dirstamp) \
 	src/tools/vol/$(DEPDIR)/$(am__dirstamp)
+src/tools/vol/cmd_remove.$(OBJEXT): src/tools/vol/$(am__dirstamp) \
+	src/tools/vol/$(DEPDIR)/$(am__dirstamp)
 src/tools/vol/cmd_filter.$(OBJEXT): src/tools/vol/$(am__dirstamp) \
+	src/tools/vol/$(DEPDIR)/$(am__dirstamp)
+src/tools/vol/cmd_modify.$(OBJEXT): src/tools/vol/$(am__dirstamp) \
 	src/tools/vol/$(DEPDIR)/$(am__dirstamp)
 
 src/tools/vol/sxvol$(EXEEXT): $(src_tools_vol_sxvol_OBJECTS) $(src_tools_vol_sxvol_DEPENDENCIES) $(EXTRA_src_tools_vol_sxvol_DEPENDENCIES) src/tools/vol/$(am__dirstamp)
@@ -747,6 +953,8 @@ mostlyclean-compile:
 	-rm -f src/tools/cp/*.$(OBJEXT)
 	-rm -f src/tools/init/*.$(OBJEXT)
 	-rm -f src/tools/ls/*.$(OBJEXT)
+	-rm -f src/tools/mv/*.$(OBJEXT)
+	-rm -f src/tools/rev/*.$(OBJEXT)
 	-rm -f src/tools/rm/*.$(OBJEXT)
 	-rm -f src/tools/sxreport-client/*.$(OBJEXT)
 	-rm -f src/tools/vol/*.$(OBJEXT)
@@ -754,12 +962,15 @@ mostlyclean-compile:
 distclean-compile:
 	-rm -f *.tab.c
 
-@AMDEP_TRUE@@am__include@ @am__quote@src/tools/acl/$(DEPDIR)/cmd_list.Po@am__quote@
 @AMDEP_TRUE@@am__include@ @am__quote@src/tools/acl/$(DEPDIR)/cmd_main.Po@am__quote@
-@AMDEP_TRUE@@am__include@ @am__quote@src/tools/acl/$(DEPDIR)/cmd_perm.Po@am__quote@
 @AMDEP_TRUE@@am__include@ @am__quote@src/tools/acl/$(DEPDIR)/cmd_useradd.Po@am__quote@
+@AMDEP_TRUE@@am__include@ @am__quote@src/tools/acl/$(DEPDIR)/cmd_userdel.Po@am__quote@
 @AMDEP_TRUE@@am__include@ @am__quote@src/tools/acl/$(DEPDIR)/cmd_usergetkey.Po@am__quote@
 @AMDEP_TRUE@@am__include@ @am__quote@src/tools/acl/$(DEPDIR)/cmd_userlist.Po@am__quote@
+@AMDEP_TRUE@@am__include@ @am__quote@src/tools/acl/$(DEPDIR)/cmd_usernewkey.Po@am__quote@
+@AMDEP_TRUE@@am__include@ @am__quote@src/tools/acl/$(DEPDIR)/cmd_volperm.Po@am__quote@
+@AMDEP_TRUE@@am__include@ @am__quote@src/tools/acl/$(DEPDIR)/cmd_volshow.Po@am__quote@
+@AMDEP_TRUE@@am__include@ @am__quote@src/tools/acl/$(DEPDIR)/cmd_whoami.Po@am__quote@
 @AMDEP_TRUE@@am__include@ @am__quote@src/tools/acl/$(DEPDIR)/sxacl.Po@am__quote@
 @AMDEP_TRUE@@am__include@ @am__quote@src/tools/cat/$(DEPDIR)/cmdline.Po@am__quote@
 @AMDEP_TRUE@@am__include@ @am__quote@src/tools/cat/$(DEPDIR)/sxcat.Po@am__quote@
@@ -769,6 +980,13 @@ distclean-compile:
 @AMDEP_TRUE@@am__include@ @am__quote@src/tools/init/$(DEPDIR)/sxinit.Po@am__quote@
 @AMDEP_TRUE@@am__include@ @am__quote@src/tools/ls/$(DEPDIR)/cmdline.Po@am__quote@
 @AMDEP_TRUE@@am__include@ @am__quote@src/tools/ls/$(DEPDIR)/sxls.Po@am__quote@
+@AMDEP_TRUE@@am__include@ @am__quote@src/tools/mv/$(DEPDIR)/cmdline.Po@am__quote@
+@AMDEP_TRUE@@am__include@ @am__quote@src/tools/mv/$(DEPDIR)/sxmv.Po@am__quote@
+@AMDEP_TRUE@@am__include@ @am__quote@src/tools/rev/$(DEPDIR)/cmd_copy.Po@am__quote@
+@AMDEP_TRUE@@am__include@ @am__quote@src/tools/rev/$(DEPDIR)/cmd_delete.Po@am__quote@
+@AMDEP_TRUE@@am__include@ @am__quote@src/tools/rev/$(DEPDIR)/cmd_list.Po@am__quote@
+@AMDEP_TRUE@@am__include@ @am__quote@src/tools/rev/$(DEPDIR)/cmd_main.Po@am__quote@
+@AMDEP_TRUE@@am__include@ @am__quote@src/tools/rev/$(DEPDIR)/sxrev.Po@am__quote@
 @AMDEP_TRUE@@am__include@ @am__quote@src/tools/rm/$(DEPDIR)/cmdline.Po@am__quote@
 @AMDEP_TRUE@@am__include@ @am__quote@src/tools/rm/$(DEPDIR)/sxrm.Po@am__quote@
 @AMDEP_TRUE@@am__include@ @am__quote@src/tools/sxreport-client/$(DEPDIR)/src_tools_sxreport_client_sxreport_client-cmdline.Po@am__quote@
@@ -776,6 +994,8 @@ distclean-compile:
 @AMDEP_TRUE@@am__include@ @am__quote@src/tools/vol/$(DEPDIR)/cmd_create.Po@am__quote@
 @AMDEP_TRUE@@am__include@ @am__quote@src/tools/vol/$(DEPDIR)/cmd_filter.Po@am__quote@
 @AMDEP_TRUE@@am__include@ @am__quote@src/tools/vol/$(DEPDIR)/cmd_main.Po@am__quote@
+@AMDEP_TRUE@@am__include@ @am__quote@src/tools/vol/$(DEPDIR)/cmd_modify.Po@am__quote@
+@AMDEP_TRUE@@am__include@ @am__quote@src/tools/vol/$(DEPDIR)/cmd_remove.Po@am__quote@
 @AMDEP_TRUE@@am__include@ @am__quote@src/tools/vol/$(DEPDIR)/sxvol.Po@am__quote@
 
 .c.o:
@@ -840,12 +1060,57 @@ clean-libtool:
 	-rm -rf src/tools/cp/.libs src/tools/cp/_libs
 	-rm -rf src/tools/init/.libs src/tools/init/_libs
 	-rm -rf src/tools/ls/.libs src/tools/ls/_libs
+	-rm -rf src/tools/mv/.libs src/tools/mv/_libs
+	-rm -rf src/tools/rev/.libs src/tools/rev/_libs
 	-rm -rf src/tools/rm/.libs src/tools/rm/_libs
 	-rm -rf src/tools/sxreport-client/.libs src/tools/sxreport-client/_libs
 	-rm -rf src/tools/vol/.libs src/tools/vol/_libs
 
 distclean-libtool:
 	-rm -f libtool config.lt
+install-man1: $(man_MANS)
+	@$(NORMAL_INSTALL)
+	@list1=''; \
+	list2='$(man_MANS)'; \
+	test -n "$(man1dir)" \
+	  && test -n "`echo $$list1$$list2`" \
+	  || exit 0; \
+	echo " $(MKDIR_P) '$(DESTDIR)$(man1dir)'"; \
+	$(MKDIR_P) "$(DESTDIR)$(man1dir)" || exit 1; \
+	{ for i in $$list1; do echo "$$i"; done;  \
+	if test -n "$$list2"; then \
+	  for i in $$list2; do echo "$$i"; done \
+	    | sed -n '/\.1[a-z]*$$/p'; \
+	fi; \
+	} | while read p; do \
+	  if test -f $$p; then d=; else d="$(srcdir)/"; fi; \
+	  echo "$$d$$p"; echo "$$p"; \
+	done | \
+	sed -e 'n;s,.*/,,;p;h;s,.*\.,,;s,^[^1][0-9a-z]*$$,1,;x' \
+	      -e 's,\.[0-9a-z]*$$,,;$(transform);G;s,\n,.,' | \
+	sed 'N;N;s,\n, ,g' | { \
+	list=; while read file base inst; do \
+	  if test "$$base" = "$$inst"; then list="$$list $$file"; else \
+	    echo " $(INSTALL_DATA) '$$file' '$(DESTDIR)$(man1dir)/$$inst'"; \
+	    $(INSTALL_DATA) "$$file" "$(DESTDIR)$(man1dir)/$$inst" || exit $$?; \
+	  fi; \
+	done; \
+	for i in $$list; do echo "$$i"; done | $(am__base_list) | \
+	while read files; do \
+	  test -z "$$files" || { \
+	    echo " $(INSTALL_DATA) $$files '$(DESTDIR)$(man1dir)'"; \
+	    $(INSTALL_DATA) $$files "$(DESTDIR)$(man1dir)" || exit $$?; }; \
+	done; }
+
+uninstall-man1:
+	@$(NORMAL_UNINSTALL)
+	@list=''; test -n "$(man1dir)" || exit 0; \
+	files=`{ for i in $$list; do echo "$$i"; done; \
+	l2='$(man_MANS)'; for i in $$l2; do echo "$$i"; done | \
+	  sed -n '/\.1[a-z]*$$/p'; \
+	} | sed -e 's,.*/,,;h;s,.*\.,,;s,^[^1][0-9a-z]*$$,1,;x' \
+	      -e 's,\.[0-9a-z]*$$,,;$(transform);G;s,\n,.,'`; \
+	dir='$(DESTDIR)$(man1dir)'; $(am__uninstall_files_from_dir)
 
 # This directory's subdirectories are mostly independent; you can cd
 # into them and run 'make' without going through this Makefile.
@@ -1143,10 +1408,10 @@ distcleancheck: distclean
 	       exit 1; } >&2
 check-am: all-am
 check: check-recursive
-all-am: Makefile $(PROGRAMS) config.h
+all-am: Makefile $(PROGRAMS) $(MANS) config.h
 installdirs: installdirs-recursive
 installdirs-am:
-	for dir in "$(DESTDIR)$(bindir)"; do \
+	for dir in "$(DESTDIR)$(bindir)" "$(DESTDIR)$(man1dir)"; do \
 	  test -z "$$dir" || $(MKDIR_P) "$$dir"; \
 	done
 install: install-recursive
@@ -1185,6 +1450,10 @@ distclean-generic:
 	-rm -f src/tools/init/$(am__dirstamp)
 	-rm -f src/tools/ls/$(DEPDIR)/$(am__dirstamp)
 	-rm -f src/tools/ls/$(am__dirstamp)
+	-rm -f src/tools/mv/$(DEPDIR)/$(am__dirstamp)
+	-rm -f src/tools/mv/$(am__dirstamp)
+	-rm -f src/tools/rev/$(DEPDIR)/$(am__dirstamp)
+	-rm -f src/tools/rev/$(am__dirstamp)
 	-rm -f src/tools/rm/$(DEPDIR)/$(am__dirstamp)
 	-rm -f src/tools/rm/$(am__dirstamp)
 	-rm -f src/tools/sxreport-client/$(DEPDIR)/$(am__dirstamp)
@@ -1201,7 +1470,7 @@ clean-am: clean-binPROGRAMS clean-generic clean-libtool mostlyclean-am
 
 distclean: distclean-recursive
 	-rm -f $(am__CONFIG_DISTCLEAN_FILES)
-	-rm -rf src/tools/acl/$(DEPDIR) src/tools/cat/$(DEPDIR) src/tools/cp/$(DEPDIR) src/tools/init/$(DEPDIR) src/tools/ls/$(DEPDIR) src/tools/rm/$(DEPDIR) src/tools/sxreport-client/$(DEPDIR) src/tools/vol/$(DEPDIR)
+	-rm -rf src/tools/acl/$(DEPDIR) src/tools/cat/$(DEPDIR) src/tools/cp/$(DEPDIR) src/tools/init/$(DEPDIR) src/tools/ls/$(DEPDIR) src/tools/mv/$(DEPDIR) src/tools/rev/$(DEPDIR) src/tools/rm/$(DEPDIR) src/tools/sxreport-client/$(DEPDIR) src/tools/vol/$(DEPDIR)
 	-rm -f Makefile
 distclean-am: clean-am distclean-compile distclean-generic \
 	distclean-hdr distclean-libtool distclean-tags
@@ -1218,7 +1487,7 @@ info: info-recursive
 
 info-am:
 
-install-data-am:
+install-data-am: install-man
 
 install-dvi: install-dvi-recursive
 
@@ -1234,7 +1503,7 @@ install-info: install-info-recursive
 
 install-info-am:
 
-install-man:
+install-man: install-man1
 
 install-pdf: install-pdf-recursive
 
@@ -1249,7 +1518,7 @@ installcheck-am: installcheck-binPROGRAMS
 maintainer-clean: maintainer-clean-recursive
 	-rm -f $(am__CONFIG_DISTCLEAN_FILES)
 	-rm -rf $(top_srcdir)/autom4te.cache
-	-rm -rf src/tools/acl/$(DEPDIR) src/tools/cat/$(DEPDIR) src/tools/cp/$(DEPDIR) src/tools/init/$(DEPDIR) src/tools/ls/$(DEPDIR) src/tools/rm/$(DEPDIR) src/tools/sxreport-client/$(DEPDIR) src/tools/vol/$(DEPDIR)
+	-rm -rf src/tools/acl/$(DEPDIR) src/tools/cat/$(DEPDIR) src/tools/cp/$(DEPDIR) src/tools/init/$(DEPDIR) src/tools/ls/$(DEPDIR) src/tools/mv/$(DEPDIR) src/tools/rev/$(DEPDIR) src/tools/rm/$(DEPDIR) src/tools/sxreport-client/$(DEPDIR) src/tools/vol/$(DEPDIR)
 	-rm -f Makefile
 maintainer-clean-am: distclean-am maintainer-clean-generic
 
@@ -1266,7 +1535,9 @@ ps: ps-recursive
 
 ps-am:
 
-uninstall-am: uninstall-binPROGRAMS
+uninstall-am: uninstall-binPROGRAMS uninstall-man
+
+uninstall-man: uninstall-man1
 
 .MAKE: $(am__recursive_targets) all install-am install-strip
 
@@ -1281,13 +1552,14 @@ uninstall-am: uninstall-binPROGRAMS
 	install install-am install-binPROGRAMS install-data \
 	install-data-am install-dvi install-dvi-am install-exec \
 	install-exec-am install-html install-html-am install-info \
-	install-info-am install-man install-pdf install-pdf-am \
-	install-ps install-ps-am install-strip installcheck \
-	installcheck-am installcheck-binPROGRAMS installdirs \
-	installdirs-am maintainer-clean maintainer-clean-generic \
-	mostlyclean mostlyclean-compile mostlyclean-generic \
-	mostlyclean-libtool pdf pdf-am ps ps-am tags tags-am uninstall \
-	uninstall-am uninstall-binPROGRAMS
+	install-info-am install-man install-man1 install-pdf \
+	install-pdf-am install-ps install-ps-am install-strip \
+	installcheck installcheck-am installcheck-binPROGRAMS \
+	installdirs installdirs-am maintainer-clean \
+	maintainer-clean-generic mostlyclean mostlyclean-compile \
+	mostlyclean-generic mostlyclean-libtool pdf pdf-am ps ps-am \
+	tags tags-am uninstall uninstall-am uninstall-binPROGRAMS \
+	uninstall-man uninstall-man1
 
 
 # Tell versions [3.59,3.63) of GNU make to not export all variables.
