@@ -38,43 +38,58 @@ extern "C" {
 struct cluster_args_info
 {
   const char *help_help; /**< @brief Print help and exit help description.  */
+  const char *full_help_help; /**< @brief Print help, including hidden options, and exit help description.  */
   const char *version_help; /**< @brief Print version and exit help description.  */
-  const char *new_help; /**< @brief Creates a new SX cluster with a local node help description.  */
-  const char *mod_help; /**< @brief Modifies an existing SX cluster help description.  */
+  const char *new_help; /**< @brief Create a new SX cluster with a local node help description.  */
+  const char *mod_help; /**< @brief Modify an existing SX cluster help description.  */
+  char * resize_arg;	/**< @brief Proportionally resize an existing SX cluster.  */
+  char * resize_orig;	/**< @brief Proportionally resize an existing SX cluster original value given at command line.  */
+  const char *resize_help; /**< @brief Proportionally resize an existing SX cluster help description.  */
+  const char *replace_faulty_help; /**< @brief Replace faulty nodes in an existing SX cluster help description.  */
   const char *info_help; /**< @brief Shows status and details of a running cluster help description.  */
-  const char *force_gc_help; /**< @brief Force a garbage collection cycle on all noeds help description.  */
+  const char *force_gc_help; /**< @brief Force a garbage collection cycle on all nodes help description.  */
+  const char *force_expire_help; /**< @brief Force GC and expiration of reservations on all nodes help description.  */
+  const char *get_cluster_key_help; /**< @brief Obtain remote cluster key help description.  */
   char * node_dir_arg;	/**< @brief Path to the node directory.  */
   char * node_dir_orig;	/**< @brief Path to the node directory original value given at command line.  */
   const char *node_dir_help; /**< @brief Path to the node directory help description.  */
-  char * key_arg;	/**< @brief File containing a pre-generated admin authentication token or stdin if \"-\" is given (default autogenerate token)..  */
-  char * key_orig;	/**< @brief File containing a pre-generated admin authentication token or stdin if \"-\" is given (default autogenerate token). original value given at command line.  */
-  const char *key_help; /**< @brief File containing a pre-generated admin authentication token or stdin if \"-\" is given (default autogenerate token). help description.  */
+  int port_arg;	/**< @brief Set the cluster destination TCP port (default 443 in secure mode or 80 in insecure mode).  */
+  char * port_orig;	/**< @brief Set the cluster destination TCP port (default 443 in secure mode or 80 in insecure mode) original value given at command line.  */
+  const char *port_help; /**< @brief Set the cluster destination TCP port (default 443 in secure mode or 80 in insecure mode) help description.  */
   char * ssl_ca_file_arg;	/**< @brief SSL CA certificate file of the SX cluster (same file as in httpd configuration).  */
   char * ssl_ca_file_orig;	/**< @brief SSL CA certificate file of the SX cluster (same file as in httpd configuration) original value given at command line.  */
   const char *ssl_ca_file_help; /**< @brief SSL CA certificate file of the SX cluster (same file as in httpd configuration) help description.  */
+  char * admin_key_arg;	/**< @brief File containing a pre-generated admin authentication token or stdin if \"-\" is given (default autogenerate token)..  */
+  char * admin_key_orig;	/**< @brief File containing a pre-generated admin authentication token or stdin if \"-\" is given (default autogenerate token). original value given at command line.  */
+  const char *admin_key_help; /**< @brief File containing a pre-generated admin authentication token or stdin if \"-\" is given (default autogenerate token). help description.  */
+  const char *batch_mode_help; /**< @brief Turn off interactive confirmations and assume yes for all questions help description.  */
+  int human_readable_flag;	/**< @brief Print human readable sizes (default=off).  */
+  const char *human_readable_help; /**< @brief Print human readable sizes help description.  */
+  int debug_flag;	/**< @brief Enable debug messages (default=off).  */
+  const char *debug_help; /**< @brief Enable debug messages help description.  */
   char * config_dir_arg;	/**< @brief Path to SX configuration directory.  */
   char * config_dir_orig;	/**< @brief Path to SX configuration directory original value given at command line.  */
   const char *config_dir_help; /**< @brief Path to SX configuration directory help description.  */
-  const char *batch_mode_help; /**< @brief Turn off interactive confirmations and assume yes for all questions help description.  */
-  char * run_as_arg;	/**< @brief Run as specified user[:group].  */
-  char * run_as_orig;	/**< @brief Run as specified user[:group] original value given at command line.  */
-  const char *run_as_help; /**< @brief Run as specified user[:group] help description.  */
-  int debug_flag;	/**< @brief Enable debug messages (default=off).  */
-  const char *debug_help; /**< @brief Enable debug messages help description.  */
   
   unsigned int help_given ;	/**< @brief Whether help was given.  */
+  unsigned int full_help_given ;	/**< @brief Whether full-help was given.  */
   unsigned int version_given ;	/**< @brief Whether version was given.  */
   unsigned int new_given ;	/**< @brief Whether new was given.  */
   unsigned int mod_given ;	/**< @brief Whether mod was given.  */
+  unsigned int resize_given ;	/**< @brief Whether resize was given.  */
+  unsigned int replace_faulty_given ;	/**< @brief Whether replace-faulty was given.  */
   unsigned int info_given ;	/**< @brief Whether info was given.  */
   unsigned int force_gc_given ;	/**< @brief Whether force-gc was given.  */
+  unsigned int force_expire_given ;	/**< @brief Whether force-expire was given.  */
+  unsigned int get_cluster_key_given ;	/**< @brief Whether get-cluster-key was given.  */
   unsigned int node_dir_given ;	/**< @brief Whether node-dir was given.  */
-  unsigned int key_given ;	/**< @brief Whether key was given.  */
+  unsigned int port_given ;	/**< @brief Whether port was given.  */
   unsigned int ssl_ca_file_given ;	/**< @brief Whether ssl-ca-file was given.  */
-  unsigned int config_dir_given ;	/**< @brief Whether config-dir was given.  */
+  unsigned int admin_key_given ;	/**< @brief Whether admin-key was given.  */
   unsigned int batch_mode_given ;	/**< @brief Whether batch-mode was given.  */
-  unsigned int run_as_given ;	/**< @brief Whether run-as was given.  */
+  unsigned int human_readable_given ;	/**< @brief Whether human-readable was given.  */
   unsigned int debug_given ;	/**< @brief Whether debug was given.  */
+  unsigned int config_dir_given ;	/**< @brief Whether config-dir was given.  */
 
   char **inputs ; /**< @brief unamed options (options without names) */
   unsigned inputs_num ; /**< @brief unamed options number */
@@ -99,6 +114,8 @@ extern const char *cluster_args_info_usage;
 extern const char *cluster_args_info_description;
 /** @brief all the lines making the help output */
 extern const char *cluster_args_info_help[];
+/** @brief all the lines making the full help output (including hidden options) */
+extern const char *cluster_args_info_full_help[];
 
 /**
  * The command line parser
@@ -160,6 +177,10 @@ int cluster_cmdline_parser_file_save(const char *filename,
  * Print the help
  */
 void cluster_cmdline_parser_print_help(void);
+/**
+ * Print the full help (including hidden options)
+ */
+void cluster_cmdline_parser_print_full_help(void);
 /**
  * Print the version
  */

@@ -36,26 +36,39 @@
 #include "utils.h"
 #include <yajl/yajl_parse.h>
 
-void sxi_hashop_begin(sxi_hashop_t *hashop, sxi_conns_t *conns, hash_presence_cb_t cb, enum sxi_hashop_kind kind, const sx_hash_t *idhash, void *context)
+void sxi_hashop_begin(sxi_hashop_t *hashop, sxi_conns_t *conns, hash_presence_cb_t cb, enum sxi_hashop_kind kind, unsigned replica, const sx_hash_t *reservehash, const sx_hash_t *idhash, void *context, uint64_t op_expires_at)
 {
     memset(hashop, 0, sizeof(*hashop));
     hashop->conns = conns;
     hashop->cb = cb;
     hashop->context = context;
     hashop->kind = kind;
-    if (idhash && bin2hex(idhash->b, sizeof(idhash->b), hashop->id, sizeof(hashop->id)))
+    hashop->replica = replica;
+    hashop->op_expires_at = op_expires_at;
+    if (reservehash && bin2hex(reservehash->b, sizeof(reservehash->b), hashop->id, sizeof(hashop->id)/2 + 1))
         WARN("bin2hex failed");
+    if (idhash) {
+        if (bin2hex(idhash->b, sizeof(idhash->b), hashop->id + sizeof(hashop->id)/2, sizeof(hashop->id)/2 + 1))
+            WARN("bin2hex failed");
+        if (!reservehash)
+            memcpy(hashop->id, hashop->id + sizeof(hashop->id)/2, sizeof(hashop->id)/2);
+    }
+    if (!idhash && !reservehash && kind != HASHOP_CHECK)
+        WARN("empty id");
+    hashop->id[sizeof(hashop->id)-1] = '\0';
+    DEBUG("id: %s", hashop->id);
     sxc_clearerr(sxi_conns_get_client(conns));
 }
 
 struct hashop_ctx {
     yajl_handle yh;
     char *hexhashes;
+    sxi_query_t *query;
     enum { MISS_ERROR, MISS_BEGIN, MISS_MAP, MISS_PRESENCE, MISS_ARRAY, MISS_COMPLETE } state;
     unsigned idx;
-    unsigned hashop_idx;
+    int idxs[DOWNLOAD_MAX_BLOCKS];
     sxi_hashop_t *hashop;
-    sxc_client_t *sx;
+    curlev_context_t *cbdata;
     struct cb_error_ctx errctx;
 };
 
@@ -114,26 +127,27 @@ static int cb_presence_boolean(void *ctx, int boolean) {
         return 0;
     }
     if (yactx->state == MISS_ARRAY) {
-        unsigned maxidx;
+        unsigned maxidx, mapped_idx;
         const char *q = yactx->hexhashes;
 
         if (!q) {
             WARN("NULL hexhashes");
             return 0;
         }
-        maxidx = strlen(q) / HASH_TEXT_LEN;
-        if (yactx->idx >= maxidx) {
+        maxidx = strlen(q) / SXI_SHA1_TEXT_LEN;
+        if (yactx->idx >= maxidx || yactx->idx >= DOWNLOAD_MAX_BLOCKS) {
             WARN("index out of bounds: %d out of [0,%d)", yactx->idx, maxidx);
             return 0;
         }
-        q += yactx->idx * HASH_TEXT_LEN;
-        DEBUG("Hash index %d (%d+%d) status: %d", yactx->hashop_idx + yactx->idx, yactx->hashop_idx, yactx->idx, boolean);
+        q += yactx->idx * SXI_SHA1_TEXT_LEN;
+        mapped_idx = yactx->idxs[yactx->idx];
+        DEBUG("Hash index %d (%d) status: %d", mapped_idx, yactx->idx, boolean);
         if (boolean) {
-            if (hashop->cb && hashop->cb(q, yactx->hashop_idx + yactx->idx, 200, hashop->context) == -1)
+            if (hashop->cb && hashop->cb(q, mapped_idx, 200, hashop->context) == -1)
                 hashop->cb_fail++;
             hashop->ok++;
         } else {
-            if (hashop->cb && hashop->cb(q, yactx->hashop_idx + yactx->idx, 404, hashop->context) == -1)
+            if (hashop->cb && hashop->cb(q, mapped_idx, 404, hashop->context) == -1)
                 hashop->cb_fail++;
             hashop->enoent++;
         }
@@ -198,21 +212,19 @@ static const yajl_callbacks presence_parser = {
     cb_presence_end_array
 };
 
-static int presence_setup_cb(curlev_context_t *ctx, const char *host) {
-    struct hashop_ctx *yactx = sxi_cbdata_get_hashop_ctx(ctx);
-    sxi_conns_t *conns = sxi_cbdata_get_conns(ctx);
-    sxc_client_t *sx = sxi_conns_get_client(conns);
+static int presence_setup_cb(curlev_context_t *cbdata, const char *host) {
+    struct hashop_ctx *yactx = sxi_cbdata_get_hashop_ctx(cbdata);
 
     if(yactx->yh)
 	yajl_free(yactx->yh);
 
+    yactx->cbdata = cbdata;
     if(!(yactx->yh  = yajl_alloc(&presence_parser, NULL, yactx))) {
-	SXDEBUG("OOM allocating yajl context");
-	sxi_seterr(sx, SXE_EMEM, "Failed to setup hashop: out of memory");
+	CBDEBUG("OOM allocating yajl context");
+	sxi_cbdata_seterr(cbdata, SXE_EMEM, "Failed to setup hashop: out of memory");
 	return 1;
     }
 
-    yactx->sx = sx;
     yactx->idx = 0;
     yactx->state = MISS_BEGIN;
     return 0;
@@ -221,11 +233,13 @@ static int presence_setup_cb(curlev_context_t *ctx, const char *host) {
 static void batch_finish(curlev_context_t *ctx, const char *url)
 {
     struct hashop_ctx *yactx = sxi_cbdata_get_hashop_ctx(ctx);
-    int status = sxi_cbdata_result(ctx, NULL);
+    long status = 0;
+    int rc = sxi_cbdata_result(ctx, NULL, NULL, &status);
     if (!yactx) {
         WARN("NULL context");
         return;
     }
+    sxi_query_free(yactx->query);
 
     sxi_hashop_t *hashop = yactx->hashop;
     if (!hashop) {
@@ -242,22 +256,32 @@ static void batch_finish(curlev_context_t *ctx, const char *url)
     sxc_client_t *sx = sxi_conns_get_client(sxi_cbdata_get_conns(ctx));
     yajl_handle yh = yactx->yh;
 
-    SXDEBUG("batch_finish for %s (idx %d): %d", yactx->hexhashes, yactx->hashop_idx, status);
-    if (status == 200) {
+    SXDEBUG("batch_finish for %s (%p) : %ld", yactx->hexhashes, yactx->hexhashes, status);
+    if (rc != -1 && status == 200) {
         /* some hashes (maybe all) are present,
          * the server reports us the presence ones */
         if (!yh) {
-            sxi_seterr(sx, SXE_EARG, "null yajl handle");
+            sxi_cbdata_seterr(ctx, SXE_EARG, "null yajl handle");
             hashop->cb_fail++;
         } else if(yajl_complete_parse(yh) != yajl_status_ok || yactx->state != MISS_COMPLETE) {
-            sxi_seterr(sx, SXE_ECOMM, "hashop failed: failed to parse cluster response");
+            sxi_cbdata_seterr(ctx, SXE_ECOMM, "hashop failed: failed to parse cluster response");
             hashop->cb_fail++;
         }
     } else {
-        unsigned i, n = strlen(q) / HASH_TEXT_LEN;
+        unsigned i, n = strlen(q) / SXI_SHA1_TEXT_LEN;
+        DEBUG("hexhashes missing all: %s (%p)", q, q);
         /* error: report all hashes as missing */
-        for (i=0;i<n;i++)
-            hashop->cb(q + i * HASH_TEXT_LEN, yactx->hashop_idx + i, 404, hashop->context);
+        if (hashop->cb) {
+            for (i=0;i<n;i++) {
+                int mapped_idx = yactx->idxs[i];
+                if (mapped_idx < 0 ) {
+                    WARN("uninitialized mapped_idx");
+                    continue;
+                }
+                DEBUG("Hash index %d (%d) status: missing", mapped_idx, i);
+                hashop->cb(q + i * SXI_SHA1_TEXT_LEN, mapped_idx, 404, hashop->context);
+            }
+        }
     }
     if (yh)
         yajl_free(yh);
@@ -287,7 +311,7 @@ static int presence_cb(curlev_context_t *ctx, const unsigned char *data, size_t 
 static int sxi_hashop_batch(sxi_hashop_t *hashop)
 {
     const char *host, *hexhashes;
-    unsigned int blocksize;
+    unsigned int blocksize, i, n;
     sxi_query_t *query;
     int rc;
     if (!hashop || !hashop->conns)
@@ -298,7 +322,7 @@ static int sxi_hashop_batch(sxi_hashop_t *hashop)
         return -1;
     blocksize = hashop->current_blocksize;
     hashop->hashes[hashop->hashes_pos] = '\0';
-    hashop->hexhashes[hashop->hashes_count*HASH_TEXT_LEN] = '\0';
+    hashop->hexhashes[hashop->hashes_count*SXI_SHA1_TEXT_LEN] = '\0';
     sxc_client_t *sx;
 
     sx = sxi_conns_get_client(hashop->conns);
@@ -312,6 +336,7 @@ static int sxi_hashop_batch(sxi_hashop_t *hashop)
         sxi_seterr(sx, SXE_EMEM, "failed to allocate presence parser");
         return -1;
     }
+    memcpy(pp->idxs, hashop->idxs_tmp, sizeof(hashop->idxs_tmp));
     curlev_context_t *cbdata = sxi_cbdata_create_hashop(hashop->conns, batch_finish, pp);
     if (!cbdata) {
 	sxi_seterr(sx, SXE_EMEM, "failed to allocate callback");
@@ -326,20 +351,54 @@ static int sxi_hashop_batch(sxi_hashop_t *hashop)
 	return -1;
     }
     pp->hashop = hashop;
-    pp->hashop_idx = hashop->queries;
     SXDEBUG("a->queries: %d", hashop->queries);
     hashop->queries += strlen(hexhashes) / 40;
 
-    SXDEBUG("hashop %d, idx:%d on %s, hexhashes: %s", hashop->hashes_count, pp->hashop_idx, hashop->hashes, hashop->hexhashes);
-    query = sxi_hashop_proto(sxi_conns_get_client(hashop->conns), blocksize, hashop->hashes, hashop->hashes_pos, hashop->kind, hashop->id);
+    SXDEBUG("hashop %d, on %s, hexhashes: %s (%p)", hashop->hashes_count, hashop->hashes, hashop->hexhashes,
+            hashop->hexhashes);
+    n = strlen(hexhashes) / SXI_SHA1_TEXT_LEN;
+    switch (hashop->kind) {
+        case HASHOP_CHECK:
+            query = sxi_hashop_proto_check(sxi_conns_get_client(hashop->conns), blocksize, hashop->hashes, hashop->hashes_pos);
+            break;
+        case HASHOP_RESERVE:
+            query = sxi_hashop_proto_reserve(sxi_conns_get_client(hashop->conns), blocksize, hashop->hashes, hashop->hashes_pos, hashop->id, hashop->op_expires_at);
+            break;
+        case HASHOP_DELETE:/* fall-through */
+        case HASHOP_INUSE:
+            DEBUG("inuse id: %s", hashop->id);
+            query = sxi_hashop_proto_inuse_begin(sxi_conns_get_client(hashop->conns), SX_ID_TOKEN, hashop->id, hashop->op_expires_at);
+            for (i=0;i < n;i++) {
+                block_meta_entry_t entry;
+                block_meta_t meta;
+                if (hex2bin(hexhashes + i * SXI_SHA1_TEXT_LEN, SXI_SHA1_TEXT_LEN, meta.hash.b, sizeof(meta.hash.b))) {
+                    sxi_query_free(query);
+                    query = NULL;
+                    break;
+                }
+                entry.replica = hashop->replica;
+                entry.count = hashop->kind == HASHOP_INUSE ? 1 : -1;
+                meta.entries = &entry;
+                meta.count = 1;
+                meta.blocksize = hashop->current_blocksize;
+                query = sxi_hashop_proto_inuse_hash(sx, query, &meta);
+            }
+            query = sxi_hashop_proto_inuse_end(sx, query);
+            break;
+        default:
+            query = NULL;
+            break;
+    }
+    pp->query = query;
     if (query) {
-        rc = sxi_cluster_query_ev(cbdata, hashop->conns, host, query->verb, query->path, NULL, 0, presence_setup_cb, presence_cb);
+        DEBUG("Sending query to %s", query->path);
+        rc = sxi_cluster_query_ev(cbdata, hashop->conns, host, query->verb, query->path, query->content, query->content_len, presence_setup_cb, presence_cb);
     } else {
         free(pp->hexhashes);
+        sxi_query_free(pp->query);
         free(pp);
         rc = -1;
     }
-    sxi_query_free(query);
     sxi_cbdata_unref(&cbdata);
     return rc;
 }
@@ -349,6 +408,7 @@ int sxi_hashop_batch_flush(sxi_hashop_t *hashop)
     int rc = 0;
     if (hashop->hashes_count > 0)
         rc = sxi_hashop_batch(hashop);
+    memset(hashop->idxs_tmp, -1, sizeof(hashop->idxs_tmp));
     hashop->hashes_count = hashop->hashes_pos = 0;
     return rc;
 }
@@ -370,23 +430,20 @@ int sxi_hashop_batch_add(sxi_hashop_t *hashop, const char *host, unsigned idx, c
     }
     hashop->current_host = host;
     hashop->current_blocksize = blocksize;
-    hidx = hashop->hashes_count * HASH_TEXT_LEN;
-    if (hashop->hashes_pos + HASH_TEXT_LEN + 1 >= sizeof(hashop->hashes) ||
-        hidx + HASH_TEXT_LEN >= sizeof(hashop->hexhashes)) {
+    hidx = hashop->hashes_count * SXI_SHA1_TEXT_LEN;
+    if (hashop->hashes_pos + SXI_SHA1_TEXT_LEN + 1 >= sizeof(hashop->hashes) ||
+        hidx + SXI_SHA1_TEXT_LEN >= sizeof(hashop->hexhashes)) {
         sxi_seterr(sx, SXE_EARG, "Out of bounds hashes_pos: %u (limit %lu), hidx: %u (limit %lu)",
                    hashop->hashes_pos, (long)sizeof(hashop->hashes),
                    hidx, (long)sizeof(hashop->hexhashes));
         return -1;
     }
-    sxi_bin2hex(binhash, HASH_BIN_LEN, hashop->hashes + hashop->hashes_pos);
-    memcpy(hashop->hexhashes + hidx, hashop->hashes + hashop->hashes_pos, HASH_TEXT_LEN);
-    SXDEBUG("hash @%d: %.*s", idx, HASH_TEXT_LEN, hashop->hashes + hashop->hashes_pos);
-    hashop->hashes_pos += HASH_TEXT_LEN;
+    sxi_bin2hex(binhash, SXI_SHA1_BIN_LEN, hashop->hashes + hashop->hashes_pos);
+    memcpy(hashop->hexhashes + hidx, hashop->hashes + hashop->hashes_pos, SXI_SHA1_TEXT_LEN);
+    SXDEBUG("hash @%d (%d): %.*s", idx, hashop->hashes_count, SXI_SHA1_TEXT_LEN, hashop->hashes + hashop->hashes_pos);
+    hashop->hashes_pos += SXI_SHA1_TEXT_LEN;
     hashop->hashes[hashop->hashes_pos++] = ',';
-    if (hashop->queries + hashop->hashes_count != idx) {
-        SXDEBUG("bad idx: %d != %d", hashop->queries + hashop->hashes_count, idx);
-        return -1;
-    }
+    hashop->idxs_tmp[hashop->hashes_count] = idx;
     hashop->hashes_count++;
     SXDEBUG("returning: %d", rc);
     return rc;

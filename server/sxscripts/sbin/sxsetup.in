@@ -1,0 +1,1156 @@
+#!/bin/sh
+# (C) Copyright 2013-present, Skylable Ltd. <info-copyright@skylable.com>
+# All Rights Reserved.
+
+OPTNUM=1
+while [ $OPTNUM -le $# ]; do
+    eval "OPTION=\$$OPTNUM"
+
+    if [ "$OPTION" = "--help" -o "$OPTION" = "-h" ]; then
+	HELP_GIVEN="yes"
+    elif [ "$OPTION" = "--info" -o "$OPTION" = "-i" ]; then
+	INFO_GIVEN="yes"
+    elif [ "$OPTION" = "--config-file" ]; then
+	CONFIG_FILE_GIVEN="yes"
+	OPTNUM=`expr $OPTNUM + 1`
+	eval "CONFIG_FILE=\$$OPTNUM"
+	if [ -z "$CONFIG_FILE" ]; then
+	    echo "--config-file requires a file argument"
+	    exit 1
+	fi
+	if [ ! -f "$CONFIG_FILE" ]; then
+	    echo "--config-file requires a valid config file"
+	    exit 1
+	fi
+
+    elif [ "$OPTION" = "--advanced" ]; then
+	ADVANCED_GIVEN="yes"
+
+    elif [ "$OPTION" = "--bare" ]; then
+	BARE_GIVEN="yes"
+
+    elif [ "$OPTION" = "--force-reinit" ]; then
+	FORCE_REINIT_GIVEN="yes"
+
+    elif [ "$OPTION" = "--wait" ]; then
+	WAIT_GIVEN="yes"
+
+    elif [ "$OPTION" = "--debug" ]; then
+	DEBUG_GIVEN="yes"
+    else
+	echo "ERROR: Unknown option '$OPTION'"
+	exit 1
+    fi
+    OPTNUM=`expr $OPTNUM + 1`
+done
+
+if [ "$HELP_GIVEN" = "yes" ]; then
+    echo "SX Setup Script"
+    echo
+    echo "sxsetup performs interactive or automated configuration of a node"
+    echo "and displays its existing configuration."
+    echo
+    echo "Usage: $0 [OPTIONS]"
+    echo
+    echo "-h, --help              Print help and exit"
+    echo "-i, --info              Show current node configuration and exit"
+    echo "    --config-file FILE  Use config FILE to configure the node automatically"
+    echo "    --advanced          Enable advanced configuration"
+    echo "    --bare              Create a bare (unprogrammed) node"
+    echo "    --force-reinit      Overwrite existing configuration"
+    echo "    --wait              Wait till rebalance finishes after joining the cluster"
+    echo "    --debug             Turn on debug mode for the created node"
+    echo
+    exit 0
+fi
+
+CFG_VERSION=2
+ETCDIR="@sysconfdir@"
+CONFIG="$ETCDIR/sxserver/sxsetup.conf"
+
+if [ "$INFO_GIVEN" = "yes" ]; then
+    if [ ! -f "$CONFIG" ]; then
+	echo "Not configured. You have to run sxsetup in configuration mode first."
+	exit 1
+    fi
+    if [ ! -r "$CONFIG" ]; then
+	echo "No permission to read $CONFIG"
+	exit 1
+    fi
+    . $CONFIG
+    echo "--- SX INFO ---"
+    echo "SX Version: `@sbindir@/sx.fcgi --version | cut -d\  -f2`"
+    echo "Cluster name: $SX_CLUSTER_NAME"
+    echo "Cluster port: $SX_PORT"
+    @sbindir@/sxadm node --info --human-readable $SX_DATA_DIR | grep -v "HashFS Version"
+    echo "Storage location: $SX_DATA_DIR"
+    test "$SX_USE_SSL" = "yes" && echo "SSL private key: $SX_SSL_KEY_FILE"
+    echo "SX Logfile: $SX_LOG_FILE"
+    exit 0
+fi
+
+# Read previous answers, and initialize the defaults with them
+LOAD_CONFIG=${CONFIG_FILE:-"$CONFIG"}
+if [ -f "$LOAD_CONFIG" ]; then
+    . "$LOAD_CONFIG"
+    if [ -f "$SX_DATA_DIR/hashfs.db" ]; then 
+	if [ "$FORCE_REINIT_GIVEN" != "yes" ]; then
+	    echo "This SX node is already configured. Run sxsetup with --info to display"
+	    echo "the current configuration or with --force-reinit to set it up again."
+	    echo "See sxsetup --help for more options."
+	    exit 1
+	fi
+    fi
+fi
+
+if [ `id -u` -ne 0 -a -z "$SX_NO_ROOT" ] && [ "$ADVANCED_GIVEN" != "yes" ]; then
+    echo "You must be root or call sxsetup with --advanced"
+    exit 1
+fi
+
+test `id -u` -ne 0 && SX_NO_ROOT="yes"
+
+# Set defaults if there are no previous answers
+SX_DATA_DIR=${SX_DATA_DIR:-"@localstatedir@/lib/sxserver/storage"}
+if [ -z "$SX_NODE_IP" ]; then
+    SX_NODE_IP=`/sbin/ifconfig eth0 2>/dev/null|grep 'inet addr'|cut -d ':' -f 2|cut -d ' ' -f 1`
+    if [ -z "$SX_NODE_IP" ]; then
+        SX_NODE_IP="127.0.0.1"
+    fi
+fi
+
+if [ "$FORCE_REINIT_GIVEN" = "yes" -a "$CONFIG_FILE_GIVEN" != "yes" ]; then
+    if [ "$ADVANCED_GIVEN" != "yes" ]; then
+	SX_PORT=
+	SX_SERVER_USER=
+	SX_SERVER_GROUP=
+	SX_NODE_INTERNAL_IP=
+    fi
+fi
+
+SX_SERVER_USER=${SX_SERVER_USER:-"nobody"}
+SX_SERVER_GROUP=`id -n -g "$SX_SERVER_USER"`
+SX_RUN_DIR=${SX_RUN_DIR:-"@localstatedir@/run/sxserver"}
+SX_LIB_DIR=${SX_LIB_DIR:-"@localstatedir@/lib/sxserver"}
+SX_NODE_SIZE=${SX_NODE_SIZE:-"1T"}
+SX_CHILDREN_NUM=${SX_CHILDREN_NUM:-"32"}
+SX_LOG_FILE=${SX_LOG_FILE:-"@localstatedir@/log/sxserver/sxfcgi.log"}
+
+# temp files
+SXSETUP_TMPDIR="@localstatedir@/lib/sxserver-tmp"
+if [ -d $SXSETUP_TMPDIR ]; then
+    echo "Temporary directory $SXSETUP_TMPDIR already exists"
+    echo "Make sure there's no other sxsetup running or remove it manually"
+    exit 1
+fi
+mkdir -p $SXSETUP_TMPDIR
+if [ $? -ne 0 ]; then
+    echo "Can't create temporary directory $SXSETUP_TMPDIR"
+    exit 1
+fi
+chmod 700 $SXSETUP_TMPDIR
+test -z "$SX_NO_ROOT" && chown "$SX_SERVER_USER":"$SX_SERVER_GROUP" $SXSETUP_TMPDIR
+OUT_TMP=$SXSETUP_TMPDIR/out.tmp
+SSLKEY_TMP=$SXSETUP_TMPDIR/sslkey.tmp
+SSLCERT_TMP=$SXSETUP_TMPDIR/sslcert.tmp
+CERTCONF_TMP=$SXSETUP_TMPDIR/certconf.tmp
+CLUSTKEY_TMP=$SXSETUP_TMPDIR/clustkey.tmp
+ADMINKEY_TMP=$SXSETUP_TMPDIR/adminkey.tmp
+trap "rm -rf $SXSETUP_TMPDIR; exit 1" EXIT INT
+
+ask_yn() {
+    while true; do
+	printf "$@ "
+        read ANSWER
+	if [ -z "$ANSWER" ]; then
+	    break
+	elif [ "$ANSWER" = "n" -o "$ANSWER" = "N" ]; then
+	    ANSWER="n"
+	    break
+	elif [ "$ANSWER" = "y" -o "$ANSWER" = "Y" ]; then
+	    ANSWER="y"
+	    break
+	fi
+    done
+}
+
+check_port() {
+    IP=$1
+    PORT=$2
+    # Can't use -t or -p, not compatible with FreeBSD
+    # Linux format: IP:port, or 0.0.0.0:port
+    # FreeBSD format: IP.port or *.port
+    FLAGS=
+    if [ `uname` = "Linux" ]; then
+	FLAGS=-p
+    fi
+    printf "Checking port $PORT on $IP ... "
+    if type netstat > /dev/null 2>&1; then
+	nstat="`netstat $FLAGS -na 2>/dev/null | 
+	grep \"tcp.*\($IP\|0.0.0.0\|::\|*\)[:.]$PORT[ \t].*LISTEN\" |
+	sed 's/\/.*//g'`"
+	if [ -n "$nstat" ]; then
+	    echo
+	    echo "ERROR: another service is already running on $IP:$PORT"
+	    echo "Please stop that service or provide another IP address."
+	    CHECK_PORT_RETVAL=1
+	else
+	    echo OK
+	    CHECK_PORT_RETVAL=0
+	fi
+    else
+	echo "'netstat' not available, assuming OK"
+	CHECK_PORT_RETVAL=0
+    fi
+}
+
+ask_questions() {
+    while true; do
+	echo "--- SKYLABLE SX CONFIGURATION SCRIPT ---"
+	echo
+	echo "The script will help you to create or extend a Skylable SX data cluster."
+	echo
+	echo "--- CLUSTER NAME ---"
+	echo
+	echo "Clients will access your cluster using a sx://clustername/volume/path URI."
+	echo "It is recommended to use a FQDN for clustername, but not required. Refer to the documentation for more info."
+	while true; do
+	    printf "Enter the cluster name (use the same across all nodes) [$SX_CLUSTER_NAME]: "
+	    read NEWVAL
+	    SX_CLUSTER_NAME=${NEWVAL:-$SX_CLUSTER_NAME}
+	    test -n "$SX_CLUSTER_NAME" && break
+	    echo "Cluster name must be provided!"
+	done
+
+	echo
+	echo "--- DATA STORAGE ---"
+	echo
+	echo "Please provide the location where all incoming data will be stored."
+	while true; do
+	    printf "Path to SX storage [default=$SX_DATA_DIR]: "
+	    read NEWVAL
+	    SX_DATA_DIR=${NEWVAL:-$SX_DATA_DIR}
+	    if [ -d "$SX_DATA_DIR" ]; then 
+		echo
+		echo "The data directory $SX_DATA_DIR already exists."
+		echo "Provide a different directory or wipe it before proceeding."
+	    elif [ -e "$SX_DATA_DIR" -a ! -d "$SX_DATA_DIR" ]; then
+		echo
+		echo "$SX_DATA_DIR already exists, but is not a directory."
+		echo "Provide a different directory or wipe it before proceeding."
+	    else
+		break
+	    fi
+	done
+
+	echo
+	echo "Please specify the maximum size of the storage for this node. You can"
+	echo "use M, G and T suffixes, eg. 100T for 100 terabytes."
+	while true; do
+	    printf "Maximum size [default=$SX_NODE_SIZE]: "
+	    read NEWVAL
+	    SX_NODE_SIZE=${NEWVAL:-$SX_NODE_SIZE}
+	    test -z "$SX_NODE_SIZE" && continue
+	    if [ -z "`echo $SX_NODE_SIZE | egrep ^[0-9]+[MGT]?$`" ]; then
+		echo "Invalid format. Use numerical size optionally followed by modifiers, eg. 20G or 4T"
+		SX_NODE_SIZE=
+		continue
+	    fi
+	    break
+	done
+
+	echo
+	echo "--- NETWORKING ---"
+	echo
+	if [ -z "$SX_USE_SSL" -o "$SX_USE_SSL" != "no" ]; then
+	    DEFAULTFIRST="(Y/n)"
+	    DEFAULTANSWER="y"
+	else
+	    DEFAULTFIRST="(y/N)"
+	    DEFAULTANSWER="n"
+	fi
+	ask_yn "Enable SSL? (use the same setting for all nodes in the cluster) $DEFAULTFIRST"
+	ANSWER=${ANSWER:-$DEFAULTANSWER}
+	if [ "$ANSWER" != "n" ]; then
+	    SX_USE_SSL="yes"
+	    DEFAULT_PORT="443"
+	    SX_SSL_CERT_FILE=${SX_SSL_CERT_FILE:-"$ETCDIR/ssl/certs/sxcert.pem"}
+	    SX_SSL_KEY_FILE=${SX_SSL_KEY_FILE:-"$ETCDIR/ssl/private/sxkey.pem"}
+	    HTTPS="https://"
+	else
+	    SX_USE_SSL="no"
+	    DEFAULT_PORT="80"
+	fi
+	test "$SX_NO_ROOT" = "yes" && DEFAULT_PORT="50$DEFAULT_PORT"
+	SX_PORT=${SX_PORT:-"$DEFAULT_PORT"}
+
+	while true; do
+	    printf "Enter the IP address of this node [default=$SX_NODE_IP]: "
+	    read NEWVAL
+	    SX_NODE_IP=${NEWVAL:-$SX_NODE_IP}
+	    test -z "$SX_NODE_IP" && continue
+	    if [ -n "$ADVANCED_GIVEN" ]; then
+		while true; do
+		    printf "Enter the port number (use the same value for all nodes in the cluster) [default=$SX_PORT]: "
+		    read NEWVAL
+		    SX_PORT=${NEWVAL:-$SX_PORT}
+		    test -n "$SX_PORT" && break
+		done
+	    fi
+	    check_port "$SX_NODE_IP" $SX_PORT
+	    test "$CHECK_PORT_RETVAL" = "1" && continue
+	    break
+	done
+
+	if [ -n "$ADVANCED_GIVEN" ]; then
+	    echo
+	    if [ -z "$SX_NODE_INTERNAL_IP" -o "$SX_NODE_INTERNAL_IP" = "$SX_NODE_IP" ]; then
+		DEFAULTFIRST="(y/N)"
+		DEFAULTANSWER="n"
+	    else
+		DEFAULTFIRST="(Y/n)"
+		DEFAULTANSWER="y"
+	    fi
+	    ask_yn "Use separated network for inter-node communication? $DEFAULTFIRST"
+	    ANSWER=${ANSWER:-$DEFAULTANSWER}
+	    if [ "$ANSWER" != "n" ]; then
+		echo
+		while true; do
+		    printf "Enter the internal IP address of this node [default=$SX_NODE_INTERNAL_IP]: "
+		    read NEWVAL
+		    SX_NODE_INTERNAL_IP=${NEWVAL:-$SX_NODE_INTERNAL_IP}
+		    test -z "$SX_NODE_INTERNAL_IP" && continue
+		    check_port "$SX_NODE_INTERNAL_IP" $SX_PORT
+		    test "$CHECK_PORT_RETVAL" = "1" && continue
+		    break
+		done
+	    fi
+	fi
+
+	echo
+	echo "--- CLUSTER CONFIGURATION ---"
+	echo
+	DEFAULTFIRST="(Y/n)"
+	DEFAULTANSWER="y"
+	if [ -n "$SX_EXISTING_NODE_IP" ]; then
+	    DEFAULTFIRST="(y/N)"
+	    DEFAULTANSWER="n"
+	fi
+	ask_yn "Is this ($SX_NODE_IP) the first node of a new cluster? $DEFAULTFIRST"
+	ANSWER=${ANSWER:-$DEFAULTANSWER}
+	if [ "$ANSWER" = "y" ]; then
+	    SX_EXISTING_NODE_IP=
+	else
+	    echo "Please provide the IP address of a working node in '$SX_CLUSTER_NAME'."
+	    while true; do
+		if [ -n "$SX_EXISTING_NODE_IP" ]; then
+		    printf "IP address [default=$SX_EXISTING_NODE_IP]: "
+		else
+		    printf "IP address: "
+		fi
+		read NEWVAL
+		SX_EXISTING_NODE_IP=${NEWVAL:-$SX_EXISTING_NODE_IP}
+		if [ "$SX_EXISTING_NODE_IP" = "$SX_NODE_IP" -o "$SX_EXISTING_NODE_IP" = "$SX_NODE_INTERNAL_IP" ]; then
+		    echo "$SX_EXISTING_NODE_IP is the IP address of this node."
+		    echo "You must provide the IP address of a node that is already part of the cluster!"
+		else
+		    if type curl > /dev/null 2>&1; then
+			if curl -s -k -m 3 $HTTPS$SX_EXISTING_NODE_IP:$SX_PORT > /dev/null 2>&1; then
+			    break
+			else
+			    echo "Cannot contact node $HTTPS$SX_EXISTING_NODE_IP"
+			    if [ -f /etc/redhat-release ]; then
+				echo "Please check the firewall rules by running 'iptables -L'"
+			    fi
+			    echo "Make sure the node is running and accessible from this host, then try again."
+
+			    test -n "$HTTPS" && echo "Disable SSL in case the cluster you want to join doesn't use secure connection."
+			fi
+		    else
+			break
+		    fi
+		fi
+	    done
+	fi
+
+	if [ -n "$SX_EXISTING_NODE_IP" -a -z "$BARE_GIVEN" ]; then
+	    echo
+	    echo "The admin key is required to join the existing cluster."
+	    echo "If you don't have it, run 'sxsetup --info' on $SX_EXISTING_NODE_IP."
+	    echo "Below you can provide the key itself or path to the file containing the key."
+
+	    while true; do
+		printf "Admin key or path to key-file [default=$SX_ADMIN_KEY]: "
+		read NEWVAL
+		SX_ADMIN_KEY=${NEWVAL:-$SX_ADMIN_KEY}
+		if [ -z "$SX_ADMIN_KEY" ]; then
+		    echo "Admin key is required to connect to the existing cluster"
+		    SX_ADMIN_KEY=
+		    continue
+		elif [ -r "$SX_ADMIN_KEY" ]; then 
+		    if [ -z "`cat $SX_ADMIN_KEY | grep '0DPiKuNIrrVmD8IUCuw1hQxNqZ'`" ]; then
+			echo "$SX_ADMIN_KEY doesn't contain a valid admin key"
+			SX_ADMIN_KEY=
+			continue
+		    fi
+		    SX_ADMIN_KEY=`cat $SX_ADMIN_KEY`
+		elif [ -z "`echo $SX_ADMIN_KEY | grep '0DPiKuNIrrVmD8IUCuw1hQxNqZ'`" ]; then
+		    echo "'$SX_ADMIN_KEY' is not a valid admin key"
+		    SX_ADMIN_KEY=
+		    continue
+		fi
+		break
+	    done
+	fi
+
+	if [ -n "$SX_EXISTING_NODE_IP" -a -n "$BARE_GIVEN" ]; then
+	    echo
+	    echo "The cluster key is required to later join this node to the cluster."
+	    echo "If you don't have it, run 'sxsetup --info' on $SX_EXISTING_NODE_IP."
+	    echo "Below you can provide the key itself or path to the file containing the key."
+
+	    while true; do
+		printf "Cluster key or path to key-file [default=$SX_CLUSTER_KEY]: "
+		read NEWVAL
+		SX_CLUSTER_KEY=${NEWVAL:-$SX_CLUSTER_KEY}
+		if [ -z "$SX_CLUSTER_KEY" ]; then
+		    echo "Cluster key is required to configure the bare node"
+		    SX_CLUSTER_KEY=
+		    continue
+		elif [ -r "$SX_CLUSTER_KEY" ]; then 
+		    if [ -z "`cat $SX_CLUSTER_KEY | grep 'CLUSTER/ALLNODE/ROOT/'`" ]; then
+			echo "$SX_CLUSTER_KEY doesn't contain a valid cluster key"
+			SX_CLUSTER_KEY=
+			continue
+		    fi
+		    SX_CLUSTER_KEY=`cat $SX_CLUSTER_KEY`
+		elif [ -z "`echo $SX_CLUSTER_KEY | grep 'CLUSTER/ALLNODE/ROOT/'`" ]; then
+		    echo "'$SX_CLUSTER_KEY' is not a valid cluster key"
+		    SX_CLUSTER_KEY=
+		    continue
+		fi
+		break
+	    done
+
+	    echo
+	    echo "Please provide the UUID of the cluster. If you don't have it, run"
+	    echo "'sxsetup --info' on $SX_EXISTING_NODE_IP."
+	    while true; do
+		printf "Cluster UUID [default=$SX_CLUSTER_UUID]: "
+		read NEWVAL
+		SX_CLUSTER_UUID=${NEWVAL:-$SX_CLUSTER_UUID}
+		if [ -z "$SX_CLUSTER_UUID" ]; then
+		    echo "Cluster UUID is required to configure the bare node"
+		    continue
+		fi
+		break
+	    done
+	fi
+
+	if [ "$SX_USE_SSL" = "yes" ] ; then
+	    echo
+	    echo "--- SSL CONFIGURATION ---"
+	    if [ "$FORCE_REINIT_GIVEN" = "yes" ]; then
+		rm -f "$SX_SSL_KEY_FILE" "$SX_SSL_CERT_FILE"
+	    fi
+	    CREATED=0
+	    while [ ! -r "$SX_SSL_KEY_FILE" -o ! -r "$SX_SSL_CERT_FILE" ]; do
+		mkdir -p "$ETCDIR/ssl/private" "$ETCDIR/ssl/certs"
+		if [ "$ADVANCED_GIVEN" = "yes" ]; then
+		    cat > "$CERTCONF_TMP" <<EOF
+[ req ]
+default_bits	       = 2048
+distinguished_name     = req_distinguished_name
+encrypt_key            = no
+x509_extensions        = v3_ca
+
+[ req_distinguished_name ]
+countryName                    = Country Name (2 letter code)
+countryName_default            = UK
+countryName_min                = 2
+countryName_max                = 2
+
+localityName                    = Locality Name (eg, city)
+localityName_default            = London
+
+organizationalUnitName         = Organizational Unit Name (eg, section)
+organizationalUnitName_default = SX
+
+commonName                     = Common Name (must match SX cluster name)
+commonName_default	       = $SX_CLUSTER_NAME
+
+EOF
+		else
+		    cat > "$CERTCONF_TMP" <<EOF
+[ req ]
+default_bits		= 2048
+distinguished_name	= req_distinguished_name
+prompt			= no
+encrypt_key		= no
+x509_extensions		= v3_ca
+
+[ req_distinguished_name ]
+C		       = UK
+L		       = London
+O		       = SX
+CN		       = $SX_CLUSTER_NAME
+
+EOF
+		fi
+		cat >> "$CERTCONF_TMP" <<EOF
+[ v3_ca ]
+subjectKeyIdentifier=hash
+authorityKeyIdentifier=keyid:always,issuer:always
+basicConstraints = critical,CA:true
+keyUsage=keyCertSign,cRLSign,digitalSignature,keyEncipherment
+EOF
+
+		if [ -z "$SX_EXISTING_NODE_IP" ]; then
+		    CREATESSL=1
+		    if [ "$ADVANCED_GIVEN" = "yes" ]; then
+			echo
+			ask_yn "Do you want to generate SSL certificate and key? (Y/n)"
+			test "$ANSWER" = "n" && CREATESSL=0
+		    fi
+		fi
+
+		if [ -z "$SX_EXISTING_NODE_IP" -a "$CREATESSL" = "1" ]; then
+		    echo
+		    echo "Generating default SSL certificate and key in $SX_SSL_KEY_FILE $SX_SSL_CERT_FILE"
+		    openssl req -days 1825 -x509 -config "$CERTCONF_TMP" -new -keyout "$SX_SSL_KEY_FILE" -out "$SX_SSL_CERT_FILE" || exit 1
+		    test -z "$SX_NO_ROOT" && chown "$SX_SERVER_USER":"$SX_SERVER_GROUP" "$SX_SSL_KEY_FILE" "$SX_SSL_CERT_FILE"
+		    chmod 600 "$SX_SSL_KEY_FILE" "$SX_SSL_CERT_FILE"
+		    SX_SSL_KEY="`cat $SX_SSL_KEY_FILE`"
+		    SX_SSL_CERT="`cat $SX_SSL_CERT_FILE`"
+		    CREATED=1
+		else
+		    echo
+		    echo "Please paste the SSL private key below (and press CTRL+D when done) or provide a path to it."
+		    echo "SSL private key:"
+		    # Cannot use read for multi-line input
+		    cat >$SSLKEY_TMP
+		    if [ -s "$SSLKEY_TMP" ]; then
+			if grep -q -F -- '-----BEGIN' "$SSLKEY_TMP"; then
+			    # it was pasted
+			    if grep -q -F -- 'PRIVATE KEY-----' "$SSLKEY_TMP"; then
+				cp "$SSLKEY_TMP" "$SX_SSL_KEY_FILE"
+			    else
+				echo
+				echo "*** The data provided is not a private key! ***"
+				continue
+			    fi
+			else
+			    cp "`cat \"$SSLKEY_TMP\"`" "$SX_SSL_KEY_FILE"
+			fi
+		    fi
+		    rm -f $SSLKEY_TMP
+
+		    GOTSRVCERT=0
+		    if [ -n "$SX_EXISTING_NODE_IP" ]; then
+			SRVCERT="`echo \"HEAD / HTTP/1.0\n Host: $SX_EXISTING_NODE_IP:$SX_PORT\n\n EOT\n\" | openssl s_client -connect $SX_EXISTING_NODE_IP:$SX_PORT -prexit 2>/dev/null`"
+			if [ $? = 0 ]; then
+			    echo "$SRVCERT" | openssl x509 > "$SSLCERT_TMP"
+			    if [ $? = 0 ]; then
+				GOTSRVCERT=1
+			    fi
+			fi
+		    fi
+
+		    echo
+		    if [ "$GOTSRVCERT" = "1" ]; then
+			echo "Successfully obtained SSL certificate from $SX_EXISTING_NODE_IP"
+			cp "$SSLCERT_TMP" "$SX_SSL_CERT_FILE"
+		    else
+			echo "Please paste the SSL certificate below (and press CTRL+D when done) or provide a path to it"
+			echo "SSL certificate: [default=$SX_SSL_CERT_FILE]"
+			cat >$SSLCERT_TMP
+			if [ -s "$SSLCERT_TMP" ]; then
+			    if grep -q -F -- '-----BEGIN' "$SSLCERT_TMP"; then
+				# it was pasted
+				if grep -q -F -- '-----BEGIN CERTIFICATE-----' "$SSLCERT_TMP"; then
+				    cp "$SSLCERT_TMP" "$SX_SSL_CERT_FILE"
+				else
+				    echo "Not a certificate!"
+				    continue
+				fi
+			    else
+				cp "`cat \"$SSLCERT_TMP\"`" "$SX_SSL_CERT_FILE"
+			    fi
+			fi
+			rm -f $SSLCERT_TMP
+		    fi
+		fi
+		test -z "$SX_NO_ROOT" && chown "$SX_SERVER_USER":"$SX_SERVER_GROUP" "$SX_SSL_KEY_FILE" "$SX_SSL_CERT_FILE" 2>/dev/null
+		chmod 600 "$SX_SSL_KEY_FILE" "$SX_SSL_CERT_FILE" 2>/dev/null
+		SX_SSL_KEY="`cat $SX_SSL_KEY_FILE`"
+		SX_SSL_CERT="`cat $SX_SSL_CERT_FILE`"
+	    done
+	    if [ "$CREATED" = 0 ]; then
+		CERTCN=`openssl x509 -in "$SX_SSL_CERT_FILE" -text|grep Subject: | sed -e 's/.*CN=//'`
+		if [ "$CERTCN" != "$SX_CLUSTER_NAME" ]; then
+		    echo "ERROR: The certificate's CN ($CERTCN) doesn't match the cluster name: $SX_CLUSTER_NAME"
+		    echo "If you changed the cluster name then you must manually remove $SX_SSL_KEY_FILE and $SX_SSL_CERT_FILE!"
+		    echo "Run $0 --force-reinit to automatically wipe the old SSL key and certificate."
+		    exit 1
+		fi
+	    fi
+	fi
+
+	if [ -n "$ADVANCED_GIVEN" ]; then
+	    echo
+	    echo "--- SERVER CONFIGURATION ---"
+	    if [ -z "$SX_NO_ROOT" ]; then
+		while true; do
+		    printf "What user should the SX server be running as [default=$SX_SERVER_USER]: "
+		    read NEWVAL
+		    test -z "$NEWVAL" && break
+		    id $NEWVAL > /dev/null 2>&1 && break
+		    echo "User $NEWVAL doesn't exist!"
+		done
+		SX_SERVER_USER=${NEWVAL:-$SX_SERVER_USER}
+		SX_SERVER_GROUP=`id -n -g "$SX_SERVER_USER"`
+	    else
+		SX_SERVER_USER=`whoami`
+		SX_SERVER_GROUP=`id -n -g "$SX_SERVER_USER"`
+	    fi
+	    echo
+	    printf "Number of children processes used by the server [default=$SX_CHILDREN_NUM]: "
+	    read NEWVAL
+	    SX_CHILDREN_NUM=${NEWVAL:-$SX_CHILDREN_NUM}
+	fi
+
+	echo
+	echo "--- YOUR CHOICES ---"
+	echo
+	echo "Cluster: sx://$SX_CLUSTER_NAME"
+	if [ -n "$SX_NODE_INTERNAL_IP" ]; then
+	    echo "Node: $SX_NODE_IP (internal address: $SX_NODE_INTERNAL_IP)"
+	else
+	    echo "Node: $SX_NODE_IP"
+	fi
+	echo "Use SSL: $SX_USE_SSL"
+	echo "Storage: $SX_DATA_DIR"
+	echo "Run as user: $SX_SERVER_USER"
+	echo
+
+	ask_yn "Is this correct? (Y/n)"
+	if [ "$ANSWER" != "n" ]; then
+	    break
+	fi
+	rm -f "$SX_SSL_KEY_FILE" "$SX_SSL_CERT_FILE"
+    done
+} #ask_questions()
+
+OLDSTAMP="`date +%s`"
+
+if [ "$CONFIG_FILE_GIVEN" = "yes" ]; then
+    echo "Using config file $CONFIG_FILE"
+
+    if [ -z "$SX_CFG_VERSION" ]; then
+	echo "ERROR: Config version not set in the config file (possibly unsupported)."
+	echo "Please perform a manual setup to generate a new config file with this"
+	echo "sxsetup version."
+	exit 1
+    fi
+
+    if [ "$SX_CFG_VERSION" != "$CFG_VERSION" ]; then
+	echo "ERROR: Config file version $SX_CFG_VERSION while sxsetup requires version $CFG_VERSION"
+	echo "Please perform a manual setup to generate a new config file with this"
+	echo "sxsetup version."
+	exit 1
+    fi
+
+    if [ -f "$SX_DATA_DIR/hashfs.db" ]; then 
+	echo "ERROR: Cluster is already initialized in $SX_DATA_DIR"
+	echo "Please wipe the existing data directory or provide a new one"
+	exit 1
+    fi
+
+    test -r "$SX_ADMIN_KEY" && SX_ADMIN_KEY=`cat $SX_ADMIN_KEY`
+    if [ -n "$SX_ADMIN_KEY" -a -z "`echo $SX_ADMIN_KEY | grep '0DPiKuNIrrVmD8IUCuw1hQxNqZ'`" ]; then
+	echo "ERROR: SX_ADMIN_KEY doesn't specify a valid admin key"
+	exit 1
+    fi
+
+    if [ -z "$SX_NODE_IP" ]; then
+	echo "ERROR: SX_NODE_IP is required to setup this node"
+	exit 1
+    fi
+
+    check_port "$SX_NODE_IP" $SX_PORT
+    test "$CHECK_PORT_RETVAL" = "1" && exit 1
+
+    if [ -n "$SX_NODE_INTERNAL_IP" ]; then
+	check_port "$SX_NODE_INTERNAL_IP" $SX_PORT
+	test "$CHECK_PORT_RETVAL" = "1" && exit 1
+    fi
+
+    if [ -n "$SX_EXISTING_NODE_IP" ]; then
+	if [ -z "$SX_ADMIN_KEY" ]; then
+	    echo "ERROR: SX_ADMIN_KEY is required when joining existing cluster"
+	    exit 1
+	fi
+    fi
+
+    if [ "$SX_USE_SSL" != "no" ]; then
+	mkdir -p "$ETCDIR/ssl/private" "$ETCDIR/ssl/certs"
+
+	if [ ! -r "$SX_SSL_CERT_FILE" ]; then
+	    if [ -z "$SX_SSL_CERT" ]; then
+		echo "ERROR: Please provide SX_SSL_CERT_FILE or SX_SSL_CERT in the config file."
+		exit 1
+	    fi
+	    echo $SX_SSL_CERT | sed -e 's/[ 	][ 	]*/\
+/g' | sed -e ':a' -e 'N' -e '$!ba' -e 's/BEGIN\n/BEGIN /g' | sed -e ':a' -e 'N' -e '$!ba' -e 's/END\n/END /g' > "$SX_SSL_CERT_FILE"
+	    test -z "$SX_NO_ROOT" && chown "$SX_SERVER_USER":"$SX_SERVER_GROUP" "$SX_SSL_CERT_FILE" 2>/dev/null
+	    chmod 600 "$SX_SSL_CERT_FILE" 2>/dev/null
+	fi
+
+	if [ ! -r "$SX_SSL_KEY_FILE" ]; then
+	    if [ -z "$SX_SSL_KEY" ]; then
+		echo "ERROR: Please provide SX_SSL_KEY_FILE or SX_SSL_KEY in the config file."
+		exit 1
+	    fi
+	    echo $SX_SSL_KEY | sed -e 's/[ 	][ 	]*/\
+/g' | sed -e ':a' -e 'N' -e '$!ba' -e 's/BEGIN\n/BEGIN /g' | sed -e ':a' -e 'N' -e '$!ba' -e 's/END\n/END /g' | sed -e ':a' -e 'N' -e '$!ba' -e 's/PRIVATE\n/PRIVATE /g' > "$SX_SSL_KEY_FILE"
+	    test -z "$SX_NO_ROOT" && chown "$SX_SERVER_USER":"$SX_SERVER_GROUP" "$SX_SSL_KEY_FILE" 2>/dev/null
+	    chmod 600 "$SX_SSL_KEY_FILE" 2>/dev/null
+	fi
+    fi
+
+else
+    # Interactive mode
+    ask_questions
+fi
+
+# Create up-to-date sxsetup.conf
+
+if [ -f "$CONFIG" ]; then
+    mv "$CONFIG" "$CONFIG.old.$OLDSTAMP"
+fi
+touch "$CONFIG"
+chmod 600 "$CONFIG"
+
+# REMEMBER: Bump CFG_VERSION after any incompatible changes to the config file!
+cat >"$CONFIG" <<EOF
+###########################################################################
+#                    !!! DO NOT EDIT THIS FILE !!!                        #
+#                                                                         #
+#    This file was generated during node creation with sxsetup.           #
+#    Some of the variables defined below are used by sxserver and other   #
+#    scripts, however the main purpose of this file is to provide         #
+#    a template for creating new nodes with sxsetup --config-file.        #
+#    Changing parameters such as SX_NODE_SIZE directly in this file       #
+#    will have no effect *after* the node was created.                    #
+#                                                                         #
+###########################################################################
+SX_CLUSTER_NAME="$SX_CLUSTER_NAME"
+SX_DATA_DIR="$SX_DATA_DIR"
+SX_RUN_DIR="$SX_RUN_DIR"
+SX_LIB_DIR="$SX_LIB_DIR"
+SX_LOG_FILE="$SX_LOG_FILE"
+SX_NODE_SIZE="$SX_NODE_SIZE"
+SX_NODE_IP="$SX_NODE_IP"
+SX_NODE_INTERNAL_IP="$SX_NODE_INTERNAL_IP"
+SX_EXISTING_NODE_IP="$SX_EXISTING_NODE_IP"
+SX_SERVER_USER="$SX_SERVER_USER"
+SX_SERVER_GROUP="$SX_SERVER_GROUP"
+SX_CHILDREN_NUM="$SX_CHILDREN_NUM"
+SX_PORT="$SX_PORT"
+SX_USE_SSL="$SX_USE_SSL"
+SX_SSL_KEY_FILE="$SX_SSL_KEY_FILE"
+SX_SSL_CERT_FILE="$SX_SSL_CERT_FILE"
+SX_SSL_KEY="$SX_SSL_KEY"
+SX_SSL_CERT="$SX_SSL_CERT"
+SX_CFG_VERSION="$CFG_VERSION"
+EOF
+
+################
+# Actual setup #
+################
+
+mkdir -p "$ETCDIR/sxserver"
+
+test "$SX_USE_SSL" = "no" && NOSSL_FLAG="--no-ssl"
+
+# sxfcgi.conf
+if [ -f "$ETCDIR/sxserver/sxfcgi.conf" ]; then
+    mv "$ETCDIR/sxserver/sxfcgi.conf" "$ETCDIR/sxserver/sxfcgi.conf.old.$OLDSTAMP"
+fi
+cat >"$ETCDIR/sxserver/sxfcgi.conf" <<EOF
+pidfile="$SX_RUN_DIR/sxfcgi.pid"
+logfile="$SX_LOG_FILE"
+socket="$SX_RUN_DIR/sxfcgi.socket"
+socket-mode=0660
+data-dir="$SX_DATA_DIR"
+children=$SX_CHILDREN_NUM
+EOF
+
+if [ -z "$SX_NO_ROOT" ]; then
+    cat >>"$ETCDIR/sxserver/sxfcgi.conf" <<EOF
+run-as="$SX_SERVER_USER:$SX_SERVER_GROUP"
+EOF
+fi
+
+if [ -z "$NOSSL_FLAG" ]; then
+    cat >>"$ETCDIR/sxserver/sxfcgi.conf" <<EOF
+ssl_ca="$SX_SSL_CERT_FILE"
+EOF
+fi
+
+if [ "$DEBUG_GIVEN" = "yes" ]; then
+    cat >>"$ETCDIR/sxserver/sxfcgi.conf" <<EOF
+debug
+EOF
+fi
+
+if [ -f "$ETCDIR/sxserver/sxhttpd.conf" ]; then
+    mv "$ETCDIR/sxserver/sxhttpd.conf" "$ETCDIR/sxserver/sxhttpd.conf.old.$OLDSTAMP"
+fi
+cp "$ETCDIR/sxserver/sxhttpd.conf.default" "$ETCDIR/sxserver/sxhttpd.conf"
+
+if [ -n "$SX_EXISTING_NODE_IP" -a -n "$SXCLUSTERKEY" ]; then
+    if [ -z "`echo $SXCLUSTERKEY | grep 'CLUSTER/ALLNODE/ROOT/'`" ]; then
+        # key file
+        if [ -r "$SXCLUSTERKEY" ]; then
+            # Save only if it is a file
+            echo SXCLUSTERKEY="$SXCLUSTERKEY" >>"$DEFAULTS"
+            SXCLUSTERKEY=`cat "$SXCLUSTERKEY"`
+        else
+            echo "Can't read key file $SXCLUSTERKEY"
+            exit 1
+        fi
+        if [ -z "`echo $SXCLUSTERKEY | grep 'CLUSTER/ALLNODE/ROOT/'`" ]; then
+            echo "'$SXCLUSTERKEY' is not a valid key or key file"
+            exit 1
+        fi
+    fi
+fi
+
+if [ -z "$NOSSL_FLAG" ] ; then
+    sed -e "s/^#//g"\
+	-e "s|ssl_certificate .*|ssl_certificate $SX_SSL_CERT_FILE;|"\
+	-e "s|ssl_certificate_key .*|ssl_certificate_key $SX_SSL_KEY_FILE;|"\
+	"$ETCDIR/sxserver/sxhttpd.conf" >$OUT_TMP
+    cp $OUT_TMP "$ETCDIR/sxserver/sxhttpd.conf"
+fi
+
+if [ -n "$SX_NODE_INTERNAL_IP" -a "$SX_NODE_IP" != "$SX_NODE_INTERNAL_IP" ]; then
+    if [ -n "`/sbin/ifconfig 2>/dev/null | grep $SX_NODE_IP`" ]; then
+	# bind to both public and internal IPs
+	sed -e "s/listen 80/listen $SX_NODE_IP:$SX_PORT default_server;\n\
+	     listen $SX_NODE_INTERNAL_IP:$SX_PORT/"\
+	"$ETCDIR/sxserver/sxhttpd.conf" >$OUT_TMP
+    else
+	# only listen on the internal IP (assume public IP is translated via 1:1 NAT)
+	sed -e "s/listen.*80/listen $SX_NODE_INTERNAL_IP:$SX_PORT/"\
+	"$ETCDIR/sxserver/sxhttpd.conf" >$OUT_TMP
+    fi
+else
+    # listen on the public IP
+    sed -e "s/listen.*80/listen $SX_NODE_IP:$SX_PORT/"\
+    "$ETCDIR/sxserver/sxhttpd.conf" >$OUT_TMP
+fi
+cp $OUT_TMP "$ETCDIR/sxserver/sxhttpd.conf"
+
+sed -e "s/^user.*/user $SX_SERVER_USER $SX_SERVER_GROUP;/"\
+    "$ETCDIR/sxserver/sxhttpd.conf" >$OUT_TMP
+cp $OUT_TMP "$ETCDIR/sxserver/sxhttpd.conf"
+
+if [ "$SX_NO_ROOT" = "yes" ] ; then
+    sed -e "s/^user.*/#user $SX_SERVER_USER $SX_SERVER_GROUP;/"\
+    "$ETCDIR/sxserver/sxhttpd.conf" >$OUT_TMP
+    cp $OUT_TMP "$ETCDIR/sxserver/sxhttpd.conf"
+fi
+
+if [ ! -f "$SX_DATA_DIR/hashfs.db" ]; then
+    echo
+    echo "--- NODE INITIALIZATION ---"
+    echo
+    mkdir -p "`dirname $SX_DATA_DIR`"
+    test -n "$SX_ADMIN_KEY" && echo "$SX_ADMIN_KEY" > $ADMINKEY_TMP
+    test -n "$SX_CLUSTER_UUID" && UUIDFLAG="--cluster-uuid=$SX_CLUSTER_UUID"
+    test -z "$SX_NO_ROOT" && OWNERFLAG="--owner=$SX_SERVER_USER:$SX_SERVER_GROUP"
+    test -n "$SX_CLUSTER_KEY" && echo "$SX_CLUSTER_KEY" > $CLUSTKEY_TMP && KEYFLAG="--cluster-key=$CLUSTKEY_TMP"
+
+    if [ "$BARE_GIVEN" = "yes" ]; then
+	if [ "$CONFIG_FILE_GIVEN" = "yes" -a "$SX_CFG_VERSION" = "2" ]; then
+	    if [ -z "$UUIDFLAG" ]; then
+		echo "SX_CLUSTER_UUID must be set with a valid cluster UUID"
+		exit 1
+	    fi
+	    if [ -z "$SX_CLUSTER_KEY" -o -z "`echo $SX_CLUSTER_KEY | grep 'CLUSTER/ALLNODE/ROOT/'`" ]; then
+		echo "SX_CLUSTER_KEY must be set with a valid cluster key"
+		exit 1
+	    fi
+	fi
+
+	# Create node
+        (
+        set -x
+        "@sbindir@/sxadm" node --new\
+            --batch-mode $OWNERFLAG $UUIDFLAG $KEYFLAG\
+            "$SX_DATA_DIR"
+        )
+	if [ $? -ne 0 ]; then
+	    echo "Failed to create the bare node. Please make sure that $SX_SERVER_USER:$SX_SERVER_GROUP"
+	    echo "has write access to $SX_DATA_DIR"
+	    exit 1
+	fi
+
+	# Start the new node
+	"@sbindir@/sxserver" start
+	if [ $? -ne 0 ]; then
+	    echo "Failed to start the bare node."
+	    exit 1
+	fi
+	if [ -n "$SX_NODE_INTERNAL_IP" -a "$SX_NODE_INTERNAL_IP" != "$SX_NODE_IP" ]; then
+	    NEWNODE="$SX_NODE_SIZE/$SX_NODE_IP/$SX_NODE_INTERNAL_IP"
+	else
+	    NEWNODE="$SX_NODE_SIZE/$SX_NODE_IP"
+	fi
+	echo "SX_CLUSTER_UUID=`@sbindir@/sxadm node --info $SX_DATA_DIR | grep 'Cluster UUID' | cut -d\  -f 3`" >> $CONFIG
+	echo "SX_CLUSTER_KEY=`@sbindir@/sxadm node --info $SX_DATA_DIR | grep 'Cluster key' | cut -d\  -f 3`" >> $CONFIG
+	echo "SX_ADMIN_KEY=`@sbindir@/sxadm node --info $SX_DATA_DIR | grep 'Admin key' | cut -d\  -f 3`" >> $CONFIG
+
+
+	echo "Bare node created. Use 'sxadm cluster --mod' to join it to the cluster"
+	echo "or perform another operation."
+	echo "Node specification: $NEWNODE"
+        rm -rf $SXSETUP_TMPDIR
+        trap - EXIT INT
+        exit 0
+
+    elif [ -z "$SX_EXISTING_NODE_IP" ]; then
+        (
+        set -x
+        "@sbindir@/sxadm" node --new\
+            --batch-mode $OWNERFLAG $KEYFLAG\
+            $UUIDFLAG "$SX_DATA_DIR"
+        )
+	if [ $? -ne 0 ]; then
+	    echo "Failed to create the first node. Please make sure that $SX_SERVER_USER:$SX_SERVER_GROUP"
+	    echo "has write access to $SX_DATA_DIR"
+	    exit 1
+	fi
+
+	test -z "$NOSSL_FLAG" && SSLCAFILE="--ssl-ca-file=$SX_SSL_CERT_FILE"
+	if [ -n "$SX_NODE_INTERNAL_IP" -a "$SX_NODE_INTERNAL_IP" != "$SX_NODE_IP" ]; then
+	    NEWNODE="$SX_NODE_SIZE/$SX_NODE_IP/$SX_NODE_INTERNAL_IP"
+	else
+	    NEWNODE="$SX_NODE_SIZE/$SX_NODE_IP"
+	fi
+
+	if [ "$FORCE_REINIT_GIVEN" = "yes" -a "$CONFIG_FILE_GIVEN" != "yes" ]; then
+	    SX_ADMIN_KEY=
+	fi
+	if [ -n "$SX_ADMIN_KEY" ]; then
+	    echo $SX_ADMIN_KEY > $ADMINKEY_TMP
+	    ADMKEYFILE="--admin-key $ADMINKEY_TMP"
+	fi
+        (
+        set -x
+        "@sbindir@/sxadm" cluster --new\
+            --port="$SX_PORT"\
+            --batch-mode\
+	    --node-dir="$SX_DATA_DIR"\
+	    $ADMKEYFILE \
+            $SSLCAFILE \
+	    $NEWNODE \
+	    "sx://$SX_CLUSTER_NAME"
+        )
+	if [ $? -ne 0 ]; then
+	    echo "Failed to create the initial cluster."
+	    exit 1
+	fi
+
+	echo "SX_CLUSTER_UUID=`@sbindir@/sxadm node --info $SX_DATA_DIR | grep 'Cluster UUID' | cut -d\  -f 3`" >> $CONFIG
+	echo "SX_CLUSTER_KEY=`@sbindir@/sxadm node --info $SX_DATA_DIR | grep 'Cluster key' | cut -d\  -f 3`" >> $CONFIG
+	echo "SX_ADMIN_KEY=`@sbindir@/sxadm node --info $SX_DATA_DIR | grep 'Admin key' | cut -d\  -f 3`" >> $CONFIG
+
+	"@sbindir@/sxserver" start
+	if [ $? -ne 0 ]; then
+	    echo "Failed to start the new node."
+	    exit 1
+	fi
+
+    else
+	# Config access to the cluster
+	test "$CONFIG_FILE_GIVEN" = "yes" && SXINITFLAGS="--batch-mode"
+	"@bindir@/sxinit" --force-reinit --port="$SX_PORT" $NOSSL_FLAG $SXINITFLAGS --auth-file="$ADMINKEY_TMP" --host-list="$SX_EXISTING_NODE_IP" "sx://admin@$SX_CLUSTER_NAME"
+	if [ $? -ne 0 ]; then
+	    echo "Failed to connect to the cluster. Please make sure the admin key is correct"
+	    echo "and $SX_EXISTING_NODE_IP is a valid and accessible node of the cluster sx://$SX_CLUSTER_NAME"
+	    exit 1
+	fi
+	SXUUID=`cat $HOME/.sx/$SX_CLUSTER_NAME/config | grep ClusterUUID | cut -d= -f2`
+	if [ -z "$SXUUID" ]; then
+	    echo "Cannot obtain cluster's UUID"
+	    exit 1
+	fi
+	echo "SX_CLUSTER_UUID=\"$SXUUID\"" >> "$CONFIG"
+
+	# Get cluster key
+	if [ -z "$SX_CLUSTER_KEY" ]; then
+	    "@sbindir@/sxadm" cluster --get-cluster-key "sx://admin@$SX_CLUSTER_NAME" > $OUT_TMP
+	    if [ $? -ne 0 ]; then
+		echo "Failed to retrieve current configuration of the cluster."
+		exit 1
+	    fi
+	    SX_CLUSTER_KEY=`cat $OUT_TMP | grep "Cluster key: " | cut -d\  -f3`
+	    if [ -z "$SX_CLUSTER_KEY" -o -z "`echo $SX_CLUSTER_KEY | grep 'CLUSTER/ALLNODE/ROOT/'`" ]; then
+		echo "Failed to obtain the cluster key."
+		exit 1
+	    fi
+	fi
+	echo "$SX_CLUSTER_KEY" > $CLUSTKEY_TMP
+	echo "SX_CLUSTER_KEY=\"$SX_CLUSTER_KEY\"" >> "$CONFIG"
+	echo "SX_ADMIN_KEY=\"$SX_ADMIN_KEY\"" >> "$CONFIG"
+
+	# Create node
+        (
+        set -x
+        "@sbindir@/sxadm" node --new\
+            --batch-mode $OWNERFLAG\
+	    --cluster-uuid="$SXUUID"\
+	    --cluster-key="$CLUSTKEY_TMP"\
+            "$SX_DATA_DIR"
+        )
+	if [ $? -ne 0 ]; then
+	    echo "Failed to create the node. Please make sure that $SX_SERVER_USER:$SX_SERVER_GROUP"
+	    echo "has write access to $SX_DATA_DIR"
+	    exit 1
+	fi
+
+	# Start the new node
+	"@sbindir@/sxserver" start
+	if [ $? -ne 0 ]; then
+	    echo "Failed to start the new node."
+	    exit 1
+	fi
+
+	if [ -n "$SX_NODE_INTERNAL_IP" -a "$SX_NODE_INTERNAL_IP" != "$SX_NODE_IP" ]; then
+	    NEWNODE="$SX_NODE_SIZE/$SX_NODE_IP/$SX_NODE_INTERNAL_IP"
+	else
+	    NEWNODE="$SX_NODE_SIZE/$SX_NODE_IP"
+	fi
+
+	# Commit new cluster config
+	REBCNT=1
+	MODCNT=1
+	while true; do
+	    "@sbindir@/sxadm" cluster --info "sx://admin@$SX_CLUSTER_NAME" > $OUT_TMP
+	    if [ $? -ne 0 ]; then
+		echo "Failed to retrieve current configuration of the cluster."
+		"@sbindir@/sxserver" stop
+		exit 1
+	    fi
+	    if [ -n "`cat $OUT_TMP | grep 'Operations in progress'`" ]; then
+		if [ $REBCNT -gt 10 ]; then
+		    echo "Failed to add the new node to the cluster, which is currently running"
+		    echo "another operation. Please try again later."
+		    "@sbindir@/sxserver" stop
+		    exit 1
+		fi
+		echo "Cluster is busy (another operation in progress)... retrying in 60 seconds (attempt $REBCNT of 10)."
+		REBCNT=`expr $REBCNT + 1`
+		sleep 60
+		continue
+	    fi
+	    SXDIST=`cat $OUT_TMP | grep "Current configuration" | cut -d: -f 2`
+	    if [ -z "$SXDIST" ]; then
+		echo "Failed to obtain the node information."
+		"@sbindir@/sxserver" stop
+		exit 1
+	    fi
+	    SXDIST="$SXDIST $NEWNODE"
+	    (
+	    set -x
+	    "@sbindir@/sxadm" cluster --mod $SXDIST "sx://admin@$SX_CLUSTER_NAME" 2>$OUT_TMP
+	    )
+	    test $? = 0 && break
+	    if [ -n "`grep 'temporarily locked' $OUT_TMP`" -a $MODCNT -le 10 ]; then
+		echo "Cluster busy... retrying in 60 seconds (attempt $MODCNT of 10)."
+		MODCNT=`expr $MODCNT + 1`
+		sleep 60
+	    else
+		cat $OUT_TMP
+		echo "Failed to modify cluster sx://$SX_CLUSTER_NAME"
+		"@sbindir@/sxserver" stop
+		exit 1
+	    fi
+	done
+
+	if [ "$WAIT_GIVEN" = "yes" ]; then
+	    echo "Waiting for cluster to finish rebalancing..."
+	    while true; do
+		"@sbindir@/sxadm" cluster --info "sx://admin@$SX_CLUSTER_NAME" > $OUT_TMP
+		if [ $? -ne 0 ]; then
+		    sleep 1
+		    continue
+		fi
+		if [ -n "`cat $OUT_TMP | grep 'Operations in progress'`" ]; then
+		    sleep 1
+		    continue
+		else
+		    break
+		fi
+	    done
+	fi
+    fi
+
+else
+    echo "Cluster is already initialized in $SX_DATA_DIR"
+    # TODO loopback but remember what I typed
+fi
+
+"@sbindir@/sxadm" node --info --human-readable "$SX_DATA_DIR" | grep -v "HashFS Version"
+
+rm -rf $SXSETUP_TMPDIR
+trap - EXIT INT
+
+echo
+echo "--- CONFIGURATION SUMMARY ---"
+echo
+if [ -z "$NOSSL_FLAG" ]; then
+    echo "SSL private key ($SX_SSL_KEY_FILE):"
+    cat "$SX_SSL_KEY_FILE"
+    echo
+    echo "SSL certificate ($SX_SSL_CERT_FILE):"
+    cat "$SX_SSL_CERT_FILE"
+fi
+
+echo
+echo "Cluster: sx://$SX_CLUSTER_NAME"
+
+if [ -n "$SX_NODE_INTERNAL_IP" -a "$SX_NODE_IP" != "$SX_NODE_INTERNAL_IP" ]; then
+    echo "This node: $SX_NODE_IP (internal address: $SX_NODE_INTERNAL_IP)"
+else
+    echo "This node: $SX_NODE_IP"
+fi
+echo "Port number: $SX_PORT"
+"@sbindir@/sxadm" node --info --human-readable "$SX_DATA_DIR" | grep -v "HashFS Version"
+echo "Storage location: $SX_DATA_DIR"
+echo "Run as user: $SX_SERVER_USER"
+echo "Sockets and pidfiles in: $SX_RUN_DIR"
+echo "Logs in: $SX_LOG_FILE"
+echo
+echo "--- END OF SUMMARY ---"
+echo
+echo "Congratulations, the new node is up and running!"
+echo "You can control it with '@sbindir@/sxserver'"
+echo
+echo "You can add a new node to the cluster by running 'sxsetup' on another server."
+if [ -z "$NOSSL_FLAG" ]; then
+    echo "When prompted, enter the 'admin key', 'SSL private key' and"
+    echo "'SSL certificate' printed above."
+else
+    echo "When prompted, enter the 'admin key' printed above."
+fi
+echo
+echo "You can run 'sxacl useradd joe sx://admin@$SX_CLUSTER_NAME' to add a new user."
+echo "To create a new volume owned by user 'joe' run:"
+echo "'sxvol create --owner joe --replica N --size SIZE sx://admin@$SX_CLUSTER_NAME/VOLNAME'"
+echo
+
+exit 0

@@ -26,7 +26,11 @@ typedef struct _sxi_job_t sxi_job_t;
 typedef struct _sxi_jobs_t {
     sxi_job_t **jobs;
     unsigned n;
+    unsigned successful;
+    long http_err;
     struct timeval tv;
+    unsigned error;
+    int ignore_errors;
 } sxi_jobs_t;
 
 /* used where a sxi_job_t would be required but we're not job based */
@@ -36,8 +40,17 @@ sxi_job_t *sxi_job_submit(sxi_conns_t *conns, sxi_hostlist_t *hlist, enum sxi_cl
 
 void sxi_job_free(sxi_job_t *job);
 
-int sxi_job_wait(sxi_conns_t *conn, sxi_jobs_t *jobs, unsigned *successful);
+int sxi_job_wait(sxi_conns_t *conn, sxi_jobs_t *jobs);
 
-int sxi_job_submit_and_poll(sxi_conns_t *conns, sxi_hostlist_t *hlist, const char *query, void *content, size_t content_size);
+int sxi_job_submit_and_poll(sxi_conns_t *conns, sxi_hostlist_t *hlist, enum sxi_cluster_verb verb, const char *query, void *content, size_t content_size);
+int sxi_job_submit_and_poll_err(sxi_conns_t *conns, sxi_hostlist_t *hlist, enum sxi_cluster_verb verb, const char *query, void *content, size_t content_size, long *http_err);
+
+/* Return number of successfully finished jobs */
+unsigned sxi_jobs_get_successful(const sxi_jobs_t *jobs);
+
+/* temporary notify filter hack */
+typedef void (*nf_fn_t)(const sxf_handle_t *handle, void *ctx, const void *cfgdata, unsigned int cfgdata_len, sxf_mode_t mode, const char *source_cluster, const char *source_volume, const char *source_path, const char *dest_cluster, const char *dest_volume, const char *dest_path);
+
+void sxi_job_set_nf(sxi_job_t *job, struct filter_handle *nf_fh, nf_fn_t nf_fn, const char *nf_src_path, const char *nf_dst_clust, const char *nf_dst_vol, const char *nf_dst_path);
 
 #endif

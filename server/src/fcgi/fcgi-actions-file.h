@@ -30,6 +30,7 @@
 
 void fcgi_send_file(void);
 void fcgi_send_file_meta(void);
+void fcgi_send_file_revisions(void);
 
 void fcgi_create_file(void);
 void fcgi_create_tempfile(void);
@@ -38,4 +39,5 @@ void fcgi_flush_tempfile(void);
 
 void fcgi_delete_file(void);
 
+void fcgi_send_replacement_files(void);
 #endif

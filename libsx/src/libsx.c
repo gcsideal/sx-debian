@@ -26,12 +26,15 @@
 #include <unistd.h>
 #include <time.h>
 #include <curl/curl.h>
+#include <pwd.h>
+#include <ctype.h>
 
 #include "libsx-int.h"
 #include "ltdl.h"
 #include "filter.h"
-#include <openssl/crypto.h>
 #include "clustcfg.h"
+#include "misc.h"
+#include "vcrypto.h"
 
 struct _sxc_client_t {
     char errbuf[65536];
@@ -39,20 +42,38 @@ struct _sxc_client_t {
     int last_error;
     int verbose;
     struct sxi_logger log;
-    int (*confirm)(const char *prompt, int default_answer);
+    sxc_input_cb input_cb;
+    void *input_ctx;
     struct filter_ctx fctx;
     struct tempfile_track temptrack;
     const char *op;
     char *op_host;
     char *op_vol;
     char *op_path;
+    char *confdir;
+    alias_list_t *alias;
 };
 
-sxc_client_t *sxc_init(const char *client_version, const sxc_logger_t *func, int (*confirm)(const char *prompt, int def)) {
-    uint32_t runtime_ver = SSLeay();
-    uint32_t compile_ver = SSLEAY_VERSION_NUMBER;
+static const char *guess_tempdir(void) {
+    const char *ret;
+
+    ret = sxi_getenv("TMPDIR");
+    if(!ret)
+	ret = sxi_getenv("TEMP");
+    if(!ret)
+	ret = "/tmp";
+
+    return ret;
+}
+
+sxc_client_t *sxc_init(const char *client_version, const sxc_logger_t *func, sxc_input_cb input_cb, void *input_ctx)
+{
     sxc_client_t *sx;
     struct sxi_logger l;
+    unsigned int config_len;
+    const char *home_dir;
+    struct passwd *pwd;
+
 
     if (!func)
         return NULL;
@@ -62,18 +83,15 @@ sxc_client_t *sxc_init(const char *client_version, const sxc_logger_t *func, int
 
     const char *this_version = sxc_get_version();
     if (!client_version || strcmp(client_version, this_version)) {
-        sxi_log_msg(&l, "sxc_init", SX_LOG_CRIT, "Version mismatch: our version '%s' - library version '%s'",
+        sxi_log_msg(&l, "sxc_init", SX_LOG_CRIT, "Version mismatch: Our version '%s' - library version '%s'",
                     client_version, this_version);
         return NULL;
     }
 
     /* FIXME THIS IS NOT THREAD SAFE */
-    srand(time(NULL));
     signal(SIGPIPE, SIG_IGN);
-    /* TODO: have a way to log this */
-    if((runtime_ver & 0xff0000000) != (compile_ver & 0xff0000000)) {
+    if (sxi_crypto_check_ver(&l))
         return NULL;
-    }
     CURLcode rc = curl_global_init(CURL_GLOBAL_ALL);
     if (rc) {
         sxi_log_msg(&l, "sxc_init", SX_LOG_CRIT, "Failed to initialize libcurl: %s",
@@ -93,15 +111,43 @@ sxc_client_t *sxc_init(const char *client_version, const sxc_logger_t *func, int
     }
     sx->log.max_level = SX_LOG_NOTICE;
     sx->log.func = func;
-    sx->confirm = confirm;
+    sx->input_cb = input_cb;
+    sx->input_ctx = input_ctx;
+
+    /* To set configuration directory use sxc_set_confdir(). Default value is taken from HOME directory. */
+    home_dir = sxi_getenv("HOME");
+    if(!home_dir) {
+        pwd = getpwuid(geteuid());
+        if(pwd)
+            home_dir = pwd->pw_dir;
+    }
+    if(home_dir) {
+        config_len = strlen(home_dir) + strlen("/.sx");
+        sx->confdir = malloc(config_len + 1);
+        if(!sx->confdir) {
+            sxi_log_syserr(&l, "sxc_init", SX_LOG_ERR, "Could not allocate memory for configuration directory");
+	    sxc_shutdown(sx, 0);
+            return NULL;
+        }
+        snprintf(sx->confdir, config_len + 1, "%s/.sx", home_dir);
+    }
+    if(sxc_set_tempdir(sx, NULL)) {
+	sxi_log_syserr(&l, "sxc_init", SX_LOG_CRIT, "Failed to set temporary path");
+	sxc_shutdown(sx, 0);
+	return NULL;
+    }
+
     return sx;
 }
 
 void sxc_shutdown(sxc_client_t *sx, int signal) {
+    int i;
     if(!sx)
 	return;
+    if(!signal)
+        sxi_clear_operation(sx);
     if(sx->temptrack.slots) {
-	for(int i = 0; i < sx->temptrack.slots; i++) {
+	for(i = 0; i < sx->temptrack.slots; i++) {
 	    if(sx->temptrack.names[i]) {
 		/* TODO: for win32 we may also need to track descriptors */
 		unlink(sx->temptrack.names[i]);
@@ -112,14 +158,22 @@ void sxc_shutdown(sxc_client_t *sx, int signal) {
 	if(!signal)
 	    free(sx->temptrack.names);
     }
+
     if(!signal) {
+        /* See sxc_set_confdir */
+        free(sx->confdir);
+        sxi_free_aliases(sx->alias);
+        free(sx->alias);
+
         if (sx->log.func && sx->log.func->close) {
             sx->log.func->close(sx->log.func->ctx);
         }
 	sxi_filter_unloadall(sx);
+	free(sx->tempdir);
 	free(sx);
 	lt_dlexit();
 	curl_global_cleanup();
+        sxi_vcrypto_cleanup();
     }
 }
 
@@ -127,10 +181,16 @@ void sxc_set_verbose(sxc_client_t *sx, int enabled) {
     if (!sx)
         return;
     sx->verbose = enabled;
+    if (sxi_log_is_debug(&sx->log))
+	return;
     if (enabled)
         sxi_log_enable_level(&sx->log, SX_LOG_INFO);
     else
-        sxi_log_enable_level(&sx->log, SX_LOG_NOTICE);
+        sxi_log_set_level(&sx->log, SX_LOG_NOTICE);
+}
+
+int sxc_is_verbose(sxc_client_t *sx) {
+    return sx ? sx->verbose : 0;
 }
 
 void sxi_clear_operation(sxc_client_t *sx)
@@ -149,6 +209,19 @@ void sxi_clear_operation(sxc_client_t *sx)
 const char * sxi_get_operation(sxc_client_t *sx)
 {
     return sx ? sx->op : NULL;
+}
+
+void sxi_operation_info(const sxc_client_t *sx, const char **op, const char **host, const char **vol, const char **path) {
+    if(!sx)
+        return;
+    if(op)
+        *op = sx->op;
+    if(host)
+        *host = sx->op_host;
+    if(vol)
+        *vol = sx->op_vol;
+    if(path)
+        *path = sx->op_path;
 }
 
 void sxi_set_operation(sxc_client_t *sx, const char *op, const char *cluster, const char *vol, const char *path)
@@ -214,8 +287,29 @@ void sxi_notice(sxc_client_t *sx, const char *fmt, ...) {
 
 const char *sxi_get_tempdir(sxc_client_t *sx) {
     if(!sx)
-	return NULL;
+	return guess_tempdir();
     return sx->tempdir;
+}
+
+int sxc_set_tempdir(sxc_client_t *sx, const char *tempdir) {
+    char *newtmp;
+
+    if(!sx)
+	return -1;
+
+    if(!tempdir)
+	tempdir = guess_tempdir();
+
+    newtmp = strdup(tempdir);
+    if(!newtmp) {
+	sxi_seterr(sx, SXE_EMEM, "Failed to set temporary directory: Out of memory");
+	return -1;
+    }
+
+    free(sx->tempdir);
+    sx->tempdir = newtmp;
+
+    return 0;
 }
 
 struct filter_ctx *sxi_get_fctx(sxc_client_t *sx) {
@@ -248,7 +342,7 @@ int sxc_geterrnum(sxc_client_t *sx) {
 const char *sxc_geterrmsg(sxc_client_t *sx) {
     if(!sx)
 	return NULL;
-    return sx->errbuf;
+    return sxc_escstr(sx->errbuf);
 }
 
 void sxc_clearerr(sxc_client_t *sx) {
@@ -273,46 +367,6 @@ void sxi_seterr(sxc_client_t *sx, enum sxc_error_t err, const char *fmt, ...) {
         sxi_vlog_msg(&sx->log, "sxi_seterr_skip", SX_LOG_DEBUG, fmt, ap);
     }
     va_end(ap);
-}
-
-void sxi_setclusterr(sxc_client_t *sx, const char *nodeid, const char *reqid, int status,
-                     const char *msg, const char *details)
-{
-    char httpcode[16];
-    if (!sx)
-        return;
-    if (!*msg) {
-        snprintf(httpcode, sizeof(httpcode), "HTTP code %d", status);
-        msg = httpcode;
-    }
-    sxi_fmt_start(&sx->log.fmt);
-    sxi_fmt_msg(&sx->log.fmt, "Failed to %s: %s (", sx->op ? sx->op : "query cluster", msg);
-    if (sx->op_host) {
-        sxi_fmt_msg(&sx->log.fmt, "sx://%s", sx->op_host);
-        if (sx->op_vol) {
-            sxi_fmt_msg(&sx->log.fmt, "/%s", sx->op_vol);
-            if (sx->op_path) {
-                sxi_fmt_msg(&sx->log.fmt, "/%s", sx->op_path);
-            }
-        }
-    }
-    sxi_fmt_msg(&sx->log.fmt," on");
-    if (nodeid)
-        sxi_fmt_msg(&sx->log.fmt, " node:%s", nodeid);
-    if (reqid)
-        sxi_fmt_msg(&sx->log.fmt, " reqid:%s", reqid);
-    sxi_fmt_msg(&sx->log.fmt, ")");
-    if (status < 400 || status >= 500) {
-        /* do not print details on 40x */
-        if (sx->verbose && details && *details) {
-            sxi_fmt_msg(&sx->log.fmt, "\nHTTP %d: %s", status, details);
-        }
-    }
-    sxi_seterr(sx, SXE_ECOMM, "%s", sx->log.fmt.buf);
-    sxi_clear_operation(sx);
-    SXDEBUG("Cluster query failed (HTTP %d): %s", status, sx->errbuf);
-    if (details && *details)
-        SXDEBUG("Cluster error: %s", details);
 }
 
 void sxi_setsyserr(sxc_client_t *sx, enum sxc_error_t err, const char *fmt, ...) {
@@ -356,11 +410,66 @@ void sxc_loglasterr(sxc_client_t *sx)
     sxi_log_msg(&sx->log, NULL, SX_LOG_ERR, "%s", sxc_geterrmsg(sx));
 }
 
-int sxi_confirm(sxc_client_t *sx, const char *prompt, int default_answer)
+/*
+ * returns -1 on error, 0 on success and 1 if no input callback registered
+ */
+int sxi_get_input(sxc_client_t *sx, sxc_input_t type, const char *prompt, const char *def, char *in, unsigned int insize)
 {
-    /* if there's no confirm callback always assume true */
-    if(!sx || !sx->confirm)
+    if(!sx || !sx->input_cb)
 	return 1;
 
-    return sx->confirm(prompt, default_answer);
+    return sx->input_cb(sx, type, prompt, def, in, insize, sx->input_ctx);
+}
+
+int sxc_filter_get_input(const sxf_handle_t *h, sxc_input_t type, const char *prompt, const char *def, char *in, unsigned int insize)
+{
+    if(!h || !h->sx || !h->sx->input_cb)
+        return 1;
+
+    return h->sx->input_cb(h->sx, type, prompt, def, in, insize, h->sx->input_ctx);
+}
+
+/* Set configuration directory */
+int sxc_set_confdir(sxc_client_t *sx, const char *config_dir) 
+{
+    char *tmp_confdir = NULL;
+    if(!sx || !config_dir)
+        return 1;
+
+    /* Try to duplicate string and check it */
+    tmp_confdir = strdup(config_dir);
+    if(!tmp_confdir) {
+        sxi_seterr(sx, SXE_EMEM, "Could not allocate memory for configuration directory name");
+        return 1;
+    }
+
+    free(sx->confdir);
+    sx->confdir = tmp_confdir;
+    return 0;
+}
+
+/* Get configuration directory full name */
+const char *sxc_get_confdir(sxc_client_t *sx) {
+    if(!sx)
+        return NULL;
+
+    return sx->confdir;
+}
+
+alias_list_t *sxi_get_alias_list(sxc_client_t *sx) {
+    if(!sx->alias) {
+        if(sxi_load_aliases(sx, &sx->alias)) {
+            sxi_seterr(sx, SXE_EMEM, "Could not list aliases: %s", sxc_geterrmsg(sx));
+        }
+    }
+    return sx->alias;
+}
+
+char* sxc_escstr(char *str) {
+    unsigned int i;
+    for(i = 0; i < strlen(str); i++) {
+        if(iscntrl(str[i]))
+            str[i] = '?';
+    }
+    return str;
 }

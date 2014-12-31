@@ -36,14 +36,12 @@
 #include "utils.h"
 #include "log.h"
 
-#define GC_MAX_WAL_PAGES 10000
-
 static void qclose_db(sqlite3 **dbp)
 {
     sqlite3 *db;
     int r;
     if (!dbp) {
-        WARN("Null DBp");
+        DEBUG("Null DBp");
         return;
     }
     db = *dbp;
@@ -66,6 +64,8 @@ static int qwal_hook(void *ctx, sqlite3 *handle, const char *name, int pages)
     sxi_db_t *db = ctx;
     if (db)
         db->wal_pages = pages;
+    if (pages >= db_max_passive_wal_pages)
+        qcheckpoint(db);
     return SQLITE_OK;
 }
 
@@ -84,20 +84,54 @@ sxi_db_t *qnew(sqlite3 *handle)
     return db;
 }
 
-void qcheckpoint(sxi_db_t *db, int kind)
+static void qcheckpoint_run(sxi_db_t *db, int kind)
 {
+    struct timeval tv0, tv1;
     int log, ckpt, rc;
     if (!db)
         return;
-    if (db->wal_pages < GC_MAX_WAL_PAGES)
-        return;
+    gettimeofday(&tv0, NULL);
     rc = sqlite3_wal_checkpoint_v2(db->handle, NULL, kind, &log, &ckpt);
-    if (rc != SQLITE_OK && rc != SQLITE_BUSY) {
-        WARN("Failed to checkpoint GC db: %s", sqlite3_errmsg(db->handle));
-    } else {
-        INFO("WAL %s: %d frames, %d checkpointed: %s", sqlite3_db_filename(db->handle, "main"), log, ckpt, sqlite3_errmsg(db->handle));
+    gettimeofday(&tv1, NULL);
+    if (rc != SQLITE_OK && rc != SQLITE_BUSY && rc != SQLITE_LOCKED) {
+        WARN("Failed to checkpoint db '%s': %s", sqlite3_db_filename(db->handle, "main"), sqlite3_errmsg(db->handle));
+    } else if (ckpt > 0) {
+        DEBUG("WAL %s: %d frames, %d checkpointed: %s in %.1fs", sqlite3_db_filename(db->handle, "main"), log, ckpt, sqlite3_errmsg(db->handle),
+             timediff(&tv0, &tv1));
     }
     db->wal_pages = 0;
+}
+
+void qcheckpoint(sxi_db_t *db)
+{
+    if (!db)
+        return;
+    if (db->wal_pages >= db_max_restart_wal_pages)
+        qcheckpoint_run(db, SQLITE_CHECKPOINT_RESTART);
+    else if (db->wal_pages >= db_max_passive_wal_pages)
+        qcheckpoint_run(db, SQLITE_CHECKPOINT_PASSIVE);
+}
+
+void qcheckpoint_restart(sxi_db_t *db)
+{
+    if (db && db->wal_pages >= db_min_passive_wal_pages)
+        qcheckpoint_run(db, SQLITE_CHECKPOINT_RESTART);
+}
+
+void qcheckpoint_idle(sxi_db_t *db)
+{
+    if (db) {
+        int changes = sqlite3_total_changes(db->handle);
+        if (changes != db->last_total_changes) {
+            struct timeval tv;
+            gettimeofday(&tv, NULL);
+            if (timediff(&db->tv_last, &tv) >= db_idle_restart) {
+                qcheckpoint_run(db, SQLITE_CHECKPOINT_RESTART);
+                memcpy(&db->tv_last, &tv, sizeof(tv));
+                db->last_total_changes = changes;
+            }
+        }
+    }
 }
 
 void qclose(sxi_db_t **db)

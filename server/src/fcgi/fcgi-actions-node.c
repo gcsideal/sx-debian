@@ -175,6 +175,9 @@ static const yajl_callbacks nodes_parser = {
 
 void fcgi_set_nodes(void) {
     sx_uuid_t selfid;
+    job_t job;
+    rc_ty s;
+
     if(sx_hashfs_self_uuid(hashfs, &selfid))
 	quit_errmsg(500, "Cluster not yet initialized");
 
@@ -210,41 +213,62 @@ void fcgi_set_nodes(void) {
     auth_complete();
     quit_unless_authed();
 
-    job_t job;
-    rc_ty s = sx_hashfs_hdist_change_req(hashfs, yctx.nodes, &job);
+    if(has_arg("replace"))
+	s = sx_hashfs_hdist_replace_req(hashfs, yctx.nodes, &job);
+    else
+	s = sx_hashfs_hdist_change_req(hashfs, yctx.nodes, &job);
+
     sx_nodelist_delete(yctx.nodes);
     if(s != OK)
 	quit_errmsg(rc2http(s), msg_get_reason());
     send_job_info(job);
 }
 
-/* {"newDistribution":"HEX(blob_cfg)"} */
+/* {"newDistribution":"HEX(blob_cfg)", "faultyNodes":["uuid1", "uuiid2"]} */
 /* MODHDIST: maybe add revision here */
 struct cb_updist_ctx {
-    enum cb_updist_state { CB_UPDIST_START, CB_UPDIST_KEY, CB_UPDIST_CFG, CB_UPDIST_COMPLETE } state;
+    enum cb_updist_state { CB_UPDIST_START, CB_UPDIST_KEY, CB_UPDIST_CFG, CB_UPDIST_FAULTY, CB_UPDIST_FAULTYNODE, CB_UPDIST_COMPLETE } state;
     void *cfg;
-    unsigned int cfg_len;
+    sx_nodelist_t *faulty;
+    unsigned int cfg_len, nfaulty;
 };
 
 static int cb_updist_string(void *ctx, const unsigned char *s, size_t l) {
     struct cb_updist_ctx *c = (struct cb_updist_ctx *)ctx;
 
-    if(c->state != CB_UPDIST_CFG || l&1 || c->cfg)
-	return 0;
+    if(c->state == CB_UPDIST_CFG) {
+	if(l&1 || c->cfg)
+	    return 0;
 
-    c->cfg_len = l/2;
-    c->cfg = wrap_malloc(l/2);
-    if(!c->cfg)
-	return 0;
+	c->cfg_len = l/2;
+	c->cfg = wrap_malloc(l/2);
+	if(!c->cfg)
+	    return 0;
 
-    if(hex2bin(s, l, c->cfg, l/2)) {
-	free(c->cfg);
-	c->cfg = NULL;
-	return 0;
+	if(hex2bin(s, l, c->cfg, l/2)) {
+	    free(c->cfg);
+	    c->cfg = NULL;
+	    return 0;
+	}
+
+	c->state = CB_UPDIST_KEY;
+	return 1;
     }
 
-    c->state = CB_UPDIST_KEY;
-    return 1;
+    if(c->state == CB_UPDIST_FAULTYNODE || l != UUID_STRING_SIZE) {
+	char uuidstr[UUID_STRING_SIZE+1];
+	sx_uuid_t uuid;
+
+	memcpy(uuidstr, s, UUID_STRING_SIZE);
+	uuidstr[UUID_STRING_SIZE] = '\0';
+	if(uuid_from_string(&uuid, uuidstr))
+	    return 0;
+	if(sx_nodelist_add(c->faulty, sx_node_new(&uuid, "127.0.0.1", NULL, 1)))
+	    return 0;
+	return 1;
+    }
+
+    return 0;
 }
 
 static int cb_updist_start_map(void *ctx) {
@@ -258,10 +282,12 @@ static int cb_updist_map_key(void *ctx, const unsigned char *s, size_t l) {
     if(c->state != CB_UPDIST_KEY)
 	return 0;
 
-    if(l != lenof("newDistribution") || strncmp("newDistribution", s, lenof("newDistribution")))
+    if(l == lenof("newDistribution") && !strncmp("newDistribution", s, lenof("newDistribution")))
+	c->state = CB_UPDIST_CFG;
+    else if(l == lenof("faultyNodes") && !strncmp("faultyNodes", s, lenof("faultyNodes")))
+	c->state = CB_UPDIST_FAULTY;
+    else
 	return 0;
-
-    c->state = CB_UPDIST_CFG;
     return 1;
 }
 
@@ -271,6 +297,26 @@ static int cb_updist_end_map(void *ctx) {
     if(c->state != CB_UPDIST_KEY)
 	return 0;
     c->state = CB_UPDIST_COMPLETE;
+    return 1;
+}
+
+static int cb_updist_start_array(void *ctx) {
+    struct cb_updist_ctx *c = (struct cb_updist_ctx *)ctx;
+
+    if(c->state != CB_UPDIST_FAULTY)
+	return 0;
+
+    c->state = CB_UPDIST_FAULTYNODE;
+    return 1;
+}
+
+static int cb_updist_end_array(void *ctx) {
+    struct cb_updist_ctx *c = (struct cb_updist_ctx *)ctx;
+
+    if(c->state != CB_UPDIST_FAULTYNODE)
+	return 0;
+
+    c->state = CB_UPDIST_KEY;
     return 1;
 }
 
@@ -284,40 +330,55 @@ static const yajl_callbacks updist_parser = {
     cb_updist_start_map,
     cb_updist_map_key,
     cb_updist_end_map,
-    cb_fail_start_array,
-    cb_fail_end_array
+    cb_updist_start_array,
+    cb_updist_end_array
 };
 
 
 void fcgi_new_distribution(void) {
     struct cb_updist_ctx yctx;
+    yajl_handle yh;
+    rc_ty s;
+    int len;
+
     yctx.cfg = NULL;
     yctx.state = CB_UPDIST_START;
+    yctx.faulty = sx_nodelist_new();
+    if(!yctx.faulty)
+	quit_errmsg(503, "Cannot allocate replacement node list");
 
-    yajl_handle yh = yajl_alloc(&updist_parser, NULL, &yctx);
-    if(!yh)
-	quit_errmsg(500, "Cannot allocate json parser");
+    yh = yajl_alloc(&updist_parser, NULL, &yctx);
+    if(!yh) {
+	sx_nodelist_delete(yctx.faulty);
+	quit_errmsg(503, "Cannot allocate json parser");
+    }
 
-    int len;
     while((len = get_body_chunk(hashbuf, sizeof(hashbuf))) > 0)
 	if(yajl_parse(yh, hashbuf, len) != yajl_status_ok) break;
 
     if(len || yajl_complete_parse(yh) != yajl_status_ok || yctx.state != CB_UPDIST_COMPLETE || !yctx.cfg || !yctx.cfg_len) {
 	yajl_free(yh);
+	sx_nodelist_delete(yctx.faulty);
 	free(yctx.cfg);
 	quit_errmsg(400, "Invalid request content");
     }
     yajl_free(yh);
 
     auth_complete();
-    quit_unless_authed();
+    if(!is_authed()) {
+	free(yctx.cfg);
+	send_authreq();
+	return;
+    }
 
-    rc_ty s = sx_hashfs_hdist_change_add(hashfs, yctx.cfg, yctx.cfg_len);
+    if(!sx_nodelist_count(yctx.faulty))
+	s = sx_hashfs_hdist_change_add(hashfs, yctx.cfg, yctx.cfg_len);
+    else
+	s = sx_hashfs_hdist_replace_add(hashfs, yctx.cfg, yctx.cfg_len, yctx.faulty);
+    sx_nodelist_delete(yctx.faulty);
     free(yctx.cfg);
     if(s != OK)
 	quit_errmsg(rc2http(s), msg_get_reason());
-
-
 
     CGI_PUTS("\r\n");
 }
@@ -327,27 +388,52 @@ void fcgi_enable_distribution(void) {
     if(s != OK)
 	quit_errmsg(rc2http(s), msg_get_reason());
 
-    /* MODHDIST: unlock and create jobs for rebalancing */
+    CGI_PUTS("\r\n");
+}
+
+void fcgi_revoke_distribution(void) {
+    rc_ty s = sx_hashfs_hdist_change_revoke(hashfs);
+    if(s != OK)
+	quit_errmsg(rc2http(s), msg_get_reason());
+    CGI_PUTS("\r\n");
+}
+
+
+void fcgi_start_rebalance(void) {
+    rc_ty s = sx_hashfs_hdist_rebalance(hashfs);
+
+    if(s != OK)
+	quit_errmsg(rc2http(s), msg_get_reason());
 
     CGI_PUTS("\r\n");
 }
 
+void fcgi_stop_rebalance(void) {
+    rc_ty s = sx_hashfs_hdist_endrebalance(hashfs);
+
+    if(s != OK)
+	quit_errmsg(rc2http(s), msg_get_reason());
+
+    CGI_PUTS("\r\n");
+}
 
 /*
   {
    "clusterName":"name",
    "nodeUUID":"12345678-1234-1234-1234-123356789abcd",
    "secureProtocol":(true|false),
+   "httpPort":8080,
    "caCertData":"--- BEGIN ....",
   }
 */
 /* MODHDIST: maybe add revision here */
 struct cb_nodeinit_ctx {
-    enum cb_nodeinit_state { CB_NODEINIT_START, CB_NODEINIT_KEY, CB_NODEINIT_NAME, CB_NODEINIT_NODE, CB_NODEINIT_SSL, CB_NODEINIT_CA, CB_NODEINIT_COMPLETE } state;
+    enum cb_nodeinit_state { CB_NODEINIT_START, CB_NODEINIT_KEY, CB_NODEINIT_NAME, CB_NODEINIT_NODE, CB_NODEINIT_SSL, CB_NODEINIT_PORT, CB_NODEINIT_CA, CB_NODEINIT_COMPLETE } state;
     unsigned int have_uuid;
     int ssl;
     char *name, *ca;
     sx_uuid_t uuid;
+    uint16_t port;
 };
 
 static int cb_nodeinit_string(void *ctx, const unsigned char *s, size_t l) {
@@ -419,6 +505,11 @@ static int cb_nodeinit_map_key(void *ctx, const unsigned char *s, size_t l) {
 	return 1;
     }
 
+    if(l == lenof("httpPort") && !strncmp("httpPort", s, lenof("httpPort"))) {
+	c->state = CB_NODEINIT_PORT;
+	return 1;
+    }
+
     if(l == lenof("secureProtocol") && !strncmp("secureProtocol", s, lenof("secureProtocol"))) {
 	c->state = CB_NODEINIT_SSL;
 	return 1;
@@ -441,12 +532,33 @@ static int cb_nodeinit_end_map(void *ctx) {
     return 1;
 }
 
+
+static int cb_nodeinit_number(void *ctx, const char *s, size_t l) {
+    struct cb_nodeinit_ctx *c = (struct cb_nodeinit_ctx *)ctx;
+    char number[6], *eon;
+    long n;
+
+    if(c->state != CB_NODEINIT_PORT || l<1 || l>5)
+	return 0;
+
+    memcpy(number, s, l);
+    number[l] = '\0';
+    n = strtol(number, &eon, 10);
+    if(*eon || n < 0 || n > 0xffff)
+	return 0;
+
+    c->port = n;
+    c->state = CB_NODEINIT_KEY;
+    return 1;
+}
+
+
 static const yajl_callbacks nodeinit_parser = {
     cb_fail_null,
     cb_nodeinit_boolean,
     NULL,
     NULL,
-    cb_fail_number,
+    cb_nodeinit_number,
     cb_nodeinit_string,
     cb_nodeinit_start_map,
     cb_nodeinit_map_key,
@@ -484,7 +596,7 @@ void fcgi_node_init(void) {
     auth_complete();
     quit_unless_authed();
 
-    rc_ty s = sx_hashfs_setnodedata(hashfs, yctx.name, &yctx.uuid, yctx.ssl, yctx.ca);
+    rc_ty s = sx_hashfs_setnodedata(hashfs, yctx.name, &yctx.uuid, yctx.port, yctx.ssl, yctx.ca);
     free(yctx.name);
     free(yctx.ca);
 
@@ -508,7 +620,7 @@ void fcgi_node_init(void) {
 
     {
         "volumes":{
-	    "volume1":{"owner":"xxxx","replica":1,"size":1234,""meta":{"key":"val","key2":"val2"}},
+	    "volume1":{"owner":"xxxx","replica":1,"revs":1,"size":1234,""meta":{"key":"val","key2":"val2"}},
 	    "volume2":{"owner":"yyyy","replica":2,"size":5678},
         }
     }
@@ -521,14 +633,14 @@ void fcgi_node_init(void) {
 */
 
 struct cb_sync_ctx {
-    enum cb_sync_state { CB_SYNC_START, CB_SYNC_MAIN, CB_SYNC_USERS, CB_SYNC_VOLUMES, CB_SYNC_PERMS, CB_SYNC_INUSERS, CB_SYNC_INVOLUMES, CB_SYNC_INPERMS, CB_SYNC_USR, CB_SYNC_VOL, CB_SYNC_PRM, CB_SYNC_USRKEY, CB_SYNC_VOLKEY, CB_SYNC_PRMKEY, CB_SYNC_USRAUTH, CB_SYNC_USRROLE, CB_SYNC_VOLOWNR, CB_SYNC_VOLREP, CB_SYNC_VOLSIZ, CB_SYNC_VOLMETA, CB_SYNC_VOLMETAKEY, CB_SYNC_VOLMETAVAL, CB_SYNC_PRMVAL, CB_SYNC_OUTRO, CB_SYNC_COMPLETE } state;
+    enum cb_sync_state { CB_SYNC_START, CB_SYNC_MAIN, CB_SYNC_USERS, CB_SYNC_VOLUMES, CB_SYNC_PERMS, CB_SYNC_INUSERS, CB_SYNC_INVOLUMES, CB_SYNC_INPERMS, CB_SYNC_USR, CB_SYNC_VOL, CB_SYNC_PRM, CB_SYNC_USRKEY, CB_SYNC_VOLKEY, CB_SYNC_PRMKEY, CB_SYNC_USRAUTH, CB_SYNC_USRROLE, CB_SYNC_VOLOWNR, CB_SYNC_VOLREP, CB_SYNC_VOLREVS, CB_SYNC_VOLSIZ, CB_SYNC_VOLMETA, CB_SYNC_VOLMETAKEY, CB_SYNC_VOLMETAVAL, CB_SYNC_PRMVAL, CB_SYNC_OUTRO, CB_SYNC_COMPLETE } state;
     int64_t size;
     char name[MAX(SXLIMIT_MAX_VOLNAME_LEN, SXLIMIT_MAX_USERNAME_LEN) + 1];
     char mkey[SXLIMIT_META_MAX_KEY_LEN+1];
     uint8_t key[AUTH_KEY_LEN];
     sx_uid_t uid;
     int admin, have_key;
-    unsigned int replica;
+    unsigned int replica, revs;
 };
 
 static int cb_sync_string(void *ctx, const unsigned char *s, size_t l) {
@@ -596,21 +708,25 @@ static int cb_sync_number(void *ctx, const char *s, size_t l) {
     char number[24], *eon;
     int64_t n;
 
-    if(c->state != CB_SYNC_VOLREP && c->state != CB_SYNC_VOLSIZ)
+    if(c->state != CB_SYNC_VOLREP && c->state != CB_SYNC_VOLSIZ && c->state != CB_SYNC_VOLREVS)
 	return 0;
 
+    if(l<1 || l>20)
+	return 0;
     memcpy(number, s, l);
     number[l] = '\0';
     n = strtoll(number, &eon, 10);
     if(*eon || n <= 0)
 	return 0;
 
-    if(c->state == CB_SYNC_VOLREP) {
-	if(n > 0xffffffff)
-	    return 0;
-	c->replica = (unsigned int)n;
-    } else
+    if(c->state == CB_SYNC_VOLSIZ)
 	c->size = n;
+    else if(n > 0xffffffff)
+	return 0;
+    else if(c->state == CB_SYNC_VOLREP)
+	c->replica = (unsigned int)n;
+    else 
+	c->revs = (unsigned int)n;
 
     c->state = CB_SYNC_VOLKEY;
 
@@ -673,6 +789,7 @@ static int cb_sync_map_key(void *ctx, const unsigned char *s, size_t l) {
 	    sx_hashfs_volume_new_begin(hashfs);
 	    c->uid = -1;
 	    c->replica = 0;
+	    c->revs = 0;
 	    c->size = -1;
 	    c->state = CB_SYNC_VOL;
 	} else
@@ -689,6 +806,8 @@ static int cb_sync_map_key(void *ctx, const unsigned char *s, size_t l) {
 	    c->state = CB_SYNC_VOLOWNR;
 	else if(l == lenof("replica") && !strncmp("replica", s, lenof("replica")))
 	    c->state = CB_SYNC_VOLREP;
+	else if(l == lenof("revs") && !strncmp("revs", s, lenof("revs")))
+	    c->state = CB_SYNC_VOLREVS;
 	else if(l == lenof("size") && !strncmp("size", s, lenof("size")))
 	    c->state = CB_SYNC_VOLSIZ;
 	else if(l == lenof("meta") && !strncmp("meta", s, lenof("meta")))
@@ -730,7 +849,9 @@ static int cb_sync_end_map(void *ctx) {
     } else if(c->state == CB_SYNC_VOLKEY) {
 	if(c->uid < 0 || c->size <= 0 || !c->replica)
 	    return 0;
-	if(sx_hashfs_volume_new_finish(hashfs, c->name, c->size, c->replica, c->uid))
+	if(!c->revs)
+	    c->revs = 1;
+	if(sx_hashfs_volume_new_finish(hashfs, c->name, c->size, c->replica, c->revs, c->uid))
 	    return 0;
 	if(sx_hashfs_volume_enable(hashfs, c->name))
 	    return 0;
@@ -793,5 +914,47 @@ void fcgi_sync_globs(void) {
     /* MODHDIST: commit if authed, rollback if unauthed */
     quit_unless_authed();
 
+    CGI_PUTS("\r\n");
+}
+
+
+void fcgi_node_jlock(void) {
+    rc_ty s = sx_hashfs_job_lock(hashfs, path);
+    if(s != OK)
+	quit_errmsg(rc2http(s), msg_get_reason());
+
+    CGI_PUTS("\r\n");
+}
+
+
+void fcgi_node_junlock(void) {
+    rc_ty s = sx_hashfs_job_unlock(hashfs, path);
+    if(s != OK)
+	quit_errmsg(rc2http(s), msg_get_reason());
+
+    CGI_PUTS("\r\n");
+}
+
+void fcgi_node_repaired(void) {
+    int64_t dist_rev = 0;
+    sx_uuid_t nodeid;
+    rc_ty s;
+
+    if(has_arg("dist")) {
+	char *eon;
+	dist_rev = strtoll(get_arg("dist"), &eon, 10);
+	if(*eon)
+	    dist_rev = 0;
+    }
+    if(dist_rev <= 0)
+	quit_errmsg(400, "Missing or invalid 'dist' argument");
+
+    if(uuid_from_string(&nodeid, path))
+	quit_errmsg(400, "Invalid repaired node UUID");
+
+    s = sx_hashfs_set_unfaulty(hashfs, &nodeid, dist_rev);
+    if(s != OK)
+	quit_errmsg(rc2http(s), msg_get_reason());
+    
     CGI_PUTS("\r\n");
 }

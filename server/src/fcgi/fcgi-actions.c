@@ -45,10 +45,6 @@ void cluster_ops(void) {
 	quit_errmsg(405, "Method Not Allowed");
     }
 
-    /* If not authed we serve the homepage back */
-    if(!is_sky())
-	quit_home();
-
     /* Cluster queries - require either a valid user or ADMIN 
      * priv enforcement in fcgi_handle_cluster_requests() */
     quit_unless_authed();
@@ -66,6 +62,13 @@ void volume_ops(void) {
 
     if(verb == VERB_HEAD || verb == VERB_GET) {
 	const sx_hashfs_volume_t *vol;
+
+	if(!strcmp(volume, ".replblk")) {
+	    /* Bulk block and blockmeta xfer (s2s, replacement node repopulation) - CLUSTER required */
+	    quit_unless_has(PRIV_CLUSTER);
+	    fcgi_send_replacement_blocks();
+	    return;
+	}
 
 	if(!strcmp(volume, ".users")) {
 	    /* List users - ADMIN required */
@@ -89,8 +92,8 @@ void volume_ops(void) {
 	    quit_errnum(500);
 	}
 
-	/* Locating or listing volume data requires READ|WRITE|OWNER access or better */
-        if (!has_priv(PRIV_READ) && !has_priv(PRIV_WRITE) && !has_priv(PRIV_OWNER) && !has_priv(PRIV_ADMIN))
+	/* Locating or listing volume data requires READ|WRITE|ACL access or better */
+        if (!has_priv(PRIV_READ) && !has_priv(PRIV_WRITE) && !has_priv(PRIV_ACL) && !has_priv(PRIV_ADMIN))
             quit_errmsg(403, "Permission denied: not enough privileges");
 
 	if(has_arg("o")) {
@@ -122,13 +125,22 @@ void volume_ops(void) {
 	if(is_reserved())
 	    quit_errmsg(403, "Volume name is reserved");
 	if(!has_priv(PRIV_ADMIN))
-	    quit_unless_has(PRIV_OWNER);
+	    quit_unless_has(PRIV_ACL);
 	fcgi_acl_volume();
 	return;
     }
 
     /* Only ADMIN or better allowed beyond this point */
     quit_unless_has(PRIV_ADMIN);
+
+    if(verb == VERB_PUT && arg_is("o", "mod")) {
+        if(is_reserved())
+            quit_errmsg(403, "Volume name is reserved");
+        quit_unless_has(PRIV_ADMIN);
+        /* Modify volume - ADMIN required */
+        fcgi_volume_mod();
+        return;
+    }
 
     if(verb == VERB_PUT && (arg_is("o","disable") || arg_is("o","enable"))) {
 	/* Enable / disable volume (2pc/s2s) - CLUSTER required */
@@ -151,6 +163,10 @@ void volume_ops(void) {
 		fcgi_new_distribution();
 	    else
 		fcgi_enable_distribution();
+	} else if(!strcmp(".rebalance", volume) && !content_len()) {
+	    /* Initiate rebalance process (s2s) - CLUSTER required */
+	    quit_unless_has(PRIV_CLUSTER);
+	    fcgi_start_rebalance();
 	} else if(!strcmp(volume, ".sync")) {
 	    /* Syncronize global objects (s2s) - CLUSTER required */
 	    quit_unless_has(PRIV_CLUSTER);
@@ -163,12 +179,14 @@ void volume_ops(void) {
 	    fcgi_set_nodes();
 	} else if (!strcmp(".users", volume)) {
 	    /* Create new user - ADMIN required */
-	    if(is_https() < sx_hashfs_uses_secure_proto(hashfs)) {
-                WARN("Key operations require SECURE mode");
-                quit_errmsg(403, "Key operations require SECURE mode");
-            }
 	    fcgi_create_user();
-	} else {
+        } else if (!strcmp(volume, ".data")) {
+            quit_unless_has(PRIV_CLUSTER);
+            fcgi_hashop_inuse();
+	} else if(!strcmp(volume, ".volsizes")) {
+            quit_unless_has(PRIV_CLUSTER);
+            fcgi_volsizes();
+        } else {
 	    /* Create new volume - ADMIN required */
 	    if(is_reserved())
 		quit_errmsg(403, "Volume name is reserved");
@@ -178,11 +196,24 @@ void volume_ops(void) {
     }
 
     if(verb == VERB_DELETE) {
-	/* Delete volume (currently s2s only) - CLUSTER required */
-	quit_unless_has(PRIV_CLUSTER);
-	if(is_reserved())
-	    quit_errmsg(403, "Volume name is reserved");
-	fcgi_delete_volume();
+	if(!strcmp(".rebalance", volume)) {
+	    /* Complete rebalance process (s2s) - CLUSTER required */
+	    quit_unless_has(PRIV_CLUSTER);
+	    fcgi_stop_rebalance();
+	} else if (!strcmp(volume, ".gc")) {
+	    quit_unless_has(PRIV_ADMIN);
+            sx_hashfs_gc_expire_all_reservations(hashfs);
+            fcgi_trigger_gc();
+	} else if(!strcmp(volume, ".dist")) {
+	    quit_unless_has(PRIV_CLUSTER);
+	    fcgi_revoke_distribution();
+        } else {
+	    /* Delete volume - ADMIN or CLUSTER required */
+	    quit_unless_has(PRIV_ADMIN);
+	    if(is_reserved())
+		quit_errmsg(403, "Volume name is reserved");
+	    fcgi_delete_volume();
+	}
 	return;
     }
 }
@@ -198,29 +229,38 @@ void file_ops(void) {
 
     if(verb == VERB_HEAD || verb == VERB_GET) {
 	if(!strcmp(volume, ".data")) {
-	    /* Get block content - any valid user allowed */
-	    fcgi_send_blocks();
+            if (has_arg("o")) {
+                quit_unless_has(PRIV_CLUSTER);
+                if (arg_is("o","check"))
+                    fcgi_hashop_blocks(HASHOP_CHECK);
+            } else {
+                /* Get block content - any valid user allowed */
+                fcgi_send_blocks();
+            }
 	} else if(!strcmp(volume, ".results")) {
 	    /* Get job result - job owner or ADMIN required (enforcement in fcgi_job_result()) */
 	    fcgi_job_result();
         } else if (!strcmp(volume, ".users")) {
 	    /* Get user data - ADMIN required */
 	    quit_unless_has(PRIV_ADMIN);
-            if(is_https() < sx_hashfs_uses_secure_proto(hashfs)) {
-                WARN("key operations require SECURE mode");
-                quit_errmsg(403, "Key operations require SECURE mode");
-            }
             fcgi_send_user();
         } else if(!strcmp(volume, ".challenge")) {
 	    /* Response to challenge (s2s) - CLUSTER required */
 	    quit_unless_has(PRIV_CLUSTER);
             fcgi_challenge_response();
+	} else if(!strcmp(volume, ".replfl")) {
+	    /* Bulk file xfer (s2s, replacement node repopulation) - CLUSTER required */
+	    quit_unless_has(PRIV_CLUSTER);
+	    fcgi_send_replacement_files();
 	} else {
 	    /* Get file (meta)data - READ required */
 	    quit_unless_has(PRIV_READ);
 	    if(has_arg("fileMeta")) {
 		/* Get file metadata */
 		fcgi_send_file_meta();
+	    } else if(has_arg("fileRevisions")) {
+		/* Get available revisions for the requested file */
+		fcgi_send_file_revisions();
 	    } else {
 		/* Get file content */
 		fcgi_send_file();
@@ -241,12 +281,42 @@ void file_ops(void) {
 	    return;
 	}
 
+	if(!strcmp(volume, ".jlock") && !content_len()) {
+	    /* Giant locking - CLUSTER required */
+	    quit_unless_has(PRIV_CLUSTER);
+	    fcgi_node_jlock();
+	    return;
+	}
+
 	if(!strcmp(volume, ".users") && (arg_is("o","disable") || arg_is("o","enable"))) {
 	    /* Enable/disable users (2pc/s2s) - CLUSTER required */
 	    quit_unless_has(PRIV_CLUSTER);
 	    fcgi_user_onoff(arg_is("o","enable"));
 	    return;
 	}
+
+        if (!strcmp(".users", volume) && path && strlen(path) > 0) {
+            rc_ty s;
+            uint8_t requser[AUTH_UID_LEN];
+            s = sx_hashfs_get_user_by_name(hashfs, path, requser);
+            switch(s) {
+                case OK:
+                    break;
+                case ENOENT:
+                    quit_errmsg(404, "No such user");
+                case EINVAL:
+                    quit_errnum(400);
+                default:
+                    quit_errnum(500);
+            }
+            /* user is allowed to change own key,
+             * admin is allowed to change all keys */
+            if (memcmp(requser, user, sizeof(requser))) {
+                quit_unless_has(PRIV_ADMIN);
+            }
+            fcgi_user_newkey();
+            return;
+        }
 
 	if(!strcmp(volume, ".data")) {
             if (has_arg("o")) {
@@ -255,10 +325,6 @@ void file_ops(void) {
                 quit_unless_has(PRIV_CLUSTER);
                 if (arg_is("o","reserve"))
                     kind = HASHOP_RESERVE;
-                else if (arg_is("o","inuse"))
-                    kind = HASHOP_INUSE;
-                else if (arg_is("o","check"))
-                    kind = HASHOP_CHECK;
                 else
                     quit_errmsg(400,"Invalid operation requested on hash batch");
                 fcgi_hashop_blocks(kind);
@@ -288,12 +354,31 @@ void file_ops(void) {
     }
 
     if(verb == VERB_DELETE) {
-	if(!strcmp(volume, ".data")) {
-	    /* Hashop delete (gc/s2s) - CLUSTER required */
-            quit_unless_has(PRIV_CLUSTER);
-            fcgi_hashop_blocks(HASHOP_DELETE);
-            return;
+
+	if(!strcmp(volume, ".jlock")) {
+	    /* Giant unlocking - CLUSTER required */
+	    quit_unless_has(PRIV_CLUSTER);
+	    fcgi_node_junlock();
+	    return;
 	}
+
+	if(!strcmp(volume, ".users")) {
+	    /* Delete user */
+	    quit_unless_has(PRIV_ADMIN);
+	    fcgi_delete_user();
+	    return;
+	}
+
+	if(!strcmp(volume, ".faulty")) {
+	    /* A faulty node was replaced - CLUSTER required */
+	    quit_unless_has(PRIV_CLUSTER);
+	    fcgi_node_repaired();
+	    return;
+	}
+
+	if(is_reserved())
+            quit_errmsg(405, "Method Not Allowed");
+
 	/* File deletion - WRITE required */
 	quit_unless_has(PRIV_WRITE);
 	fcgi_delete_file();
@@ -303,45 +388,68 @@ void file_ops(void) {
 
 void job_2pc_handle_request(sxc_client_t *sx, const job_2pc_t *spec, void *yctx)
 {
-    yajl_handle yh = yajl_alloc(spec->parser, NULL, yctx);
-    if (!yh)
-	quit_errmsg(500, "Cannot allocate json parser");
-    int len;
-    while((len = get_body_chunk(hashbuf, sizeof(hashbuf))) > 0)
-	if(yajl_parse(yh, hashbuf, len) != yajl_status_ok) break;
-    if(len || yajl_complete_parse(yh) != yajl_status_ok || !spec->parse_complete(yctx)) {
-	yajl_free(yh);
-	quit_errmsg(400, "Invalid request content");
+    if (spec->parser) {
+        rc_ty rc = OK;
+        yajl_handle yh = yajl_alloc(spec->parser, NULL, yctx);
+        if (!yh)
+            quit_errmsg(500, "Cannot allocate json parser");
+        int len;
+        while((len = get_body_chunk(hashbuf, sizeof(hashbuf))) > 0)
+            if(yajl_parse(yh, hashbuf, len) != yajl_status_ok) break;
+        if(len || yajl_complete_parse(yh) != yajl_status_ok)
+            rc = EINVAL;
+        yajl_free(yh);
+        if(rc == OK) {
+            auth_complete();
+            quit_unless_authed();
+            rc = spec->parse_complete(yctx);
+        }
+        if (rc) {
+            const char *msg = msg_get_reason();
+            if(!msg || !*msg)
+                msg = "Invalid request content";
+            quit_errmsg(rc2http(rc), msg);
+        }
+    } else {
+        /* check that body is empty? */
+        auth_complete();
+        quit_unless_authed();
     }
-    yajl_free(yh);
-
-    auth_complete();
-    quit_unless_authed();
 
     sx_blob_t *joblb = sx_blob_new();
     if (!joblb)
         quit_errmsg(500, "Cannot allocate job blob");
-    if (spec->to_blob(sx, yctx, joblb)) {
+
+    sx_nodelist_t *nodes = NULL;
+    if (spec->nodes(sx, joblb, &nodes))
+        quit_errmsg(500, msg_get_reason());
+
+    if (spec->to_blob(sx, sx_nodelist_count(nodes), yctx, joblb)) {
         const char *msg = msg_get_reason();
         sx_blob_free(joblb);
         if(!msg || !*msg)
             msg = "Cannot create job blob";
+        sx_nodelist_delete(nodes);
         quit_errmsg(500, msg);
     }
     if(has_priv(PRIV_CLUSTER)) {
-        msg_set_reason("cannot execute blob");
+        sx_nodelist_delete(nodes);
         sx_blob_reset(joblb);
-        rc_ty rc = spec->execute_blob(hashfs, joblb, JOBPHASE_REQUEST);
+        rc_ty rc = spec->execute_blob(hashfs, joblb, JOBPHASE_REQUEST, 1);
         sx_blob_free(joblb);
-        if (rc != OK)
-            quit_errmsg(rc2http(rc), msg_get_reason());
+        if (rc != OK) {
+            const char *msg = msg_get_reason();
+            if (!msg)
+                msg = rc2str(rc);
+            WARN("Failed to execute job(%d): %s", rc2http(rc), msg);
+            quit_errmsg(rc2http(rc), msg);
+        }
 	CGI_PUTS("\r\n");
     } else {
 	const void *job_data;
 	unsigned int job_datalen;
 	job_t job;
         int res;
-        sx_nodelist_t *nodes = NULL;
 	unsigned int job_timeout;
 
         /* create job, must not reset yet */
@@ -350,14 +458,13 @@ void job_2pc_handle_request(sxc_client_t *sx, const job_2pc_t *spec, void *yctx)
         sx_blob_reset(joblb);
         const char *lock = spec->get_lock(joblb);
         sx_blob_reset(joblb);
-        res = spec->nodes(sx, joblb, &nodes);
-	job_timeout = 12 * sx_nodelist_count(nodes); /* FIXME: this should be jobtype specific */
-        if (res == OK)
-            res = sx_hashfs_job_new(hashfs, uid, &job, spec->job_type, job_timeout, lock, job_data, job_datalen, nodes);
-        sx_nodelist_delete(nodes);
+	job_timeout = spec->timeout(sx, sx_nodelist_count(nodes));
+        res = sx_hashfs_job_new(hashfs, uid, &job, spec->job_type, job_timeout, lock, job_data, job_datalen, nodes);
         sx_blob_free(joblb);
+        sx_nodelist_delete(nodes);
         if (res != OK)
             quit_errmsg(rc2http(res), msg_get_reason());
         send_job_info(job);
     }
 }
+

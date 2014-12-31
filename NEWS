@@ -1,0 +1,87 @@
+1.0
+---
+
+This is the first stable release of Skylable SX. The changes
+from 0.9 include:
+
+  * New user manual covering all important cluster and
+    client operations (see doc/manual/manual.pdf or 
+    http://www.skylable.com/products/sx/manual)
+  * Support for replacing and rebuilding of broken nodes (see
+    the manual for instructions on cluster healing)
+  * New tool 'sxmv' for moving and renaming files (see 'man sxmv')
+  * 'sxcp --ignore-errors' (ignore errors during recursive operations
+    and report them at the end)
+  * 'sxcp --exclude/--include' (skip or process files matching specific
+    patterns)
+  * 'sxvol modify' (change configuration of existing volumes)
+  * 'sxadm --resize' (proportionally grow or shrink the entire cluster)
+  * 'sxadm node --check' improvements (better detect local problems,
+    eg. with faulty hard drives)
+  * 'sxadm node --extract' (recover local storage in emergency situations)
+  * Many improvements and bugfixes
+
+0.9 (Final Beta)
+----------------
+
+This is a final beta of Skylable SX! Changes in this release include:
+
+  * New garbage collector implementation, both more robust and scalable
+  * Full support for file revisions (see 'man sxrev' and 'man sxvol' for
+    details on how to manage and work with the revisions)
+  * "undelete" filter (see 'sxvol filter --info undelete')
+  * Usability improvements, including new man pages for the client tools
+  * Many minor improvements and bugfixes
+
+0.4 (Fourth Beta)
+-----------------
+
+This release contains important enhancements and bugfixes, including:
+
+  * Automatic rebalance when nodes are added, modified or removed
+    from the cluster
+  * aes256 filter now uses the AES-256-CBC-HMAC-512 mode and bcrypt for
+    key derivation
+  * sxcp --one-file-system support (to not cross filesystem boundaries)
+  * sxcp can now limit the number of connections (global and per host), see
+    --full-help for usage information
+  * Many usability enhancements in the client tools
+  * Other improvements and bugfixes
+
+0.3 (Third Beta)
+----------------
+
+The key features and improvements in this release include:
+
+  * Support for using a custom port number (configure with sxsetup --advanced).
+    This also allows sxsetup to run without root privileges when SX is
+    configured to run on a port higher than 1024.
+  * sxcp now displays a progress bar while transferring files
+  * sxcp --bwlimit support (to set a bandwidth usage limit)
+  * configure --with-system-libs support (to force the use of system libraries
+    instead of those bundled in 3rdparty/)
+  * Many minor improvements and bugfixes
+
+0.2 (Second Beta)
+-----------------
+
+Changes in this release include:
+
+  * Support for building with either NSS or OpenSSL
+  * Minimum Curl version supported is now 7.34.0 (configure will use the
+    embedded version if the system's one is not supported - this allows
+    out-of-box build on CentOS 6)
+  * aes256 filter now generates per-volume salts; in order to preserve
+    deduplication support across different volumes using the same password
+    you can force a static salt, eg. --filter aes256="salt:af6a812ad0b1cb22"
+  * sxinit --force-reinit support (to recreate the entire local cluster config)
+  * sxinit --list support (to list all configured clusters and profiles)
+  * sxinit --alias support (to assign an alias for easy access), see
+    https://wiki.skylable.com/wiki/Sxinit#Aliases
+  * sxls -l now also lists filters used by volumes
+  * Other bugfixes and improvements
+
+0.1 (First Beta)
+----------------
+
+Initial public release of Skylable SX.

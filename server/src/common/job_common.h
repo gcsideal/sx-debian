@@ -35,6 +35,7 @@
 typedef int64_t job_t;
 
 #define JOB_FAILURE (-1LL)
+#define JOB_NOPARENT JOB_FAILURE
 #define JOB_FAIL_REASON_SIZE 512
 
 typedef enum _job_status_t {
@@ -47,9 +48,24 @@ typedef enum _jobtype_t {
     JOBTYPE_CREATE_VOLUME = 0,
     JOBTYPE_CREATE_USER,
     JOBTYPE_VOLUME_ACL,
+    JOBTYPE_REPLICATE_BLOCKS,
     JOBTYPE_FLUSH_FILE,
     JOBTYPE_DELETE_FILE,
-    JOBTYPE_DISTRIBUTION
+    JOBTYPE_DISTRIBUTION,
+    JOBTYPE_STARTREBALANCE,
+    JOBTYPE_FINISHREBALANCE,
+    JOBTYPE_JLOCK,
+    JOBTYPE_REBALANCE_BLOCKS,
+    JOBTYPE_REBALANCE_FILES,
+    JOBTYPE_REBALANCE_CLEANUP,
+    JOBTYPE_DELETE_USER,
+    JOBTYPE_DELETE_VOLUME,
+    JOBTYPE_NEWKEY_USER,
+    JOBTYPE_MODIFY_VOLUME,
+    JOBTYPE_REPLACE,
+    JOBTYPE_REPLACE_BLOCKS,
+    JOBTYPE_REPLACE_FILES,
+    JOBTYPE_DUMMY,
 } jobtype_t;
 
 typedef enum {
@@ -63,15 +79,20 @@ struct _sx_hashfs_t; /* fwd */
 typedef struct {
     const yajl_callbacks *parser;
     int job_type;
-    int (*parse_complete)(void *ctx);
+    rc_ty (*parse_complete)(void *ctx);
     const char* (*get_lock)(sx_blob_t *blob);
-    int (*to_blob)(sxc_client_t *sx, void *ctx, sx_blob_t *blob);
-    rc_ty (*execute_blob)(struct _sx_hashfs_t *hashfs, sx_blob_t *blob, jobphase_t phase);
+    int (*to_blob)(sxc_client_t *sx, int nodes, void *ctx, sx_blob_t *blob);
+    rc_ty (*execute_blob)(struct _sx_hashfs_t *hashfs, sx_blob_t *blob, jobphase_t phase, int remote);
     sxi_query_t* (*proto_from_blob)(sxc_client_t *sx, sx_blob_t *blob, jobphase_t phase);
     int (*nodes)(sxc_client_t *sx, sx_blob_t *blob, sx_nodelist_t **nodes);
+    unsigned (*timeout)(sxc_client_t *sx, int nodes);
 } job_2pc_t;
 
 extern const job_2pc_t acl_spec;
+extern const job_2pc_t user_spec;
+extern const job_2pc_t userdel_spec;
+extern const job_2pc_t user_newkey_spec;
+extern const job_2pc_t volmod_spec;
 
 void job_2pc_handle_request(sxc_client_t *sx, const job_2pc_t *spec, void *yctx);
 #endif
