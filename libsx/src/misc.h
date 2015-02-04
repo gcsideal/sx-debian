@@ -22,7 +22,12 @@
 
 #include "sx.h"
 #include <sys/time.h>
-#include <openssl/x509.h>
+#include <sys/types.h>
+
+/* dest_size: size of destination buffer (sizeof() if static, or n if malloc(n))
+ * src: NULL-terminated string
+ * */
+void sxi_strlcpy(char *dest, const char *src, size_t dest_size);
 
 void *sxi_realloc(sxc_client_t *sx, void *ptr, unsigned int newlen);
 int sxi_is_valid_authtoken(sxc_client_t *sx, const char *token);
@@ -34,6 +39,8 @@ void sxi_bin2hex(const void *bin, unsigned int len, char *hex);
 int sxi_uuid_parse(const char *uuid_str, uint8_t *uuid);
 void sxi_uuid_unparse(const uint8_t *uuid, char *uuid_str);
 int sxi_hex2bin(const char *src, uint32_t src_len, uint8_t *dst, uint32_t dst_len);
+unsigned int sxi_rand(void);
+char *sxi_getenv(const char *name);
 
 typedef struct _sxi_ht_t sxi_ht;
 sxi_ht *sxi_ht_new(sxc_client_t *sx, unsigned int initial_size);
@@ -55,16 +62,39 @@ void sxi_ht_free(sxi_ht *ht);
 
 double sxi_timediff(const struct timeval *a, const struct timeval *b);
 int sxi_utf8_validate(const char *str);
-int sxi_print_certificate_info(sxc_client_t *sx, X509 *x);
-void sxi_print_old_certificate_info(sxc_client_t *sx, const char *file);
 
 char *sxi_json_quote_string(const char *s);
 int sxi_uri_is_sx(sxc_client_t *sx, const char *uri);
 
 char sxi_read_one_char(void);
-int sxi_yesno(const char *prompt, int def);
-int sxi_mkdir_hier(sxc_client_t *sx, const char *fullpath);
+int sxi_mkdir_hier(sxc_client_t *sx, const char *fullpath, mode_t mode);
 int sxi_rmdirs(const char *dir);
+
+int64_t sxi_parse_size(const char *str);
+
+/* Hold information about alias */
+typedef struct _alias_t {
+    /* Alias name */
+    char *name;
+    /* Cluster name */
+    char *cluster;
+} alias_t;
+
+/* Hold aliases list */
+typedef struct _sxc_alias_list_t {
+    /* Array of aliases */
+    alias_t *entry;
+    /* Number of aliases stored in entry array */
+    int num;
+} alias_list_t;
+
+/* Get aliases stored in configuration directory */
+alias_list_t *sxi_get_alias_list(sxc_client_t *sx);
+
+/* List all aliases stored in configuration directory */
+int sxi_load_aliases(sxc_client_t *sx, alias_list_t **list);
+/* Free memory taken for aliases list */
+void sxi_free_aliases(alias_list_t *aliases);
 
 #endif
 

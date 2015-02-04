@@ -1,24 +1,25 @@
 package "sxvol"
-args "--unamed-opts --no-handle-version --no-handle-error --file-name=cmd_create --func-name=create_cmdline_parser --arg-struct-name=create_args_info --strict-hidden"
-usage "sxvol create [OPTIONS] --owner=username sx://[profile@]cluster/NAME"
+args "--unamed-opts --no-handle-version --no-handle-error --file-name=cmd_create --func-name=create_cmdline_parser --arg-struct-name=create_args_info"
+usage "sxvol create [OPTIONS] -r N -o username sx://[profile@]cluster/volume"
 
 text "\nVolume create options:\n"
 
-option  "size" s "Set the size of the new volume (allows k,m,g,t suffixes)" string default="10G" optional
+option  "replica"   r "Set the replica count of the volume (mandatory)" int required
 
-option  "replica" r "Set the replica count of the volume (mandatory)" int required
+option  "owner"	    o "Create new volume owned by specified user (mandatory)" string required
 
-option	"filter" f "Use filter 'NAME' for the new volume" string typestr="NAME" optional
+option  "size"	    s "Set the size of the new volume (mandatory; allows K,M,G,T suffixes)" string required
 
+option	"filter"    f "Use filter 'NAME' for the new volume" string typestr="NAME" optional
+
+option  "max-revisions" - "Set the maximum number of revisions to keep for files in this volume" int default="1" optional
 
 text "\nAdditional options:\n"
 
-option  "config-dir"		c "Path to SX configuration directory"
-        string typestr="PATH" optional
+option  "debug"			D "Enable debug messages" flag off
 
-option  "owner" o "Create new volume owned by specified user (mandatory)" string required
+option  "config-dir"		c "Path to SX configuration directory"
+        string typestr="PATH" optional hidden
 
 option  "filter-dir"		- "Path to SX filter directory"
-        string typestr="PATH" optional
-
-option  "debug"		D "Enable debug messages" flag off
+        string typestr="PATH" optional hidden

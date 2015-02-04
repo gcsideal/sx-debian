@@ -2,7 +2,7 @@
 # Process this file with autoconf to produce a configure script.
 
 AC_PREREQ([2.68])
-AC_INIT([sx], [0.1], [https://bugzilla.skylable.com])
+AC_INIT([sx], [1.0], [https://bugzilla.skylable.com])
 AC_CONFIG_AUX_DIR([build-aux])
 AC_CONFIG_MACRO_DIR([m4])
 dnl for cmdline.c
@@ -21,7 +21,16 @@ AC_CONFIG_HEADERS([config.h])
 
 AC_DEFINE([_XOPEN_SOURCE], [600], [Expose C99, and POSIX.1-2001 + XSI extension])
 
-AC_DEFINE([_BSD_SOURCE], [], [OpenBSD won''t expose some POSIX.1 definitions unless this is used])
+# We need some BSD extensions (setgroups, struct winsize) that might be hidden by POSIX
+AC_DEFINE([_BSD_SOURCE], [1], [BSD extensions])
+AC_DEFINE([_DEFAULT_SOURCE], [1], [Keep glibc 2.20+ quiet])
+
+case "$host_os" in
+    solaris*)
+        # According to AC_USE_SYSTEM_EXTENSIONS this is not safe define on all platforms
+        AC_DEFINE([__EXTENSIONS__], [1], [Solaris BSD (and other) extensions])
+        ;;
+esac
 
 AC_PROG_CC_C99
 if test "$ac_cv_prog_cc_c99" = "no"; then
@@ -73,17 +82,6 @@ PKG_CHECK_MODULES([CRYPTO], [libcrypto >= 0.9], [], [
 AC_SUBST(CRYPTO_LIBS)
 AC_SUBST(CRYPTO_CFLAGS)
 LIBS=$ac_save_LIBS
-
-# Check
-PKG_CHECK_MODULES([CHECK], [check >= 0.9.4], [has_sys_check=yes],
-                  [has_sys_check=no])
-
-if test "$has_sys_check" = "no"; then
-    CHECK_LIBS=../3rdparty/check/src/libcheck.la
-    CHECK_CFLAGS="-I ../3rdparty/check/src -I ../3rdparty/check"
-fi
-AC_SUBST([CHECK_LIBS])
-AC_SUBST([CHECK_CFLAGS])
 
 # Libfcgi
 FCGI_CPPFLAGS=
@@ -168,20 +166,49 @@ fi
 AC_C_BIGENDIAN()
 
 # Checks for library functions.
-AC_CHECK_FUNCS([setproctitle memset fdatasync])
+AC_CHECK_FUNCS([setproctitle memset fdatasync setgroups])
 
-# Checks for sqlite3 flags.
-AC_CHECK_FUNCS([posix_fallocate usleep], [SQLITE3_FLAGS="$SQLITE3_FLAGS [-DHAVE_]AS_TR_CPP($ac_func)[=1]]", [buggy_build=1])
-AC_SUBST(SQLITE3_FLAGS)
+AC_ARG_WITH(system_sqlite3,AC_HELP_STRING([--with-system-sqlite3],
+            [Use system SQLite3]))
 
-AC_CONFIG_FILES([Makefile])
+if test "x$with_system_sqlite3" == "xyes"; then
+    PKG_CHECK_MODULES([SQLITE3], [sqlite3 >= 3.8.4.3], [], [
+                         AC_MSG_ERROR([System SQLite3 version not found or too old])
+                       ])
+else
+    SQLITE3_CFLAGS="-I../3rdparty/libsqlite3/"
+    SQLITE3_LIBS="../3rdparty/libsqlite3/libsqlite3.la"
+fi
+
+# sxhttpd (nginx)
+AC_ARG_ENABLE([sxhttpd],
+[  --disable-sxhttpd	  do not build sxhttpd ],
+build_sxhttpd=$enableval, build_sxhttpd="yes")
+
+
+if test "x$build_sxhttpd" = "xno"; then
+    AC_PATH_TOOL(SXHTTPD,nginx,
+                 [AC_MSG_ERROR([nginx is required when --disable-sxhttpd is used])],
+                 [/usr/sbin:/usr/local/sbin:$PATH])
+else
+    SXHTTPD="$sbindir/sxhttpd"
+fi
+
+AC_SUBST(SXHTTPD)
+
+AC_CONFIG_FILES([Makefile sxscripts/Makefile])
 AC_OUTPUT
 
 AC_MSG_NOTICE([Summary])
 echo "    crypto library: $CRYPTO_LIBS"
-MY_STATUS([check], [$has_sys_check],[$CHECK_CFLAGS], [$CHECK_LIBS])
 MY_STATUS([libfcgi], [$has_sys_fcgi],[$FCGI_CPPFLAGS], [$FCGI_LIBS])
 MY_STATUS([yajl], [$has_sys_yajl], [$YAJL_CPPFLAGS], [$YAJL_LIBS])
+
+use_sys_sqlite3="no"
+if test "x$with_system_sqlite3" = "xyes"; then
+    use_sys_sqlite3="yes"
+fi
+MY_STATUS([sqlite3],[$use_sys_sqlite3], [$SQLITE3_CFLAGS],[$SQLITE3_LIBS])
 cat <<EOF
     Compiler is GCC: $GCC
     Additional CPPFLAGS: $AM_CPPFLAGS

@@ -1,0 +1,7 @@
+etc/
+usr/bin/
+usr/sbin/
+usr/share/doc/sx/
+usr/share/man/
+var/log/sxserver
+var/lib/sxserver

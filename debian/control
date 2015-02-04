@@ -1,0 +1,57 @@
+Source: sx
+Section: web
+Priority: optional
+Maintainer: Laszlo Boszormenyi (GCS) <gcs@debian.org>
+Build-Depends: debhelper (>= 9), libssl-dev, libyajl-dev, libfcgi-dev,
+    libcurl4-openssl-dev (>= 7.34.0), libltdl-dev,
+    libsqlite3-dev (>= 3.8.4.3), pkg-config, nginx,
+    libwww-perl, libjson-xs-perl, libdigest-hmac-perl, liburi-perl
+Standards-Version: 3.9.5
+Homepage: http://www.skylable.com/products/sx
+
+Package: sx
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, nginx, openssl, logrotate
+Description: Scalable public and private cloud storage
+ Skylable Sx is a reliable, fully distributed cluster solution for your data
+ storage needs.
+ .
+ With Sx you can aggregate the disk space available on multiple servers and
+ merge it into a single storage system.
+ The cluster makes sure that your data is always replicated over multiple nodes
+ (the exact number of copies is defined by the sysadmin) and synchronized.
+ .
+ Additionally Sx has built-in support for deduplication, client-side
+ encryption, on-the-fly compression and much more.
+
+Package: libsx1
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: Scalable public and private cloud storage
+ Skylable Sx is a reliable, fully distributed cluster solution for your data 
+ storage needs.
+ .
+ With Sx you can aggregate the disk space available on multiple servers and 
+ merge it into a single storage system.
+ The cluster makes sure that your data is always replicated over multiple nodes
+ (the exact number of copies is defined by the sysadmin) and synchronized.
+ .
+ Additionally Sx has built-in support for deduplication, client-side 
+ encryption, on-the-fly compression and much more.
+
+Package: libsx-dev
+Section: libdevel
+Architecture: any
+Depends: libsx1 (= ${binary:Version}), ${misc:Depends}
+Description: Scalable public and private cloud storage
+ Skylable Sx is a reliable, fully distributed cluster solution for your data 
+ storage needs.
+ .
+ With Sx you can aggregate the disk space available on multiple servers and 
+ merge it into a single storage system.
+ The cluster makes sure that your data is always replicated over multiple nodes
+ (the exact number of copies is defined by the sysadmin) and synchronized.
+ .
+ Additionally Sx has built-in support for deduplication, client-side 
+ encryption, on-the-fly compression and much more.
+

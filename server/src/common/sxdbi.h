@@ -30,14 +30,18 @@
 
 #include "default.h"
 #include "sqlite3.h"
-
+#include <sys/time.h>
 typedef struct {
     sqlite3 *handle;
     int wal_pages;
+    int last_total_changes;
+    struct timeval tv_last;
 } sxi_db_t;
 
 sxi_db_t* qnew(sqlite3 *handle);
-void qcheckpoint(sxi_db_t *db, int kind);
+void qcheckpoint(sxi_db_t *db);
+void qcheckpoint_restart(sxi_db_t *db);
+void qcheckpoint_idle(sxi_db_t *db);
 int qprep(sxi_db_t *db, sqlite3_stmt **q, const char *query);
 int qstep(sqlite3_stmt *q);
 int qstep_expect(sqlite3_stmt *q, int expect);
@@ -56,7 +60,5 @@ void qrollback(sxi_db_t *db);
 void qclose(sxi_db_t **db);
 
 #define qnullify(Q) do { sqlite3_finalize(Q); Q = NULL; } while(0)
-
-#define SXDBI_BUSY_TIMEOUT 20
 
 #endif

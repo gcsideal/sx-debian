@@ -45,7 +45,7 @@ static void send_distribution(const sx_nodelist_t *nodes) {
 	    CGI_PUTC(',');
 	CGI_PRINTF("{\"nodeUUID\":\"%s\",\"nodeAddress\":\"%s\",", uuid, addr);
 	if(strcmp(addr, int_addr))
-	    CGI_PRINTF("\"nodeInternalAddress\":\"%s\",}", int_addr);
+	    CGI_PRINTF("\"nodeInternalAddress\":\"%s\",", int_addr);
 	CGI_PUTS("\"nodeCapacity\":");
 	CGI_PUTLL(sx_node_capacity(node));
 	CGI_PUTC('}');
@@ -80,8 +80,14 @@ void fcgi_handle_cluster_requests(void) {
     CGI_PUTS("Content-type: application/json\r\n\r\n{");
 
     if(has_arg("clusterStatus")) {
+	sx_inprogress_t status;
+	const char *progress_msg;
 
+	status = sx_hashfs_get_progress_info(hashfs, &progress_msg);
+	if(status == INPRG_ERROR)
+	    quit_errmsg(500, msg_get_reason());
 	CGI_PUTS("\"clusterStatus\":{\"distributionModels\":[");
+
 	if(!sx_storage_is_bare(hashfs)) {
 	    const sx_nodelist_t *nodes = sx_hashfs_nodelist(hashfs, NL_PREV);
 	    const sx_uuid_t *dist_uuid;
@@ -98,6 +104,26 @@ void fcgi_handle_cluster_requests(void) {
 	    dist_uuid = sx_hashfs_distinfo(hashfs, &version, &checksum);
 	    CGI_PRINTF("],\"distributionUUID\":\"%s\",\"distributionVersion\":%u,\"distributionChecksum\":", dist_uuid->string, version);
 	    CGI_PUTLL(checksum);
+
+	    if(status != INPRG_IDLE) {
+		const char *op, *complete;
+		if(status == INPRG_REBALANCE_RUNNING) {
+		    op = "rebalance";
+		    complete = "false";
+		} else if(status == INPRG_REBALANCE_COMPLETE) {
+		    op = "rebalance";
+		    complete = "true";
+		} else if(status == INPRG_REPLACE_RUNNING) {
+		    op = "replace";
+		    complete = "false";
+		} else /* if(status == INPRG_REPLACE_COMPLETE) */ {
+		    op = "replace";
+		    complete = "true";
+		}
+		CGI_PRINTF(",\"opInProgress\":{\"opType\":\"%s\",\"isComplete\":%s,\"opInfo\":", op, complete);
+		json_send_qstring(progress_msg);
+		CGI_PUTC('}');
+	    }
 	    CGI_PRINTF(",\"clusterAuth\":\"%s\"}", sx_hashfs_authtoken(hashfs));
 	} else
 	    CGI_PUTS("]}");
@@ -110,14 +136,57 @@ void fcgi_handle_cluster_requests(void) {
 	CGI_PUTS("\"volumeList\":{");
         int u = has_priv(PRIV_ADMIN) ? 0 : uid;/* uid = 0: list all volumes */
 	for(s = sx_hashfs_volume_first(hashfs, &vol, u); s == OK; s = sx_hashfs_volume_next(hashfs)) {
+            sx_priv_t priv = 0;
+
 	    if(comma)
 		CGI_PUTC(',');
 	    else
 		comma |= 1;
 
 	    json_send_qstring(vol->name);
-	    CGI_PRINTF(":{\"replicaCount\":%u,\"sizeBytes\":", vol->replica_count);
-	    CGI_PUTLL(vol->size);
+            if((s = sx_hashfs_get_access(hashfs, uid, vol->name, &priv)) != OK) {
+                CGI_PUTS("}");
+                quit_itererr("Failed to get volume privs", s);
+            }
+            if(has_priv(PRIV_ADMIN))
+                priv = PRIV_READ | PRIV_WRITE;
+
+	    CGI_PRINTF(":{\"replicaCount\":%u,\"maxRevisions\":%u,\"privs\":\"%c%c\",\"usedSize\":", vol->replica_count, vol->revisions,
+                (priv & PRIV_READ) ? 'r' : '-', (priv & PRIV_WRITE) ? 'w' : '-');
+
+	    CGI_PUTLL(vol->cursize);
+            CGI_PRINTF(",\"sizeBytes\":");
+            CGI_PUTLL(vol->size);
+
+            if(has_arg("volumeMeta")) {
+                const char *metakey;
+                const void *metavalue;
+                unsigned int metasize, comma_meta = 0;
+
+                if((s = sx_hashfs_volumemeta_begin(hashfs, vol)) != OK) {
+                    CGI_PUTS("}}");
+                    quit_itererr("Cannot lookup volume metadata", s);
+                }
+
+                CGI_PUTS(",\"volumeMeta\":{");
+                while((s = sx_hashfs_volumemeta_next(hashfs, &metakey, &metavalue, &metasize)) == OK) {
+                    char hexval[SXLIMIT_META_MAX_VALUE_LEN*2+1];
+                    if(comma_meta)
+                        CGI_PUTC(',');
+                    else
+                        comma_meta |= 1;
+                    json_send_qstring(metakey);
+                    CGI_PUTS(":\"");
+                    bin2hex(metavalue, metasize, hexval, sizeof(hexval));
+                    CGI_PUTS(hexval);
+                    CGI_PUTC('"');
+                }
+                CGI_PUTC('}');
+                if(s != ITER_NO_MORE) {
+                    CGI_PUTS("}}");
+                    quit_itererr("Failed to list volume metadata", s);
+                }
+            }
 	    CGI_PUTS("}");
 	}
 
@@ -129,7 +198,7 @@ void fcgi_handle_cluster_requests(void) {
 	comma |= 1;
     }
     if(has_arg("nodeList")) {
-	const sx_nodelist_t *nodes = sx_hashfs_nodelist(hashfs, NL_NEXT);
+	const sx_nodelist_t *nodes = sx_hashfs_nodelist(hashfs, NL_NEXTPREV);
 
 	if(comma) CGI_PUTC(',');
 	CGI_PUTS("\"nodeList\":");
@@ -140,6 +209,16 @@ void fcgi_handle_cluster_requests(void) {
         }
 	send_nodes_randomised(nodes);
 	comma |= 1;
+    }
+    if(has_arg("whoami")) {
+        char self[SXLIMIT_MAX_USERNAME_LEN+2];
+        if(comma) CGI_PUTC(',');
+        CGI_PUTS("\"whoami\":");
+        s = sx_hashfs_uid_get_name(hashfs, uid, self, sizeof(self));
+        if (s != OK)
+            quit_errmsg(rc2http(s), msg_get_reason());
+        json_send_qstring(self);
+        comma |= 1;
     }
 
     /* MOAR COMMANDS HERE */

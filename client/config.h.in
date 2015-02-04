@@ -9,6 +9,9 @@
 /* Define to 1 if you have the <inttypes.h> header file. */
 #undef HAVE_INTTYPES_H
 
+/* Define to 1 if you have the `isatty' function. */
+#undef HAVE_ISATTY
+
 /* Define to 1 if you have the <memory.h> header file. */
 #undef HAVE_MEMORY_H
 
@@ -38,6 +41,9 @@
 
 /* Define to 1 if you have the <unistd.h> header file. */
 #undef HAVE_UNISTD_H
+
+/* Defined if HMAC_Update returns int */
+#undef HMAC_UPDATE_RETURNS_INT
 
 /* Define to the sub-directory in which libtool stores uninstalled libraries.
    */
@@ -84,9 +90,6 @@
 #  undef WORDS_BIGENDIAN
 # endif
 #endif
-
-/* OpenBSD won''t expose some POSIX.1 definitions unless this is used */
-#undef _BSD_SOURCE
 
 /* Enable large inode numbers on Mac OS X 10.5.  */
 #ifndef _DARWIN_USE_64_BIT_INODE

@@ -2,24 +2,31 @@ package "sxadm"
 args "--unamed-opts --no-handle-version --no-handle-error --file-name=cmd_cluster --func-name=cluster_cmdline_parser --arg-struct-name=cluster_args_info"
 usage "
 sxadm cluster --new [options] NODE sx://[profile@]cluster
-sxadm cluster --mod [options] NODE [NODE ...] sx://[profile@]cluster"
+sxadm cluster --mod [options] NODE [NODE ...] sx://[profile@]cluster
+sxadm cluster --resize <+/->SIZE sx://[profile@]cluster
+sxadm cluster --replace-faulty [options] NODE [NODE ...] sx://[profile@]cluster"
 
 defgroup "MODE" required
-groupoption "new" N "Creates a new SX cluster with a local node" group="MODE" dependon="node-dir"
-groupoption "mod" M "Modifies an existing SX cluster" group="MODE"
+groupoption "new" N "Create a new SX cluster with a local node" group="MODE" dependon="node-dir"
+groupoption "mod" M "Modify an existing SX cluster" group="MODE"
+groupoption "resize" R "Proportionally resize an existing SX cluster" group="MODE" string typestr="<+/->SIZE"
+groupoption "replace-faulty" F "Replace faulty nodes in an existing SX cluster" group="MODE"
 groupoption "info" I "Shows status and details of a running cluster" group="MODE"
-groupoption "force-gc" G "Force a garbage collection cycle on all noeds" group="MODE"
+groupoption "force-gc" G "Force a garbage collection cycle on all nodes" group="MODE"
+groupoption "force-expire" X "Force GC and expiration of reservations on all nodes" group="MODE"
+groupoption "get-cluster-key" - "Obtain remote cluster key" group="MODE" hidden
 
 section "New cluster options"
 option "node-dir" d "Path to the node directory" string typestr="PATH" dependon="new" optional
-option "key" k "File containing a pre-generated admin authentication token or stdin if \"-\" is given (default autogenerate token)." string typestr="PATH" dependon="new" optional
+option "port" - "Set the cluster destination TCP port (default 443 in secure mode or 80 in insecure mode)" dependon="new" int optional
 option "ssl-ca-file" - "SSL CA certificate file of the SX cluster (same file as in httpd configuration)" string typestr="PATH" dependon="new" optional
+option "admin-key" k "File containing a pre-generated admin authentication token or stdin if \"-\" is given (default autogenerate token)." string typestr="PATH" dependon="new" optional hidden
 
 section "Common options"
-option "config-dir" c "Path to SX configuration directory" string typestr="PATH" optional
 option "batch-mode" b "Turn off interactive confirmations and assume yes for all questions" optional
-option "run-as"	    - "Run as specified user[:group]" string typestr="user[:group]" optional
+option "human-readable" H "Print human readable sizes" flag off
 option "debug"      D "Enable debug messages" flag off
+option "config-dir" c "Path to SX configuration directory" string typestr="PATH" optional hidden
 
 text "
 NODE definition is a string in the form <capacity>/<address>/[internal_address]/[node_uuid]

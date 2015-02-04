@@ -1,33 +1,28 @@
 ACLOCAL_AMFLAGS = -I m4 -I /usr/share/aclocal
-
+SUBDIRS = sxscripts
 AM_CPPFLAGS += -I $(top_srcdir)/../libsx/include -I $(top_srcdir)/src/common -I $(top_srcdir)/../
 SX_CPPFLAGS=-DDEFAULT_FCGI_CFGFILE=\"$(sysconfdir)/sxserver/sxfcgi.conf\"
 
-noinst_LTLIBRARIES = src/common/libcommon.la src/common/libsqlite3.la
-noinst_PROGRAMS = test/testfile test/hdist-test
+noinst_LTLIBRARIES = src/common/libcommon.la
 
-bin_PROGRAMS = src/tools/sxsim/sxsim test/randgen
+noinst_PROGRAMS = test/testfile test/hdist-test test/client-test test/randgen
+
+bin_PROGRAMS = src/tools/sxsim/sxsim
 sbin_PROGRAMS = src/fcgi/sx.fcgi src/tools/sxreport-server/sxreport-server src/tools/sxadm/sxadm
 
-src_common_libsqlite3_la_SOURCES = src/common/sqlite3.c \
-			       src/common/sqlite3.h
-
-src_common_libsqlite3_la_CPPFLAGS = $(AM_CPPFLAGS) -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_THREADSAFE=0 @SQLITE3_FLAGS@
-src_common_libsqlite3_la_LIBTOOLFLAGS = $(AM_LIBTOOLFLAGS) --tag=disable-shared
-
 src_common_libcommon_la_SOURCES = \
-		    include/default.h\
-		    include/errors.h\
-		    include/gnuc.h\
-		    include/log.h\
-		    include/types.h\
-		    include/utils.h\
-		    include/blob.h\
-		    include/nodes.h\
-		    include/hdist.h \
-		    include/hashfs.h\
-		    include/sxdbi.h\
-		    include/isaac.h\
+		    src/common/blob.h\
+		    src/common/errors.h\
+		    src/common/hashfs.h\
+		    src/common/hdist.h\
+		    src/common/isaac.h\
+		    src/common/job_common.h\
+		    src/common/log.h\
+		    src/common/nodes.h\
+		    src/common/sxdbi.h\
+		    src/common/utils.h\
+		    src/common/clstqry.h\
+		    src/common/clstqry.c\
 		    src/common/qsort.h \
 		    src/common/errors.c\
 		    src/common/log.c\
@@ -41,14 +36,14 @@ src_common_libcommon_la_SOURCES = \
 		    src/common/sxdbi.c\
 		    src/common/qsort.c \
 		    src/common/isaac.c \
-		    src/common/ver.c \
 		    src/common/sxproc.c \
 		    src/common/sxproc.h \
 		    src/common/init.c \
 		    src/common/init.h
 
-src_common_libcommon_la_LIBADD = @CRYPTO_LIBS@ @HDIST_LIBS@ src/common/libsqlite3.la $(top_builddir)/../libsx/src/libsx.la
+src_common_libcommon_la_LIBADD = @CRYPTO_LIBS@ @HDIST_LIBS@ @SQLITE3_LIBS@ $(top_builddir)/../libsx/src/libsx.la
 src_common_libcommon_la_CPPFLAGS = $(AM_CPPFLAGS) @CRYPTO_CFLAGS@ @YAJL_CPPFLAGS@
+src_common_libcommon_la_CFLAGS = $(AM_CFLAGS) @SQLITE3_CFLAGS@
 src_common_libcommon_la_LIBTOOLFLAGS = $(AM_LIBTOOLFLAGS) --tag=disable-shared
 
 src_fcgi_sx_fcgi_SOURCES = \
@@ -83,7 +78,7 @@ src_fcgi_sx_fcgi_SOURCES = \
 		    src/fcgi/cmdline.c \
 		    src/fcgi/cmdline.h
 
-src_fcgi_sx_fcgi_CFLAGS = $(AM_CFLAGS) @WNPS_CFLAG@
+src_fcgi_sx_fcgi_CFLAGS = $(AM_CFLAGS) @WNPS_CFLAG@ @SQLITE3_CFLAGS@
 src_fcgi_sx_fcgi_LDADD = src/common/libcommon.la @FCGI_LIBS@ @YAJL_LIBS@ @HDIST_LIBS@ @RESOLV_LIBS@
 src_fcgi_sx_fcgi_CPPFLAGS = $(AM_CPPFLAGS) @FCGI_CPPFLAGS@ @YAJL_CPPFLAGS@ @CRYPTO_CFLAGS@ $(SX_CPPFLAGS)
 
@@ -95,7 +90,7 @@ src_tools_sxadm_sxadm_SOURCES = \
 		    src/tools/sxadm/cmd_node.h\
 		    src/tools/sxadm/cmd_main.c\
 		    src/tools/sxadm/cmd_main.h
-src_tools_sxadm_sxadm_CFLAGS = $(AM_CFLAGS) @WNPS_CFLAG@
+src_tools_sxadm_sxadm_CFLAGS = $(AM_CFLAGS) @WNPS_CFLAG@ @SQLITE3_CFLAGS@
 src_tools_sxadm_sxadm_LDADD = src/common/libcommon.la @YAJL_LIBS@
 src_tools_sxadm_sxadm_CPPFLAGS = $(AM_CPPFLAGS) @YAJL_CPPFLAGS@
 
@@ -106,7 +101,7 @@ src_tools_sxreport_server_sxreport_server_SOURCES = \
 		    src/fcgi/cfgfile.h\
 		    src/tools/sxreport-server/cmd_main.c\
 		    src/tools/sxreport-server/cmd_main.h
-src_tools_sxreport_server_sxreport_server_CFLAGS = $(AM_CFLAGS) @WNPS_CFLAG@
+src_tools_sxreport_server_sxreport_server_CFLAGS = $(AM_CFLAGS) @WNPS_CFLAG@ @SQLITE3_CFLAGS@
 src_tools_sxreport_server_sxreport_server_LDADD = src/common/libcommon.la @YAJL_LIBS@ @FCGI_LIBS@ @HDIST_LIBS@
 src_tools_sxreport_server_sxreport_server_CPPFLAGS = $(AM_CPPFLAGS) @FCGI_CPPFLAGS@ @CRYPTO_CFLAGS@ @YAJL_CPPFLAGS@ $(SX_CPPFLAGS)\
 				       -DINFO_CPPFLAGS="\"$(AM_CPPFLAGS) $(CPPFLAGS) @FCGI_CPPFLAGS@ @CRYPTO_CFLAGS@ @YAJL_CPPFLAGS@\""\
@@ -140,32 +135,20 @@ test_hdist_test_CPPFLAGS = $(AM_CPPFLAGS) -I$(top_srcdir)/src/common
 
 test_testfile_SOURCES = test/testfile.c
 
-check_PROGRAMS = test/printerrno test/check_misc
+test_client_test_SOURCES = test/client-test.c test/rgen.h test/rgen.c test/client-test-cmdline.h test/client-test-cmdline.c
+test_client_test_LDADD = src/common/libcommon.la @HDIST_LIBS@
+test_client_test_CPPFLAGS = $(AM_CPPFLAGS) -I$(top_srcdir)/src/common
+
+check_PROGRAMS = test/printerrno
 
 check_SCRIPTS = test/runvg.sh test/run-nginx-test.sh test/fcgi-test.pl
 EXTRA_DIST = $(check_SCRIPTS)
-TESTS = test/check_misc test/hdist-test test/run-nginx-test.sh
+TESTS = test/hdist-test test/run-nginx-test.sh
 
 test_printerrno_SOURCES = test/printerrno.c
 
-noinst_LTLIBRARIES += test/libcheckmain.la
-test_libcheckmain_la_SOURCES = \
-			test/check_main.c\
-			test/check_main.h\
-			test/rgen.c\
-			test/rgen.h
-test_libcheckmain_la_CPPFLAGS = $(AM_CPPFLAGS) -DABS_BUILDDIR=\"$(abs_builddir)\"
-test_libcheckmain_la_CFLAGS = $(AM_CFLAGS) @CHECK_CFLAGS@
-
-test_check_misc_SOURCES = test/check_misc.c
-test_check_misc_LDADD = test/libcheckmain.la src/common/libcommon.la @CHECK_LIBS@
-test_check_misc_CFLAGS = $(AM_CFLAGS) @CHECK_CFLAGS@
-
 check-local:
 	if test -f test-suite.log; then ln -sf `pwd`/test-suite.log ../test-suite.log; else :; fi
-
-check-valgrind:
-	$(MAKE) check-TESTS TESTS="test/check_misc" LOG_COMPILER=test/runvg.sh CK_FORK=no TEST_SUITE_LOG=valgrind-test-suite.log
 
 CLEANFILES = valgrind-test-suite.log valgrind.log test/test-nginx.conf
 if COVERAGE

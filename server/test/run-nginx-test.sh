@@ -2,13 +2,20 @@
 set -e
 set -x
 
-# reset PATH to standard utilities, otherwise if the user changed PATH
+# update PATH to standard utilities, otherwise if the user changed PATH
 # we might miss essential utilities like chown
-PATH=`getconf PATH`
+PATH="`getconf PATH`:$PATH"
+
+# Disable proxies
+unset HTTP_PROXY
+unset http_proxy
+unset HTTPS_PROXY
+unset https_proxy
 
 prefix=`mktemp -d $PWD/sx-test-XXXXXXXX`
 cleanup () {
-    rm -rf "$prefix"
+    (cd sxscripts && make clean)
+    rm -rf $prefix
 }
 trap cleanup EXIT INT
 
@@ -19,25 +26,24 @@ mkdir $HOME
 mkdir -p "$prefix/bin" "$prefix/sbin" "$prefix/etc/sxserver"
 mkdir -p "$prefix/var/lib/sxserver" "$prefix/var/log/sxserver" "$prefix/var/run/sxserver"
 
-edit () {
-    sed \
-        -e "s|@bindir@|$prefix/bin|g" \
-        -e "s|@sbindir@|$prefix/sbin|g" \
-        -e "s|@localstatedir@|$prefix/var|g" \
-        -e "s|@sysconfdir@|$prefix/etc|g" \
-        -e "s|@prefix@|$prefix|g" \
-    "$1" >"$2"
-}
-
-edit ../3rdparty/sxhttpd/sxserver/sxhttpd.conf.default.in "$prefix/etc/sxserver/sxhttpd.conf"
-edit ../3rdparty/sxhttpd/bin/sxserver.in "$prefix/sbin/sxserver"
-chmod +x "$prefix/sbin/sxserver"
-cp ../3rdparty/sxhttpd/sxserver/fastcgi_params "$prefix/etc/sxserver/fastcgi_params"
+if [ `uname` = 'SunOS' ]; then
+  # doesn't work with GNU make <4.0 but required for non-GNU make
+  FLAG=-e
+else
+  FLAG=
+fi
+(cd sxscripts && make -s clean && make -s $FLAG prefix="$prefix" SXHTTPD="$prefix/sbin/sxhttpd" sbindir="$prefix/sbin" bindir="$prefix/bin" sysconfdir="$prefix/etc" localstatedir="$prefix/var" install)
+(cd sxscripts && make -s clean && make -s)
 
 ln -s `pwd`/../client/src/tools/init/sxinit "$prefix/bin/sxinit"
 ln -s `pwd`/src/tools/sxadm/sxadm "$prefix/sbin/sxadm"
 ln -s `pwd`/src/fcgi/sx.fcgi "$prefix/sbin/sx.fcgi"
-ln -s `pwd`/../3rdparty/nginx/objs/nginx "$prefix/sbin/sxhttpd"
+
+built_nginx=`pwd`/../3rdparty/nginx/objs/nginx
+rm -f "$prefix/sbin/sxhttpd"
+test -x "$built_nginx" && ln -s "$built_nginx" "$prefix/sbin/sxhttpd"
+
+cp "$prefix/etc/sxserver/sxhttpd.conf.default" "$prefix/etc/sxserver/sxhttpd.conf"
 
 SXRUNDIR="$prefix/var/run/sxserver"
 SXSTOREDIR="$prefix/var/lib/sxserver"
@@ -50,17 +56,20 @@ socket-mode=0660
 data-dir="$SXSTOREDIR/data"
 children=2
 EOF
+if [ "x$VERBOSE" = "x1" ]; then
+    echo debug >>"$prefix/etc/sxserver/sxfcgi.conf"
+fi
 
 cat >"$prefix/etc/sxserver/sxsetup.conf" <<EOF
 SX_NO_ROOT=1
 SX_RUN_DIR="$SXRUNDIR"
 EOF
 
-sed -e "s|listen .*443|listen 127.0.0.1:8443|g" -e "s|listen .*80|listen 127.0.0.1:8013|g" $prefix/etc/sxserver/sxhttpd.conf >$prefix/etc/sxserver/sxhttpd.conf.1
+sed -e "s|^user.*|user `whoami`;|" -e "s|listen .*443|listen 127.0.0.1:8443|g" -e "s|listen .*80|listen 127.0.0.1:8013|g" $prefix/etc/sxserver/sxhttpd.conf >$prefix/etc/sxserver/sxhttpd.conf.1
 mv "$prefix/etc/sxserver/sxhttpd.conf.1" "$prefix/etc/sxserver/sxhttpd.conf"
 
 "$prefix/sbin/sxadm" node --new --batch-mode "$SXSTOREDIR/data"
-"$prefix/sbin/sxadm" cluster --new --batch-mode --node-dir="$SXSTOREDIR/data" "100M/127.0.0.1" "sx://localhost"
+"$prefix/sbin/sxadm" cluster --new --batch-mode --node-dir="$SXSTOREDIR/data" "6G/127.0.0.1" "sx://localhost"
 
 # TODO: sxadm should be more easily scriptable
 "$prefix/sbin/sxadm" node --info "$SXSTOREDIR/data" | grep 'Admin key: ' | cut -d\  -f3 >"$SXSTOREDIR/data/admin.key"
@@ -70,10 +79,18 @@ cleanup () {
     "$prefix/sbin/sxserver" stop
     rm -rf $prefix
 }
-"$prefix/sbin/sx.fcgi" --config-file "$prefix/etc/sxserver/sxfcgi.conf"
-"$prefix/sbin/sxhttpd" -c "$prefix/etc/sxserver/sxhttpd.conf"
+export SX_FCGI_OPTS="--config-file=$prefix/etc/sxserver/sxfcgi.conf"
+"$prefix/sbin/sxserver" start
 
 trap cleanup EXIT INT
+
+"$prefix/bin/sxinit" --batch-mode --port=8013 --no-ssl --auth-file="$SXSTOREDIR/data/admin.key" --config-dir="$prefix/.sx" sx://localhost
+`dirname $0`/client-test --config-dir="$prefix/.sx" --filter-dir="`pwd`/../client/src/filters" sx://localhost || {
+    cat "$SXLOGFILE";
+    cat $prefix/var/log/sxserver/sxhttpd-error.log;
+    exit 1
+}
+
 perl `dirname $0`/fcgi-test.pl 127.0.0.1:8013 $SXSTOREDIR/data || {
     rc=$?
     cat "$SXLOGFILE";

@@ -79,6 +79,9 @@
 /* Define to 1 if you have the <memory.h> header file. */
 #undef HAVE_MEMORY_H
 
+/* Define to 1 if you have the 'nftw' function */
+#undef HAVE_NFTW
+
 /* Define to 1 if you have the `opendir' function. */
 #undef HAVE_OPENDIR
 
@@ -87,6 +90,9 @@
 
 /* Define to 1 if you have the `readdir' function. */
 #undef HAVE_READDIR
+
+/* Define to 1 if you have the `secure_getenv' function. */
+#undef HAVE_SECURE_GETENV
 
 /* Define if you have the shl_load function. */
 #undef HAVE_SHL_LOAD
@@ -263,9 +269,6 @@
 #  undef WORDS_BIGENDIAN
 # endif
 #endif
-
-/* OpenBSD won''t expose some POSIX.1 definitions unless this is used */
-#undef _BSD_SOURCE
 
 /* Enable large inode numbers on Mac OS X 10.5.  */
 #ifndef _DARWIN_USE_64_BIT_INODE

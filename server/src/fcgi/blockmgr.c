@@ -78,7 +78,9 @@ struct blockmgr_data_t {
 
 static void blockmgr_del_xfer(struct blockmgr_data_t *q, int64_t xfer_id) {
     sqlite3_reset(q->qdel);
-    if(qbind_int64(q->qdel, ":id", xfer_id) ||
+    if(sx_hashfs_blkrb_release(q->hashfs, xfer_id) != OK)
+	WARN("Failed to release block %lld", (long long)xfer_id);
+    else if(qbind_int64(q->qdel, ":id", xfer_id) ||
        qstep_noret(q->qdel))
 	WARN("Failed to delete transfer %lld", (long long)xfer_id);
     sqlite3_reset(q->qdel);
@@ -96,6 +98,7 @@ static uint8_t upbuffer[UPLOAD_CHUNK_SIZE];
 void blockmgr_process_queue(struct blockmgr_data_t *q) {
     sxc_client_t *sx = sx_hashfs_client(q->hashfs);
     sxi_conns_t *clust = sx_hashfs_conns(q->hashfs);
+    const sx_node_t *me = sx_hashfs_self(q->hashfs);
     sxi_hostlist_t uploadto;
 
     sxi_hostlist_init(&uploadto);
@@ -128,7 +131,7 @@ void blockmgr_process_queue(struct blockmgr_data_t *q) {
 	bs = sqlite3_column_int(q->qlist, 2);
         n = sqlite3_column_blob(q->qlist, 3);
 	nlen = sqlite3_column_bytes(q->qlist, 3);
-	if(!h || hlen != HASH_BIN_LEN || /* Bad hash */
+	if(!h || hlen != SXI_SHA1_BIN_LEN || /* Bad hash */
 	   !n || nlen != sizeof(node_uuid.binary) || /* Bad node */
 	   sx_hashfs_check_blocksize(bs)) { /* Bad blocksize */
 	    WARN("Removing bad transfer");
@@ -146,7 +149,7 @@ void blockmgr_process_queue(struct blockmgr_data_t *q) {
 	    continue;
 	}
 
-	if(!sx_node_cmp(node, sx_hashfs_self(q->hashfs))) {
+	if(!sx_node_cmp(node, me)) {
 	    WARN("Removing transfer to self");
 	    sqlite3_reset(q->qlist);
 	    blockmgr_del_xfer(q, xfer_id);
@@ -167,14 +170,14 @@ void blockmgr_process_queue(struct blockmgr_data_t *q) {
         }
         /* just check for presence, reservation was already done by the failed
          * INUSE */
-	sxi_hashop_begin(&hc, clust, hcb, HASHOP_CHECK, NULL, &hlist);
+	sxi_hashop_begin(&hc, clust, hcb, HASHOP_CHECK, 0, NULL, NULL, &hlist, 0);
         for(hlist.nblocks = 0; r == SQLITE_ROW; hlist.nblocks++) {
 	    /* Some preliminary extra checks; broken entries will be wiped on the next (outer) loop */
 	    h = sqlite3_column_blob(q->qlist, 1);
 	    hlen = sqlite3_column_bytes(q->qlist, 1);
 	    n = sqlite3_column_blob(q->qlist, 3);
 	    nlen = sqlite3_column_bytes(q->qlist, 3);
-	    if(!h || hlen != HASH_BIN_LEN) {
+	    if(!h || hlen != SXI_SHA1_BIN_LEN) {
                 WARN("Bad hash");
 		break;
             }
@@ -192,7 +195,7 @@ void blockmgr_process_queue(struct blockmgr_data_t *q) {
             }
 
 	    hlist.ids[hlist.nblocks] = sqlite3_column_int64(q->qlist, 0);
-            memcpy(&hlist.binhs[hlist.nblocks], h, HASH_BIN_LEN);
+            memcpy(&hlist.binhs[hlist.nblocks], h, SXI_SHA1_BIN_LEN);
             if(sxi_hashop_batch_add(&hc, host, hlist.nblocks, h, bs) != 0) {
                 WARN("Cannot verify block presence: %s", sxc_geterrmsg(sx));
                 blockmgr_reschedule_xfer(q, hlist.ids[hlist.nblocks]);
@@ -208,10 +211,8 @@ void blockmgr_process_queue(struct blockmgr_data_t *q) {
 
 	sqlite3_reset(q->qlist);
 
-	INFO("Checking on %s", node_uuid.string);
-
 	if(sxi_hashop_end(&hc) == -1) {
-	    WARN("Cannot verify block presence: %s", sxc_geterrmsg(sx));
+	    WARN("Cannot verify block presence on node %s: %s", node_uuid.string, sxc_geterrmsg(sx));
 	    for(j=0; j<hlist.nblocks; j++)
 		blockmgr_reschedule_xfer(q, hlist.ids[j]);
 	    continue;
@@ -222,7 +223,7 @@ void blockmgr_process_queue(struct blockmgr_data_t *q) {
 	    const uint8_t *b;
 	    if(hlist.havehs[i]) {
                 /* TODO: print actual hash */
-		INFO("Block %d was found remotely", i);
+		DEBUG("Block %d was found remotely", i);
 		blockmgr_del_xfer(q, hlist.ids[i]);
 	    } else if(sx_hashfs_block_get(q->hashfs, bs, &hlist.binhs[i], &b)) {
 		INFO("Block %ld was not found locally", hlist.ids[i]);
@@ -233,7 +234,6 @@ void blockmgr_process_queue(struct blockmgr_data_t *q) {
 	    }
 	    if(sizeof(upbuffer) - (curb - upbuffer) < bs || i == hlist.nblocks - 1) {
 		/* upload chunk */
-                /* FIXME: proper token..... */
 		if(sxi_upload_block_from_buf(clust, &uploadto, token, upbuffer, bs, curb-upbuffer)) {
 		    WARN("Block transfer failed");
 		    for(j=0; j<=i; j++)
@@ -243,9 +243,12 @@ void blockmgr_process_queue(struct blockmgr_data_t *q) {
 		}
 		curb = upbuffer;
 		for(j=0; j<=i; j++) {
+                    char debughash[sizeof(sx_hash_t)*2+1];
+                    const sx_hash_t *hash = &hlist.binhs[j];
 		    if(hlist.havehs[j])
 			continue;
-		    INFO("Block %ld was transferred successfuly", hlist.ids[j]);
+                    bin2hex(hash->b, sizeof(hash->b), debughash, sizeof(debughash));
+		    DEBUG("Block %ld #%s# was transferred successfuly", hlist.ids[j], debughash);
 		    blockmgr_del_xfer(q, hlist.ids[j]);
 		    hlist.havehs[j] = 1;
 		    trigger_jobmgr = 1;
@@ -255,11 +258,11 @@ void blockmgr_process_queue(struct blockmgr_data_t *q) {
 
 	if(trigger_jobmgr)
 	    sx_hashfs_job_trigger(q->hashfs);
+        sx_hashfs_checkpoint_passive(q->hashfs);
     }
     sxi_hostlist_empty(&uploadto);
     sqlite3_reset(q->qlist); /* Better safe than deadlocked */
 }
-
 
 int blockmgr(sxc_client_t *sx, const char *self, const char *dir, int pipe) {
     struct blockmgr_data_t q;
@@ -286,12 +289,10 @@ int blockmgr(sxc_client_t *sx, const char *self, const char *dir, int pipe) {
 	CRIT("Failed to initialize the hash server interface");
 	goto blockmgr_err;
     }
-    if (sx_hashfs_gc_open(q.hashfs))
-        goto blockmgr_err;
 
     xferdb = sx_hashfs_xferdb(q.hashfs);
 
-    if(qprep(xferdb, &q.qprune, "DELETE FROM topush WHERE sched_time > expiry_time"))
+    if(qprep(xferdb, &q.qprune, "DELETE FROM topush WHERE id IN (SELECT id FROM topush LEFT JOIN onhold ON block = hblock AND size = hsize AND node = hnode WHERE hid IS NULL) AND sched_time > expiry_time")) /* If you touch this query, please double check index usage! */
 	goto blockmgr_err;
     if(qprep(xferdb, &q.qlist, "SELECT a.id, a.block, a.size, a.node FROM topush AS a LEFT JOIN (SELECT size, node FROM topush ORDER BY sched_time ASC LIMIT 1) AS b ON a.node = b.node AND a.size = b.size WHERE b.node IS NOT NULL AND b.size IS NOT NULL AND sched_time <= strftime('%Y-%m-%d %H:%M:%f') ORDER BY sched_time ASC LIMIT "STRIFY(DOWNLOAD_MAX_BLOCKS)))
 	goto blockmgr_err;
@@ -302,7 +303,7 @@ int blockmgr(sxc_client_t *sx, const char *self, const char *dir, int pipe) {
 
     while(!terminate) {
 	int dc;
-        if (wait_trigger(pipe, BLOCKMGR_DELAY, NULL))
+        if (wait_trigger(pipe, blockmgr_delay, NULL))
             break;
 
 	DEBUG("Start processing block queue");
@@ -316,12 +317,12 @@ int blockmgr(sxc_client_t *sx, const char *self, const char *dir, int pipe) {
 	    INFO("Distribution reloaded");
 	}
 
-	/* FIXME: logging pruned xfers might help debugging but it's an overkill
-	 * so we just quietly delete everything */
 	qstep_noret(q.qprune);
 	blockmgr_process_queue(&q);
 	DEBUG("Done processing block queue");
-        sx_hashfs_checkpoint(q.hashfs);
+        sx_hashfs_checkpoint_xferdb(q.hashfs);
+        sx_hashfs_checkpoint_gc(q.hashfs);
+        sx_hashfs_checkpoint_passive(q.hashfs);
     }
 
  blockmgr_err:

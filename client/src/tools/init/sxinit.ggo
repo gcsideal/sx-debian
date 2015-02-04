@@ -1,21 +1,26 @@
 package "sxinit"
-purpose "Manage local configuration of SX"
-args "--unamed-opts=sx://[profile@]cluster --no-handle-version --no-handle-error --strict-hidden"
-usage "sxinit [OPTIONS]... sx://[profile@]cluster"
+purpose "Manage local configuration of SX clusters"
+args "--unamed-opts=sx://[profile@]cluster --no-handle-version --no-handle-error"
+usage "sxinit [OPTIONS]... { sx://[profile@]cluster | --list }"
 
-option  "config-dir"		c "Path to SX configuration directory"
-        string typestr="PATH" optional
+option	"list"		    L "List configured profiles and aliases" optional
 
-option  "host-list"		l "List of SX hosts (IP addresses)"
-        string typestr="IP_1,IP_2,IP_3,... " optional
+option  "delete"            - "Delete a profile" optional
 
-option  "no-ssl"	- "Disable secure communication" flag off
+option  "no-ssl"	    - "Disable secure communication" flag off
 
-option  "debug"		D "Enable debug messages" flag off
+option  "auth-file"	    a "File containing user key (instead of stdin)" string optional
 
-option "batch-mode" b "Turn off interactive confirmations and assume yes for all questions" flag off
+option  "port"		    - "Set the cluster destination TCP port (default 443 in secure mode and 80 in insecure mode)" int optional
 
-option  "auth-file" a "File containing user key (instead of stdin)" string optional
+option  "host-list"	    l "List of SX hosts (IP addresses)" string typestr="IP_1,IP_2,IP_3,... " optional
 
-option  "force-reinit"	- "Remove old cluster configuration and init from scratch" flag off
+option	"alias"		    A "Alias that will be used instead of full sx://[profile@]cluster/" string optional 
 
+option  "batch-mode"	    b "Turn off interactive confirmations and assume yes for all questions" flag off
+
+option  "force-reinit"	    - "Remove old cluster configuration and init from scratch" flag off
+
+option  "debug"		    D "Enable debug messages" flag off
+
+option  "config-dir"	    c "Path to SX configuration directory" string typestr="PATH" optional hidden

@@ -1,0 +1,99 @@
+From: =?utf-8?q?T=C3=B6r=C3=B6k_Edwin?= <edwin@skylable.com>
+Date: Wed, 31 Dec 2014 11:40:24 +0200
+Subject: fix manpage-has-bad-whatis-entry
+
+https://lintian.debian.org/tags/manpage-has-bad-whatis-entry.html
+---
+ client/man/sxrev-copy.1.in   | 2 +-
+ client/man/sxrev-delete.1.in | 2 +-
+ client/man/sxrev-list.1.in   | 2 +-
+ client/man/sxvol-create.1.in | 2 +-
+ client/man/sxvol-filter.1.in | 2 +-
+ client/man/sxvol-modify.1.in | 2 +-
+ client/man/sxvol-remove.1.in | 2 +-
+ 7 files changed, 7 insertions(+), 7 deletions(-)
+
+diff --git a/client/man/sxrev-copy.1.in b/client/man/sxrev-copy.1.in
+index 1a21608..cad7c5e 100644
+--- a/client/man/sxrev-copy.1.in
++++ b/client/man/sxrev-copy.1.in
+@@ -1,6 +1,6 @@
+ .TH SXREV-COPY "1" "September 2014" "sxrev @VERSION@" "Skylable SX Manual"
+ .SH NAME
+-sxrev copy \- copy a specific revision of a file
++sxrev-copy \- copy a specific revision of a file
+ .SH SYNOPSIS
+ .B sxrev copy
+ [\fI\,OPTIONS\/\fR] \fI\,sx://\/\fR[\fI\,profile@\/\fR]\fI\,cluster/volume/path DEST\/\fR
+diff --git a/client/man/sxrev-delete.1.in b/client/man/sxrev-delete.1.in
+index 062a7f2..a195868 100644
+--- a/client/man/sxrev-delete.1.in
++++ b/client/man/sxrev-delete.1.in
+@@ -1,6 +1,6 @@
+ .TH SXREV-DELETE "1" "September 2014" "sxrev @VERSION@" "Skylable SX Manual"
+ .SH NAME
+-sxrev delete \- delete a revision
++sxrev-delete \- delete a revision
+ .SH SYNOPSIS
+ .B sxrev delete
+ [\fI\,OPTIONS\/\fR] \fI sx://\/\fR[\fI\,profile@\/\fR]\fI\,cluster/volume/path\/\fR
+diff --git a/client/man/sxrev-list.1.in b/client/man/sxrev-list.1.in
+index 9bd7506..5d1b8cc 100644
+--- a/client/man/sxrev-list.1.in
++++ b/client/man/sxrev-list.1.in
+@@ -1,6 +1,6 @@
+ .TH SXREV-LIST "1" "September 2014" "sxrev @VERSION@" "Skylable SX Manual"
+ .SH NAME
+-sxrev list \- list revisions
++sxrev-list \- list revisions
+ .SH SYNOPSIS
+ .B sxrev list
+ \fIsx://\/\fR[\fI\,profile@\/\fR]\fI\,cluster/volume/path\/\fR
+diff --git a/client/man/sxvol-create.1.in b/client/man/sxvol-create.1.in
+index b35b7e1..c1812d4 100644
+--- a/client/man/sxvol-create.1.in
++++ b/client/man/sxvol-create.1.in
+@@ -1,6 +1,6 @@
+ .TH SXVOL-CREATE "1" "September 2014" "sxvol @VERSION@" "Skylable SX Manual"
+ .SH NAME
+-sxvol create \- create volumes on SX clusters
++sxvol-create \- create volumes on SX clusters
+ .SH SYNOPSIS
+ .B sxvol create
+ \fR[\fI\,OPTIONS\/\fR] \fI\,-r N -s SIZE -o username sx://\/\fR[\fI\,profile@\/\fR]\fI\,cluster/volume\/\fR
+diff --git a/client/man/sxvol-filter.1.in b/client/man/sxvol-filter.1.in
+index 176bb39..f5e0b26 100644
+--- a/client/man/sxvol-filter.1.in
++++ b/client/man/sxvol-filter.1.in
+@@ -1,6 +1,6 @@
+ .TH SXVOL-FILTER "1" "September 2014" "sxvol @VERSION@" "Skylable SX Manual"
+ .SH NAME
+-sxvol filter \- display information about filters
++sxvol-filter \- display information about filters
+ .SH SYNOPSIS
+ .B sxvol
+ \fI\,filter <OPTIONS>\/\fR...
+diff --git a/client/man/sxvol-modify.1.in b/client/man/sxvol-modify.1.in
+index 1972bc0..bc758c0 100644
+--- a/client/man/sxvol-modify.1.in
++++ b/client/man/sxvol-modify.1.in
+@@ -1,6 +1,6 @@
+ .TH SXVOL-MODIFY "1" "November 2014" "sxvol @VERSION@" "Skylable SX Manual"
+ .SH NAME
+-sxvol modify \- modify existing volumes
++sxvol-modify \- modify existing volumes
+ .SH SYNOPSIS
+ .B sxvol modify
+ \fR<\fI\,OPTIONS\/\fR> \fI\,sx://\/\fR[\fI\,profile@\/\fR]\fI\,cluster/volume\/\fR
+diff --git a/client/man/sxvol-remove.1.in b/client/man/sxvol-remove.1.in
+index e19823c..775aa71 100644
+--- a/client/man/sxvol-remove.1.in
++++ b/client/man/sxvol-remove.1.in
+@@ -1,6 +1,6 @@
+ .TH SXVOL-REMOVE "1" "September 2014" "sxvol @VERSION@" "Skylable SX Manual"
+ .SH NAME
+-sxvol remove \- remove volumes from SX clusters
++sxvol-remove \- remove volumes from SX clusters
+ .SH SYNOPSIS
+ .B sxvol remove
+ [\fI\,OPTIONS\/\fR] \fI\,sx://\/\fR[\fI\,profile@\/\fR]\fI\,cluster/volume\/\fR
