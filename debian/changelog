@@ -1,5 +1,5 @@
-sx (1.0+debian-1) UNRELEASED; urgency=low
+sx (1.0+ds-1) unstable; urgency=low
 
-  * Initial release (closes: #XXXXXX).
+  * Initial upload (closes: #776850).
 
- -- Laszlo Boszormenyi (GCS) <gcs@debian.org>  Fri, 11 Apr 2014 10:18:50 +0000
+ -- Laszlo Boszormenyi (GCS) <gcs@debian.org>  Sun, 08 Feb 2015 07:35:32 +0000
