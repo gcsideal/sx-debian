@@ -11,7 +11,7 @@ Homepage: http://www.skylable.com/products/sx
 
 Package: sx
 Architecture: any
-Depends: ${shlibs:Depends}, ${misc:Depends}, nginx, openssl, logrotate
+Depends: ${shlibs:Depends}, ${misc:Depends}, nginx, openssl, logrotate, python, ca-certificates
 Description: Scalable public and private cloud storage
  Skylable Sx is a reliable, fully distributed cluster solution for your data
  storage needs.
@@ -24,7 +24,7 @@ Description: Scalable public and private cloud storage
  Additionally Sx has built-in support for deduplication, client-side
  encryption, on-the-fly compression and much more.
 
-Package: libsx1
+Package: libsx2
 Architecture: any
 Depends: ${shlibs:Depends}, ${misc:Depends}
 Description: Scalable public and private cloud storage
@@ -42,7 +42,7 @@ Description: Scalable public and private cloud storage
 Package: libsx-dev
 Section: libdevel
 Architecture: any
-Depends: libsx1 (= ${binary:Version}), ${misc:Depends}
+Depends: libsx2 (= ${binary:Version}), ${misc:Depends}
 Description: Scalable public and private cloud storage
  Skylable Sx is a reliable, fully distributed cluster solution for your data 
  storage needs.
