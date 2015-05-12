@@ -36,6 +36,8 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <termios.h>
+#include <sys/mman.h>
 
 #include "sx.h"
 #include "cmd_main.h"
@@ -47,6 +49,7 @@
 #include "cmd_volperm.h"
 #include "cmd_volshow.h"
 #include "cmd_whoami.h"
+#include "cmd_userclone.h"
 #include "libsx/src/misc.h"
 #include "libsx/src/clustcfg.h"
 #include "version.h"
@@ -56,8 +59,14 @@ static sxc_client_t *gsx = NULL;
 
 static void sighandler(int signal)
 {
+    struct termios tcur;
     if(gsx)
 	sxc_shutdown(gsx, signal);
+    /* work around for ctrl+c during pass2token() in sxc_user_add() or sxc_user_newkey() */
+    tcgetattr(0, &tcur);
+    tcur.c_lflag |= ECHO;
+    tcsetattr(0, TCSANOW, &tcur);
+
     fprintf(stderr, "Process interrupted\n");
     exit(1);
 }
@@ -92,15 +101,51 @@ sxc_cluster_t *load_config(sxc_client_t *sx, const char *uri, sxc_uri_t **sxuri)
     return cluster;
 }
 
-static int add_user(sxc_client_t *sx, sxc_cluster_t *cluster, sxc_uri_t *u, const char *username,  enum enum_role type, const char *authfile, int batch_mode, const char *oldtoken) {
+static int add_user(sxc_client_t *sx, sxc_cluster_t *cluster, sxc_uri_t *u, const char *username, const char* pass_file, enum enum_role type, const char *authfile, int batch_mode, const char *oldtoken, const char *existing, const char *desc, int generate_key) {
     char *key;
+    int created_role = (type == role_arg_admin ? 1 : 0);
+    char pass[1024];
 
     if(u->volume) {
 	fprintf(stderr, "ERROR: Bad URI: Please omit volume\n");
 	return 1;
     }
 
-    key = sxc_user_add(cluster, username, type == role_arg_admin, oldtoken);
+    if(pass_file && strcmp(pass_file, "-")) {
+        if(oldtoken) {
+            fprintf(stderr, "ERROR: Can't use pass file and old key\n");
+            return 1;
+        } else if(existing) {
+            fprintf(stderr, "ERROR: Can't use pass file to clone users\n");
+            return 1;
+        }
+
+        mlock(pass, sizeof(pass));
+        if(sxc_read_pass_file(sx, pass_file, pass, sizeof(pass))) {
+            fprintf(stderr, "ERROR: %s\n", sxc_geterrmsg(sx));
+            munlock(pass, sizeof(pass));
+            return 1;
+        }
+    }
+
+    if(batch_mode && !oldtoken && !pass_file)
+        generate_key = 1;
+    if(existing) /* Cloning user */
+        key = sxc_user_clone(cluster, existing, username, oldtoken, &created_role, desc);
+    else {
+	if(!generate_key && !pass_file && !batch_mode) {
+	    printf("Enter password for user '%s'\n", username);
+	    fflush(stdout);
+	}
+	/* Creating new user */
+        key = sxc_user_add(cluster, username, pass_file ? pass : NULL, type == role_arg_admin, oldtoken, desc, generate_key);
+    }
+
+    if(pass_file && strcmp(pass_file, "-")) {
+        memset(pass, 0, sizeof(pass));
+        munlock(pass, sizeof(pass));
+    }
+
     if(!key) {
         fprintf(stderr, "ERROR: Can't create user %s: %s\n", username, sxc_geterrmsg(sx));
 	return 1;
@@ -109,11 +154,23 @@ static int add_user(sxc_client_t *sx, sxc_cluster_t *cluster, sxc_uri_t *u, cons
     if(batch_mode) {
 	printf("%s\n", key);
     } else {
+        char *conflink;
+
+        conflink = sxc_cluster_configuration_link(cluster, username, key);
+        if(!conflink) {
+            fprintf(stderr, "ERROR: %s\n", sxc_geterrmsg(sx));
+            free(key);
+            return 1;
+        }
 	printf("User successfully created!\n");
 	printf("Name: %s\n", username);
 	printf("Key : %s\n", key);
-	printf("Type: %s\n\n", type == role_arg_admin ? "admin" : "normal");
-	printf("Run 'sxinit sx://%s@%s' to start using the cluster as user '%s'.\n", username, u->host, username);
+        printf("Type: %s\n", created_role ? "admin" : "normal");
+        printf("Configuration link: %s", conflink);
+	if(existing)
+            printf("\nDescription: %s (clone of user '%s')", desc, existing);
+	printf("\n\nRun 'sxinit sx://%s@%s' or 'sxinit --config-link <link>' to start using the cluster as user '%s'.\n", username, u->host, username);
+        free(conflink);
     }
 
     if (authfile) {
@@ -141,15 +198,42 @@ static int add_user(sxc_client_t *sx, sxc_cluster_t *cluster, sxc_uri_t *u, cons
     return 0;
 }
 
-static int newkey_user(sxc_client_t *sx, sxc_cluster_t *cluster, sxc_uri_t *u, const char *username,  const char *authfile, int batch_mode, const char *oldtoken) {
+static int newkey_user(sxc_client_t *sx, sxc_cluster_t *cluster, sxc_uri_t *u, const char *username, const char* pass_file, const char *authfile, int batch_mode, const char *oldtoken, int generate_key) {
     char *key;
+    char pass[1024];
 
     if(u->volume) {
 	fprintf(stderr, "ERROR: Bad URI: Please omit volume\n");
 	return 1;
     }
 
-    key = sxc_user_newkey(cluster, username, oldtoken);
+    if(pass_file) {
+        if(oldtoken) {
+            fprintf(stderr, "ERROR: Can't use pass file and old key\n");
+            return 1;
+        }
+
+        mlock(pass, sizeof(pass));
+        if(sxc_read_pass_file(sx, pass_file, pass, sizeof(pass))) {
+            fprintf(stderr, "ERROR: %s\n", sxc_geterrmsg(sx));
+            munlock(pass, sizeof(pass));
+            return 1;
+        }
+    }
+
+    if(batch_mode && !oldtoken && !pass_file)
+        generate_key = 1;
+
+    if(!generate_key && !pass_file && !batch_mode) {
+	printf("Enter new password for user '%s'\n", username);
+	fflush(stdout);
+    }
+
+    key = sxc_user_newkey(cluster, username, pass_file ? pass : NULL, oldtoken, generate_key);
+    if(pass_file) {
+        memset(pass, 0, sizeof(pass));
+        munlock(pass, sizeof(pass));
+    }
     if(!key) {
         fprintf(stderr, "ERROR: Can't change the key for %s: %s\n", username, sxc_geterrmsg(sx));
 	return 1;
@@ -157,10 +241,20 @@ static int newkey_user(sxc_client_t *sx, sxc_cluster_t *cluster, sxc_uri_t *u, c
     if(batch_mode) {
 	printf("%s\n", key);
     } else {
+        char *conflink;
+
+        conflink = sxc_cluster_configuration_link(cluster, username, key);
+        if(!conflink) {
+            fprintf(stderr, "ERROR: %s\n", sxc_geterrmsg(sx));
+            free(key);
+            return 1;
+        }
 	printf("Key successfully changed!\n");
 	printf("Name   : %s\n", username);
 	printf("New key: %s\n", key);
-	printf("Run 'sxinit sx://%s@%s' and provide the new key for user '%s'.\n", username, u->host, username);
+        printf("Configuration link: %s\n", conflink);
+	printf("\nRun 'sxinit sx://%s@%s' and provide the new key or run 'sxinit --config-link <link>' to reconfigure automatically with the new key for user '%s'.\n", username, u->host, username);
+        free(conflink);
     }
 
     if (authfile) {
@@ -188,7 +282,7 @@ static int newkey_user(sxc_client_t *sx, sxc_cluster_t *cluster, sxc_uri_t *u, c
     return 0;
 }
 
-static int getkey_user(sxc_client_t *sx, sxc_cluster_t *cluster, sxc_uri_t *u, const char *username, const char *authfile)
+static int getkey_user(sxc_client_t *sx, sxc_cluster_t *cluster, sxc_uri_t *u, const char *username, const char *authfile, int get_config_link)
 {
     int rc = 0;
     FILE *f = stdout;
@@ -205,7 +299,7 @@ static int getkey_user(sxc_client_t *sx, sxc_cluster_t *cluster, sxc_uri_t *u, c
             return 1;
         }
     }
-    rc = sxc_user_getkey(cluster, username, f);
+    rc = sxc_user_getinfo(cluster, username, f, NULL, get_config_link);
     if (authfile && fclose(f)) {
         fprintf(stderr, "ERROR: Can't close file %s: %s\n", authfile, strerror(errno));
 	return 1;
@@ -216,20 +310,25 @@ static int getkey_user(sxc_client_t *sx, sxc_cluster_t *cluster, sxc_uri_t *u, c
     return rc;
 }
 
-static int list_users(sxc_client_t *sx, sxc_cluster_t *cluster, sxc_uri_t *u)
+static int list_users(sxc_client_t *sx, sxc_cluster_t *cluster, sxc_uri_t *u, const char *list_clones, int verbose)
 {
     int rc = 0, lstrc = 0;
     sxc_cluster_lu_t *lst;
-    char *user = NULL;
+    char *user = NULL, *desc = NULL;
     int is_admin;
 
     if(u->volume) {
 	fprintf(stderr, "ERROR: Bad URI: Please omit volume.\n");
 	return 1;
     }
-    for (lst = sxc_cluster_listusers(cluster); lst && (lstrc = sxc_cluster_listusers_next(lst, &user, &is_admin)) > 0;) {
-        printf("%s (%s)\n", user, is_admin ? "admin" : "normal");
+    for (lst = (list_clones ? sxc_cluster_listclones(cluster, list_clones) : sxc_cluster_listusers(cluster)); lst && (lstrc = sxc_cluster_listusers_next(lst, &user, &is_admin, &desc)) > 0;) {
+        const char *is_adm = is_admin ? "admin" : "normal";
+        if (verbose)
+            printf("%-24s (%6s) - %s\n", user, is_adm, desc);
+        else
+            printf("%s (%s)\n", user, is_adm);
         free(user);
+        free(desc);
     }
     sxc_cluster_listusers_free(lst);
     if (!lst || lstrc == -1) {
@@ -239,21 +338,26 @@ static int list_users(sxc_client_t *sx, sxc_cluster_t *cluster, sxc_uri_t *u)
     return rc;
 }
 
-static int whoami(sxc_client_t *sx, sxc_cluster_t *cluster, sxc_uri_t *u)
+static int whoami(sxc_client_t *sx, sxc_cluster_t *cluster, sxc_uri_t *u, int print_role)
 {
     char *user = NULL;
+    char *role = NULL;
 
     if(u->volume) {
 	fprintf(stderr, "ERROR: Bad URI: Please omit volume.\n");
 	return 1;
     }
-    user = sxc_cluster_whoami(cluster);
-    if (!user) {
+
+    if (sxc_cluster_whoami(cluster, &user, print_role ? &role : NULL)) {
         fprintf(stderr, "ERROR: %s\n", sxc_geterrmsg(sx));
         return 1;
     }
-    printf("%s\n", user);
+    if(print_role)
+        printf("%s (%s)\n", user, role);
+    else
+        printf("%s\n", user);
     free(user);
+    free(role);
     return 0;
 }
 
@@ -368,8 +472,39 @@ int main(int argc, char **argv) {
                 ret = 1;
                 break;
             }
-	    ret = add_user(sx, cluster, uri, args.inputs[0], args.role_arg, args.auth_file_arg, args.batch_mode_flag, args.force_key_arg);
+	    ret = add_user(sx, cluster, uri, args.inputs[0], args.pass_file_arg, args.role_arg, args.auth_file_arg, args.batch_mode_flag, args.force_key_arg, NULL, NULL, args.generate_key_given);
             useradd_cmdline_parser_free(&args);
+
+        } else if(!strcmp(argv[1], "userclone")) {
+            struct userclone_args_info args;
+            if (userclone_cmdline_parser(argc - 1, &argv[1], &args)) {
+                ret = 1;
+                break;
+            }
+            if(args.version_given) {
+                printf("%s %s\n", MAIN_CMDLINE_PARSER_PACKAGE, SRC_VERSION);
+                break;
+            }
+            if(args.config_dir_given && sxc_set_confdir(sx, args.config_dir_arg)) {
+                fprintf(stderr, "ERROR: Could not set configuration directory %s: %s\n", args.config_dir_arg, sxc_geterrmsg(sx));
+                ret = 1;
+                break;
+            }
+            sxc_set_debug(sx, args.debug_flag);
+            if (args.inputs_num != 3) {
+                userclone_cmdline_parser_print_help();
+                printf("\n");
+                fprintf(stderr, "ERROR: Wrong number of arguments\n");
+                ret = 1;
+                break;
+            }
+            cluster = load_config(sx, args.inputs[2], &uri);
+            if(!cluster) {
+                ret = 1;
+                break;
+            }
+            ret = add_user(sx, cluster, uri, args.inputs[1], NULL, 0, args.auth_file_arg, args.batch_mode_flag, args.force_key_arg, args.inputs[0], args.description_arg, 0);
+            userclone_cmdline_parser_free(&args);
 
 	} else if(!strcmp(argv[1], "userdel")) {
             struct userdel_args_info args;
@@ -399,11 +534,11 @@ int main(int argc, char **argv) {
                 ret = 1;
                 break;
             }
-	    if(sxc_user_remove(cluster, args.inputs[0])) {
+	    if(sxc_user_remove(cluster, args.inputs[0], args.all_given)) {
 		fprintf(stderr, "ERROR: Can't remove user %s: %s\n", args.inputs[0], sxc_geterrmsg(sx));
 		ret = 1;
 	    } else {
-		printf("User '%s' successfully removed.\n", args.inputs[0]);
+		printf("User '%s'%s successfully removed.\n", args.inputs[0], args.all_given ? " and its clones" : "");
 	    }
             userdel_cmdline_parser_free(&args);
 
@@ -435,7 +570,7 @@ int main(int argc, char **argv) {
                 ret = 1;
                 break;
             }
-	    ret = list_users(sx, cluster, uri);
+	    ret = list_users(sx, cluster, uri, args.clones_arg, !!args.clones_arg || args.verbose_given);
             userlist_cmdline_parser_free(&args);
         } else if (!strcmp(argv[1], "usergetkey")) {
             struct usergetkey_args_info args;
@@ -465,7 +600,7 @@ int main(int argc, char **argv) {
                 ret = 1;
                 break;
             }
-	    ret = getkey_user(sx, cluster, uri, args.inputs[0], args.auth_file_arg);
+	    ret = getkey_user(sx, cluster, uri, args.inputs[0], args.auth_file_arg, args.config_link_given);
             usergetkey_cmdline_parser_free(&args);
         } else if (!strcmp(argv[1], "usernewkey")) {
             struct usernewkey_args_info args;
@@ -495,7 +630,7 @@ int main(int argc, char **argv) {
                 ret = 1;
                 break;
             }
-	    ret = newkey_user(sx, cluster, uri, args.inputs[0], args.auth_file_arg, args.batch_mode_flag, args.force_key_arg);
+	    ret = newkey_user(sx, cluster, uri, args.inputs[0], args.pass_file_arg, args.auth_file_arg, args.batch_mode_flag, args.force_key_arg, args.generate_key_given);
             usernewkey_cmdline_parser_free(&args);
         } else if (!strcmp(argv[1], "volperm")) {
             struct volperm_args_info args;
@@ -586,7 +721,7 @@ int main(int argc, char **argv) {
                 ret = 1;
                 break;
             }
-	    ret = whoami(sx, cluster, uri);
+	    ret = whoami(sx, cluster, uri, args.role_given);
             whoami_cmdline_parser_free(&args);
         } else {
             if (main_cmdline_parser(argc, argv, &main_args)) {

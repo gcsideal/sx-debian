@@ -26,6 +26,8 @@
 #include "misc.h"
 #include "sxproto.h"
 #define UUID_LEN 36
+#define SXI_CONNS_HARD_TIMEOUT  1800    /* 30 minutes */
+#define SXI_CONNS_SOFT_TIMEOUT  600     /* 10 minutes */
 
 struct _sxi_jobs_t;
 typedef struct sxi_hashop sxi_hashop_t;
@@ -48,6 +50,7 @@ const char *sxi_conns_get_auth(const sxi_conns_t *conns);
 time_t sxi_conns_get_timediff(const sxi_conns_t *conns);
 void sxi_conns_set_timediff(sxi_conns_t *conns, time_t timediff);
 void sxi_conns_set_cafile(sxi_conns_t *conns, const char *cafile);
+const char *sxi_conns_get_cafile(sxi_conns_t *conns);
 int sxi_conns_set_hostlist(sxi_conns_t *conns, const sxi_hostlist_t *hlist);
 sxi_hostlist_t *sxi_conns_get_hostlist(sxi_conns_t *conns);
 unsigned int sxi_conns_get_timeout(sxi_conns_t *conns, const char *host);
@@ -107,5 +110,41 @@ sxc_xfer_stat_t *sxi_conns_get_xfer_stat(const sxi_conns_t *conns);
 
 /* Set progress statistics information */
 int sxi_conns_set_xfer_stat(sxi_conns_t *conns, sxc_xfer_stat_t *xfer_stat);
+
+typedef struct _node_status_t {
+    char internal_addr[40]; /* Internal node address */
+    char addr[40]; /* Node address */
+    char storage_dir[1024]; /* Node storage directory */
+    char uuid[UUID_LEN+1]; /* Node UUID string representation */
+    int is_bare; /* 1 if node is bare, 0 otherwise */
+    int64_t node_size; /* Current node capacity in bytes */
+    int64_t block_size; /* Filesystem block size */
+    int64_t total_blocks; /* Filesystem total number of blocks */
+    int64_t avail_blocks; /* Number of blocks that can be used by unprivileged user */
+    int64_t storage_allocated; /* Number of bytes allocated for hashfs storage files */
+    int64_t storage_commited; /* Number of bytes currently taken by hashfs storage files */
+    int64_t mem_total; /* Total memory capacity */
+
+    char utctime[256];
+    char localtime[256];
+
+    /* CPU information */
+    int cores; /* Number of all cores in system */
+    char endianness[32]; /* System endianness */
+
+    char os_name[40]; /* System name, e.g. 'Linux' */
+    char os_release[256]; /* System release */
+    char os_version[256]; /* System version */
+    char os_arch[40]; /* Machine architecture */
+
+    char libsx_version[40]; /* Libsx version */
+    char hashfs_version[16]; /* HashFS version */
+    char heal_status[40];
+} sxi_node_status_t;
+
+int sxi_conns_set_timeouts(sxi_conns_t *conns, unsigned int hard_timeout, unsigned int soft_timeout);
+int sxi_conns_get_timeouts(sxi_conns_t *conns, unsigned int *hard_timeout, unsigned int *soft_timeout);
+
+char *sxi_conns_fetch_sxauthd_credentials(sxi_conns_t *conns, const char *username, const char *pass, const char *unique_name, const char *display_name, const char *host, int port, int quiet);
 
 #endif

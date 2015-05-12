@@ -122,6 +122,7 @@ static int yacb_jobres_string(void *ctx, const unsigned char *s, size_t l) {
 
 	memcpy(yactx->message, s, l);
 	yactx->message[l] = '\0';
+        CBDEBUG("Job message: %s", yactx->message);
     } else if(yactx->state == JR_RES) {
 	if(yactx->status != JOBST_UNDEF) {
 	    CBDEBUG("Request status already received");
@@ -421,6 +422,7 @@ sxi_job_t* sxi_job_submit(sxi_conns_t *conns, sxi_hostlist_t *hlist, enum sxi_cl
     yres->cbdata = sxi_cbdata_create_job(conns, jobres_finish, &yres->ctx);
     if (!yres->cbdata) {
         free(yres);
+        SXDEBUG("sxi_cbdata_create_job failed");
         return NULL;
     }
 
@@ -471,12 +473,15 @@ sxi_job_t* sxi_job_submit(sxi_conns_t *conns, sxi_hostlist_t *hlist, enum sxi_cl
     if (http_code)
         *http_code = qret;
     if(qret != 200 || yget.state != JG_COMPLETE) {
+        SXDEBUG("unexpected json reply, HTTP %d: parse state %d", qret, yget.state);
 	goto failure;
     }
     SXDEBUG("Received job id %s with %d-%d secs polling\n", yget.job_id, yget.poll_min_delay, yget.poll_max_delay);
 
-    if(sxi_hostlist_add_host(sx, &jobhost, yget.job_host))
+    if(sxi_hostlist_add_host(sx, &jobhost, yget.job_host)) {
+        SXDEBUG("sxi_hostlist_add_host failed");
 	goto failure;
+    }
 
     yres->poll_min_delay = yget.poll_min_delay;
     yres->poll_max_delay = yget.poll_max_delay;
@@ -673,6 +678,7 @@ static int sxi_job_poll(sxi_conns_t *conns, sxi_jobs_t *jobs, int wait)
             rc = sxi_job_status_ev(conns, &jobs->jobs[i], &jobs->successful, &jobs->http_err, &jobs->error);
             if (rc < 0) {
                 ret = -1;
+                SXDEBUG("sxi_job_status_ev failed: %s", jobs->jobs[i] ? jobs->jobs[i]->message : "(null job)");
                 if (!jobs->ignore_errors)
                     break;
                 continue;
@@ -697,10 +703,37 @@ static int sxi_job_poll(sxi_conns_t *conns, sxi_jobs_t *jobs, int wait)
          * early in some situations, so count the number of still alive queries in
          * a separate loop */
         finished = alive = pending = errors = 0;
+        rc = 0;
         for (i=0;i<jobs->n;i++) {
             if (jobs->jobs[i]) {
                 if (!sxi_cbdata_is_finished(jobs->jobs[i]->cbdata))
                     alive++;
+            }
+        }
+        /* If there are still alive jobs, poll before checking their status */
+        if (alive) {
+            while (finished != alive && !rc) {
+                rc = sxi_curlev_poll(sxi_conns_get_curlev(conns));
+                if (finished > alive) {
+                    sxi_notice(sx, "counters out of sync in job_wait: %d > %d", finished, alive);
+                    break;
+                }
+            }
+            if (rc) {
+                ret = rc;
+                break;
+            }
+        }
+        if (!jobs->ignore_errors && jobs->error)
+            break;
+
+        /* Check jobs statuses */
+        for (i=0;i<jobs->n;i++) {
+            if (jobs->jobs[i]) {
+                if (!sxi_cbdata_is_finished(jobs->jobs[i]->cbdata)) {
+                    SXDEBUG("Job %s status query is not finished, but polling is", jobs->jobs[i]->job_id);
+                    break;
+                }
                 switch (jobs->jobs[i]->status) {
                     case JOBST_UNDEF:/* fall-through */
                     case JOBST_PENDING:
@@ -721,21 +754,6 @@ static int sxi_job_poll(sxi_conns_t *conns, sxi_jobs_t *jobs, int wait)
             memcpy(&t0, &t, sizeof(t));
         }
         SXDEBUG("Pending %d jobs, %d errors, %d queries", pending, errors, alive);
-        if (alive) {
-            while (finished != alive && rc != -1) {
-                rc = sxi_curlev_poll(sxi_conns_get_curlev(conns));
-                if (finished > alive) {
-                    sxi_notice(sx, "counters out of sync in job_wait: %d > %d", finished, alive);
-                    break;
-                }
-            }
-            if (rc) {
-                ret = rc;
-                break;
-            }
-        }
-        if (!jobs->ignore_errors && jobs->error)
-            break;
         if (!wait)
             break;
         gettimeofday(&tv1, NULL);
@@ -744,11 +762,18 @@ static int sxi_job_poll(sxi_conns_t *conns, sxi_jobs_t *jobs, int wait)
         SXDEBUG("Sleeping %ld ms...", delay);
         usleep(delay * 1000);
     }
+    rc = 0;
     for (i=0;i<jobs->n;i++) {
-        if (jobs->jobs[i])
-            sxi_job_result(sx, &jobs->jobs[i], &jobs->successful, &jobs->http_err, &jobs->error);
+        if (jobs->jobs[i] && (wait || jobs->jobs[i]->status != JOBST_PENDING)) {
+            rc = sxi_job_result(sx, &jobs->jobs[i], &jobs->successful, &jobs->http_err, &jobs->error);
+            if(rc) {
+                SXDEBUG("sxi_job_result failed: %s", jobs->jobs[i] ? jobs->jobs[i]->message : "(null job)");
+                ret = rc;
+            }
+        }
     }
-
+    if(ret)
+        SXDEBUG("job_poll fails with: %d (%s)", ret, sxc_geterrmsg(sx));
     return ret;
 }
 

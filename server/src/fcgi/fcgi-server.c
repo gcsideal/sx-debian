@@ -124,7 +124,7 @@ static void fcgilog_log(void *ctx, const char *argv0, int prio, const char *msg)
 }
 
 static sxc_logger_t fcgilog = {
-    NULL, NULL, fcgilog_log
+    NULL, NULL, fcgilog_log, NULL
 };
 
 void OS_LibShutdown(void);
@@ -219,8 +219,6 @@ void print_help(const char *prog)
     printf("Usage: %s [OPTIONS]\n\n", prog);
     printf("  -h, --help		Print help and exit\n");
     printf("  -V, --version		Print version and exit\n");
-    printf("  -D, --debug		Enable debug messages  (default=off)\n");
-    printf("      --foreground      Do not daemonize  (default=off)\n");
     printf("\n");
 
     printf("This program reads all settings from the config file %s\n", DEFAULT_FCGI_CFGFILE);
@@ -521,6 +519,7 @@ int main(int argc, char **argv) {
     if(s<0) {
 	CRIT("Failed to open socket '%s'", args.socket_arg);
         cmdline_parser_free(&args);
+        free(pidfile);
         sx_done(&sx);
 	return EXIT_FAILURE;
     }
@@ -533,6 +532,7 @@ int main(int argc, char **argv) {
 	if(getsockname(s, (struct sockaddr *)&sa, &salen)) {
 	    PCRIT("failed to determine socket domain");
             cmdline_parser_free(&args);
+            free(pidfile);
             sx_done(&sx);
 	    return EXIT_FAILURE;
 	}
@@ -540,12 +540,14 @@ int main(int argc, char **argv) {
 	    if(salen > sizeof(sa)) {
 		CRIT("Cannot locate socket: path too long");
                 cmdline_parser_free(&args);
+                free(pidfile);
                 sx_done(&sx);
 		return EXIT_FAILURE;
 	    }
 	    if(chmod(sa.sun_path, sockmode)) {
 		PCRIT("Cannot set permissions on socket %s", sa.sun_path);
                 cmdline_parser_free(&args);
+                free(pidfile);
                 sx_done(&sx);
 		return EXIT_FAILURE;
 	    }
@@ -557,6 +559,7 @@ int main(int argc, char **argv) {
 	if(dup2(s, FCGI_LISTENSOCK_FILENO)<0) {
 	    PCRIT("Failed to rename socket descriptor %d to %d", s, FCGI_LISTENSOCK_FILENO);
             cmdline_parser_free(&args);
+            free(pidfile);
             sx_done(&sx);
 	    return EXIT_FAILURE;
 	}
@@ -573,8 +576,17 @@ int main(int argc, char **argv) {
 	sx_hashfs_close(test_hashfs);
     } else {
 	CRIT("Failed to initialize the storage interface");
-	fprintf(stderr, "Failed to initialize the storage interface - check the logfile %s\n", args.logfile_arg);
+        const char *msg = msg_get_reason();
+        if (msg && *msg) {
+            fprintf(stderr, "%s\n", msg);
+            if (strstr(msg, "Version mismatch")) {
+                fprintf(stderr,"\nYou should upgrade the node and then try to start it again:\n\tsxadm node --upgrade '%s'\n\n", args.data_dir_arg);
+            }
+        } else {
+            fprintf(stderr, "Failed to initialize the storage interface - check the logfile %s\n", args.logfile_arg);
+        }
         cmdline_parser_free(&args);
+        free(pidfile);
         sx_done(&sx);
 	return EXIT_FAILURE;
     }
@@ -721,6 +733,8 @@ int main(int argc, char **argv) {
 	close(block_trigger);
         close(gc_trigger);
         close(gc_expire_trigger);
+        close(inner_gc_trigger);
+        close(inner_gc_expire_trigger);
         OS_LibShutdown();
         sx_done(&sx);
         return ret;
@@ -740,7 +754,7 @@ int main(int argc, char **argv) {
     } else if(!pids[GCMGR]) {
         int ret;
         sx_done(&sx);
-        sx = sx_init(NULL, "garbage collector", args.logfile_arg, foreground, argc, argv);
+        sx = sx_init(NULL, "heal & garbage collector", args.logfile_arg, foreground, argc, argv);
         if (sx) {
             if(debug)
                 log_setminlevel(sx,SX_LOG_DEBUG);
@@ -758,7 +772,8 @@ int main(int argc, char **argv) {
         sx_done(&sx);
         return ret;
     }
-    close(inner_block_trigger);
+    close(inner_gc_trigger);
+    close(inner_gc_expire_trigger);
 
     if(have_nodeid)
 	INFO("Node %s in cluster %s starting up", node_uuid.string, cluster_uuid.string);

@@ -33,7 +33,7 @@
 #include "vcrypto.h"
 #include "version.h"
 
-#define CLSTDEBUG(...) do{ sxc_client_t *_sx; if(conns && (_sx = conns->sx)) sxi_debug(_sx, __FUNCTION__, __VA_ARGS__); } while(0)
+#define CLSTDEBUG(...) do{ sxc_client_t *_sx; if(conns && (_sx = conns->sx)) sxi_debug(_sx, __func__, __VA_ARGS__); } while(0)
 #define conns_err(...) do { if(conns) sxi_seterr(conns->sx, __VA_ARGS__); } while(0)
 
 struct _sxi_conns_t {
@@ -54,6 +54,10 @@ struct _sxi_conns_t {
 
     /* Transfer progress stats */
     sxc_xfer_stat_t *xfer_stat;
+
+    /* Connection timeouts */
+    unsigned int hard_timeout; /* Timeout used for requests sent to cluster: total time a single request is allowed to exist */
+    unsigned int soft_timeout; /* Timeout for stalled requests: maximum time between successful data parts being transferred */
 };
 
 sxi_conns_t *sxi_conns_new(sxc_client_t *sx) {
@@ -161,6 +165,10 @@ void sxi_conns_set_cafile(sxi_conns_t *conns, const char *cafile) {
 	conns->insecure = 1;
 	sxi_curlev_set_cafile(conns->curlev, NULL);
     }
+}
+
+const char *sxi_conns_get_cafile(sxi_conns_t *conns) {
+    return sxi_curlev_get_cafile(conns->curlev);
 }
 
 int sxi_conns_is_secure(sxi_conns_t *conns) {
@@ -359,6 +367,11 @@ static enum head_result head_cb(curlev_context_t *ctx, long http_status, char *p
 	    sxi_cbdata_seterr(ctx, SXE_ECOMM, "Unsupported protocol version (client version %u, server version %.*s)", SRC_API_VERSION, nlen, v);
 	    return HEAD_FAIL;
 	}
+    }
+
+    if(klen == lenof("ETag:") &&
+       !strncasecmp(ptr, "ETag:", lenof("ETag:"))) {
+        sxi_cbdata_set_etag(ctx, v, vlen);
     }
 
     if(http_status == 401) {
@@ -659,7 +672,7 @@ int sxi_cluster_query_track(sxi_conns_t *conns, const sxi_hostlist_t *hlist, enu
 	}
 
 	/* Break out on success or if the failure is non retriable */
-	if((status == 200) ||
+	if((status == 200) || (status == 304) ||
 	   (status / 100 == 4 && status != 404 && status != 408 && status != 410 && status != 429))
 	    break;
     }
@@ -691,8 +704,10 @@ int sxi_cluster_query_ev_retry(curlev_context_t *cbdata,
     if (!cbdata || !conns)
         return -1;
     if(sxi_set_retry_cb(cbdata, hlist, sxi_cluster_query_ev,
-                     verb, query, content, content_size, setup_callback, jobs))
+                     verb, query, content, content_size, setup_callback, jobs)) {
+        sxi_seterr(sxi_conns_get_client(conns), SXE_EARG, "Cannot set retry callback");
         return -1;
+    }
     return sxi_cluster_query_ev(cbdata, conns, sxi_hostlist_get_host(hlist, 0), verb, query, content, content_size,
                                 setup_callback, callback);
 }
@@ -861,6 +876,36 @@ void sxi_conns_disable_blacklisting(sxi_conns_t *conns) {
 	conns->no_blacklisting = 1;
 }
 
+char *sxi_conns_fetch_sxauthd_credentials(sxi_conns_t *conns, const char *username, const char *pass, const char *unique_name, const char *display_name, const char *host, int port, int quiet) {
+    unsigned int len;
+    sxc_client_t *sx;
+    char *url, *ret;
+    if(!conns)
+        return NULL;
+    sx = sxi_conns_get_client(conns);
+
+    if(!username || !host || port < 0 || !pass) {
+        sxi_seterr(sx, SXE_EARG, "Invalid argument");
+        return NULL;
+    }
+
+    len = lenof("https://:65535/.auth/api/v1/create") + strlen(host) + 1;
+    url = malloc(len);
+    if(!url) {
+        sxi_seterr(sx, SXE_EMEM, "Out of memory");
+        return NULL;
+    }
+
+    if(port)
+        snprintf(url, len, "https://%s:%u/.auth/api/v1/create", host, port);
+    else
+        snprintf(url, len, "https://%s/.auth/api/v1/create", host);
+
+    ret = sxi_curlev_fetch_sxauthd_credentials(sxi_conns_get_curlev(conns), url, username, pass, unique_name, display_name, quiet);
+    free(url);
+    return ret;
+}
+
 int sxi_conns_root_noauth(sxi_conns_t *conns, const char *tmpcafile, int quiet)
 {
     unsigned i, hostcount, n;
@@ -868,7 +913,6 @@ int sxi_conns_root_noauth(sxi_conns_t *conns, const char *tmpcafile, int quiet)
     const char *bracket_open, *bracket_close;
     const char *query = "";
     char *url;
-
     if (sxi_is_debug_enabled(conns->sx))
 	sxi_curlev_set_verbose(conns->curlev, 1);
     hostcount = sxi_hostlist_get_count(&conns->hlist);
@@ -984,4 +1028,26 @@ int sxi_conns_internally_secure(sxi_conns_t *conns) {
     if(!conns)
 	return -1;
     return conns->internal_security != 0;
+}
+
+int sxi_conns_set_timeouts(sxi_conns_t *conns, unsigned int hard_timeout, unsigned int soft_timeout) {
+    if(!conns)
+        return -1;
+    if(hard_timeout && soft_timeout && soft_timeout > hard_timeout) {
+        sxi_seterr(sxi_conns_get_client(conns), SXE_EARG, "Invalid argument: hard timeout cannot be lower than soft timeout");
+        return 1;
+    }
+    conns->hard_timeout = hard_timeout;
+    conns->soft_timeout = soft_timeout;
+    return 0;
+}
+
+int sxi_conns_get_timeouts(sxi_conns_t *conns, unsigned int *hard_timeout, unsigned int *soft_timeout) {
+    if(!conns)
+        return -1;
+    if(hard_timeout)
+        *hard_timeout = conns->hard_timeout;
+    if(soft_timeout)
+        *soft_timeout = conns->soft_timeout;
+    return 0;
 }

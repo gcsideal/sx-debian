@@ -206,6 +206,10 @@ sub bin_to_hex {
 #    $s =~ s/(.)/sprintf("%02x",ord($1))/eg;
 }
 
+sub hex_to_bin {
+    return pack "H*", shift;
+}
+
 sub test_reply {
     my $verb = shift;
     my $test = shift;
@@ -432,11 +436,9 @@ sub test_upload {
 	$req->content_type('application/json');
 	$req->content(encode_json $content);
 	$repl = do_query $req, $auth;
-#	print $req->as_string."\n";
-#	print $repl->decoded_content."\n";
         if($i == 0 && defined $expectrc) {
             if($expectrc != $repl->code) {
-                fail 'Unexpected return code: got '.$repl->code;
+                fail "Unexpected return code: got: ".$repl->code.", expected: $expectrc";
                 return;
             }
             if($expectrc != 200) {
@@ -805,6 +807,229 @@ test_get 'listing files - filter /dir/', authed_only(200, 'application/json'), "
 test_get 'listing files - filter /dir/file', authed_only(200, 'application/json'), "$vol?filter=/dir/file", undef, sub { my $json = get_json(shift) or return 0; return is_hash($json->{'fileList'}) && scalar keys %{$json->{'fileList'}} == 1 && is_hash($json->{'fileList'}->{'/dir/file'}); };
 test_get 'listing files (utf-8)', authed_only(200, 'application/json'), escape_uri($utfvol), undef, sub { my $json = get_json(shift) or return 0; return is_hash($json->{'fileList'}) && scalar keys %{$json->{'fileList'}} == 1 && is_hash($json->{'fileList'}->{"/$utffile"});};
 
+### Check listing files more precisely (for lscache changes testing) ###
+
+### Make files tree on volume: ###
+# vol/tree
+# vol/tree/a/a
+# vol/tree/a/b
+# vol/tree/a/c
+# vol/tree/b
+# vol/tree/b/a
+# vol/tree/b/b
+# vol/tree/[]
+# vol/tree/[]/a
+# vol/tree/[]/\a
+# vol/tree/[]/\a/a
+# vol/tree/[]/?*\
+
+test_upload 'file upload (tree)', $writer, '', $vol, 'tree';
+test_upload 'file upload (tree/a/a)', $writer, '', $vol, 'tree/a/a';
+test_upload 'file upload (tree/a/b)', $writer, '', $vol, 'tree/a/b';
+test_upload 'file upload (tree/a/c)', $writer, '', $vol, 'tree/a/c';
+test_upload 'file upload (tree/b)', $writer, '', $vol, 'tree/b';
+test_upload 'file upload (tree/b/a)', $writer, '', $vol, 'tree/b/a';
+test_upload 'file upload (tree/b/b)', $writer, '', $vol, 'tree/b/b';
+test_upload 'file upload (tree/[])', $writer, '', $vol, 'tree/[]';
+test_upload 'file upload (tree/[]/a)', $writer, '', $vol, 'tree/[]/a';
+test_upload 'file upload (tree/[]/\a)', $writer, '', $vol, 'tree/[]/\a';
+test_upload 'file upload (tree/[]/\a/a)', $writer, '', $vol, 'tree/[]/\a/a';
+test_upload 'file upload (tree/[]/?*\\', $writer, '', $vol, 'tree/[]/?*\\';
+
+# List only 'tree' file (fakedir will also be returned)
+test_get 'listing \'tree\' files', authed_only(200, 'application/json'), "$vol?filter=tree", undef,
+    sub {
+        my $json_raw = shift;
+        my $json = get_json($json_raw) or return 0;
+        return 0 unless is_int($json->{'volumeSize'}) && $json->{'volumeSize'} == $volumesize && is_int($json->{'replicaCount'}) &&
+            $json->{'replicaCount'} == 1 && is_hash($json->{'fileList'}) && scalar keys %{$json->{'fileList'}} == 2;
+        return 0 unless is_hash($json->{'fileList'}->{'/tree'});
+        my $f = $json->{'fileList'}->{'/tree'} or return 0;
+        return 0 unless is_int($f->{'fileSize'}) && $f->{'fileSize'} == 0 && is_int($f->{'blockSize'}) && $f->{'blockSize'} == 4096;
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/'});
+    };
+
+# List all files from tree
+test_get 'listing all \'tree/\' files', authed_only(200, 'application/json'), "$vol?filter=tree/", undef,
+    sub {
+        my $json_raw = shift;
+        my $json = get_json($json_raw) or return 0;
+        return 0 unless is_int($json->{'volumeSize'}) && $json->{'volumeSize'} == $volumesize && is_int($json->{'replicaCount'}) &&
+            $json->{'replicaCount'} == 1 && is_hash($json->{'fileList'}) && scalar keys %{$json->{'fileList'}} == 5;
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/[]'});
+        my $f = $json->{'fileList'}->{'/tree/[]'} or return 0;
+        return 0 unless is_int($f->{'fileSize'}) && $f->{'fileSize'} == 0 && is_int($f->{'blockSize'}) && $f->{'blockSize'} == 4096;
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/[]/'});
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/a/'});
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/b'});
+        $f = $json->{'fileList'}->{'/tree/b'} or return 0;
+        return 0 unless is_int($f->{'fileSize'}) && $f->{'fileSize'} == 0 && is_int($f->{'blockSize'}) && $f->{'blockSize'} == 4096;
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/b/'});
+    };
+
+# List all files from 'tree' (recursively)
+test_get 'listing all \'tree\' files (recursively)', authed_only(200, 'application/json'), "$vol?filter=tree&recursive", undef,
+    sub {
+        my $json_raw = shift;
+        my $json = get_json($json_raw) or return 0;
+        return 0 unless is_int($json->{'volumeSize'}) && $json->{'volumeSize'} == $volumesize && is_int($json->{'replicaCount'}) &&
+             $json->{'replicaCount'} == 1 && is_hash($json->{'fileList'}) && scalar keys %{$json->{'fileList'}} == 12;
+        return 0 unless is_hash($json->{'fileList'}->{'/tree'});
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/a/a'});
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/a/b'});
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/a/c'});
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/b'});
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/b/a'});
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/b/b'});
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/[]'});
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/[]/a'});
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/[]/\a'});
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/[]/\a/a'});
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/[]/?*\\'});
+    };
+
+# List all files from 'tree' after 'tree/a'
+test_get 'listing all \'tree\' files after /tree/a', authed_only(200, 'application/json'), "$vol?filter=tree/&after=tree/a", undef,
+    sub {
+        my $json_raw = shift;
+        my $json = get_json($json_raw) or return 0;
+        return 0 unless is_int($json->{'volumeSize'}) && $json->{'volumeSize'} == $volumesize && is_int($json->{'replicaCount'}) &&
+             $json->{'replicaCount'} == 1 && is_hash($json->{'fileList'}) && scalar keys %{$json->{'fileList'}} == 3;
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/a/'});
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/b'});
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/b/'});
+    };
+
+# List all files from 'tree/??/' (recursively)
+test_get 'listing all \'tree/??/\' files (recursively)', authed_only(200, 'application/json'), "$vol?filter=tree/??/&recursive", undef,
+    sub {
+        my $json_raw = shift;
+        my $json = get_json($json_raw) or return 0;
+        return 0 unless is_int($json->{'volumeSize'}) && $json->{'volumeSize'} == $volumesize && is_int($json->{'replicaCount'}) &&
+             $json->{'replicaCount'} == 1 && is_hash($json->{'fileList'}) && scalar keys %{$json->{'fileList'}} == 4;
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/[]/a'});
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/[]/\a'});
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/[]/\a/a'});
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/[]/?*\\'});
+    };
+
+# List 'tree/\[\]/' (recursively)
+test_get 'listing all \'tree/\[\]/\' files (recursively)', authed_only(200, 'application/json'), "$vol?filter=tree/\[\]/&recursive", undef,
+    sub {
+        my $json_raw = shift;
+        my $json = get_json($json_raw) or return 0;
+        return 0 unless is_int($json->{'volumeSize'}) && $json->{'volumeSize'} == $volumesize && is_int($json->{'replicaCount'}) &&
+             $json->{'replicaCount'} == 1 && is_hash($json->{'fileList'}) && scalar keys %{$json->{'fileList'}} == 4;
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/[]/a'});
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/[]/\a'});
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/[]/\a/a'});
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/[]/?*\\'});
+    };
+
+# List 'tree/??/\[abc]''
+test_get 'listing all \'tree/??/\\[abc]\' files', authed_only(200, 'application/json'), "$vol?filter=tree/??/\\\\[abc]", undef,
+    sub {
+        my $json_raw = shift;
+        my $json = get_json($json_raw) or return 0;
+        return 0 unless is_int($json->{'volumeSize'}) && $json->{'volumeSize'} == $volumesize && is_int($json->{'replicaCount'}) &&
+             $json->{'replicaCount'} == 1 && is_hash($json->{'fileList'}) && scalar keys %{$json->{'fileList'}} == 2;
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/[]/\a'});
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/[]/\a/'});
+    };
+
+# List 'tree/??/\[abc]'' (recursively)
+test_get 'listing all \'tree/??/\\[abc]\' files (recursively)', authed_only(200, 'application/json'), "$vol?filter=tree/??/\\\\[abc]&recursive", undef,
+    sub {
+        my $json_raw = shift;
+        my $json = get_json($json_raw) or return 0;
+        return 0 unless is_int($json->{'volumeSize'}) && $json->{'volumeSize'} == $volumesize && is_int($json->{'replicaCount'}) &&
+             $json->{'replicaCount'} == 1 && is_hash($json->{'fileList'}) && scalar keys %{$json->{'fileList'}} == 2;
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/[]/\a'});
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/[]/\a/a'});
+    };
+
+# List 'tree/*/\?'' (recursively)
+test_get 'listing all \'tree/*/\\?\' files (recursively)', authed_only(200, 'application/json'), "$vol?filter=tree/*/\\\\?&recursive", undef,
+    sub {
+        my $json_raw = shift;
+        my $json = get_json($json_raw) or return 0;
+        return 0 unless is_int($json->{'volumeSize'}) && $json->{'volumeSize'} == $volumesize && is_int($json->{'replicaCount'}) &&
+             $json->{'replicaCount'} == 1 && is_hash($json->{'fileList'}) && scalar keys %{$json->{'fileList'}} == 2;
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/[]/\a'});
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/[]/\a/a'});
+    };
+
+# List 'tree/*/*\*''
+test_get 'listing all \'tree/*/\\*\' files', authed_only(200, 'application/json'), "$vol?filter=tree/*/*\\\\*", undef,
+    sub {
+        my $json_raw = shift;
+        my $json = get_json($json_raw) or return 0;
+        return 0 unless is_int($json->{'volumeSize'}) && $json->{'volumeSize'} == $volumesize && is_int($json->{'replicaCount'}) &&
+             $json->{'replicaCount'} == 1 && is_hash($json->{'fileList'}) && scalar keys %{$json->{'fileList'}} == 3;
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/[]/\a'});
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/[]/\a/'});
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/[]/?*\\'});
+    };
+
+# List  'tree/[ab]/[ab]''
+test_get 'listing all \'tree/[ab]/[ab]\' files', authed_only(200, 'application/json'), "$vol?filter=tree/[ab]/[ab]", undef,
+    sub {
+        my $json_raw = shift;
+        my $json = get_json($json_raw) or return 0;
+        return 0 unless is_int($json->{'volumeSize'}) && $json->{'volumeSize'} == $volumesize && is_int($json->{'replicaCount'}) &&
+            $json->{'replicaCount'} == 1 && is_hash($json->{'fileList'}) && scalar keys %{$json->{'fileList'}} == 4;
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/a/a'});
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/a/b'});
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/b/a'});
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/b/b'});
+    };
+
+# List  'tree/*/''
+test_get 'listing all \'tree/*/\' files', authed_only(200, 'application/json'), "$vol?filter=tree/*/", undef,
+    sub {
+        my $json_raw = shift;
+        my $json = get_json($json_raw) or return 0;
+        return 0 unless is_int($json->{'volumeSize'}) && $json->{'volumeSize'} == $volumesize && is_int($json->{'replicaCount'}) &&
+            $json->{'replicaCount'} == 1 && is_hash($json->{'fileList'}) && scalar keys %{$json->{'fileList'}} == 9;
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/a/a'});
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/a/b'});
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/a/c'});
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/b/a'});
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/b/b'});
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/[]/a'});
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/[]/\a'});
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/[]/\a/'});
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/[]/?*\\'});
+    };
+
+
+
+### Check volume modification request ###
+test_delete_job "Wiping tiny$vol contents", {'badauth'=>[401],$reader=>[403],$writer=>[200]}, "tiny$vol/toobig";
+test_upload 'file upload (add first revision)', $writer, random_data($tinyvolumesize/2-length('toobig')), "tiny$vol", 'toobig';
+test_upload 'file upload (overwrite existing revision)', $writer, random_data($tinyvolumesize/2-length('toobig')), "tiny$vol", 'toobig';
+test_get 'file revisions (should be 1)', authed_only(200, 'application/json'), "tiny$vol/toobig?fileRevisions", undef, sub { my $json = get_json(shift); return 0 unless is_hash($json->{'fileRevisions'}) && scalar keys %{$json->{'fileRevisions'}} == 1; };
+test_put_job "Increasing max revisions for tiny$vol", admin_only(200), "tiny$vol?o=mod", "{\"maxRevisions\":2}";
+test_get "tiny$vol max revisions limit modification", {'badauth'=>[401],$reader=>[200,'application/json'],$writer=>[200,'application/json'],'admin'=>[200,'application/json']}, "?volumeList", undef, sub { my $json = get_json(shift); return 0 unless is_hash($json->{'volumeList'}) && is_hash($json->{'volumeList'}->{"tiny$vol"}) && is_int($json->{'volumeList'}->{"tiny$vol"}->{'maxRevisions'}) && $json->{'volumeList'}->{"tiny$vol"}->{'maxRevisions'} == 2; };
+test_put_job "Increasing max revisions for tiny$vol (too high)", admin_only(400), "tiny$vol?o=mod", "{\"maxRevisions\":100}"; # Revisions limit is too high
+test_put_job "Increasing max revisions for $vol", admin_only(400), "$vol?o=mod", "{\"maxRevisions\":5"; # Will exceed cluster capacity
+test_upload 'file upload (add new revision)', $writer, random_data($tinyvolumesize/2-length('toobig')), "tiny$vol", 'toobig';
+test_get 'file revisions (should be 2)', authed_only(200, 'application/json'), "tiny$vol/toobig?fileRevisions", undef, sub { my $json = get_json(shift); return 0 unless is_hash($json->{'fileRevisions'}) && scalar keys %{$json->{'fileRevisions'}} == 2; };
+test_put_job "Decreasing max revisions for tiny$vol", admin_only(200), "tiny$vol?o=mod", "{\"maxRevisions\":1}"; # New revisions limit is lower than current one
+test_upload 'file upload (overwrite existing revision)', $writer, random_data($tinyvolumesize/2-length('toobig')), "tiny$vol", 'toobig'; # This will allow server to finish delete jobs
+test_get 'file revisions (should be 1)', authed_only(200, 'application/json'), "tiny$vol/toobig?fileRevisions", undef, sub { my $json = get_json(shift); return 0 unless is_hash($json->{'fileRevisions'}) && scalar keys %{$json->{'fileRevisions'}} == 1; };
+$tinyvolumesize = $tinyvolumesize + 2;
+test_put_job "Increasing tiny$vol volume size", admin_only(200), "tiny$vol?o=mod", "{\"size\":$tinyvolumesize}"; # Without this change call below should return 413
+test_upload 'bigger file upload (overwrite existing revision)', $writer, random_data($tinyvolumesize/2-length('toobig')+1), "tiny$vol", 'toobig';
+test_put_job "tiny$vol ownership change (invalid owner)", admin_only(404), "tiny$vol?o=mod", "{\"owner\":\"somebadusername\"}";
+test_put_job "tiny$vol ownership change ($reader)", admin_only(200), "tiny$vol?o=mod", "{\"owner\":\"$reader\"}";
+test_get 'volume ownership', {$reader=>[200,'application/json']}, "tiny$vol?o=acl", undef, sub { my $json = get_json(shift); my %is_priv = map { $_, 1 } @{$json->{$reader}}; return is_array($json->{$reader}) && $is_priv{'owner'}; };
+test_put_job "tiny$vol ownership change (admin)", admin_only(200), "tiny$vol?o=mod", "{\"owner\":\"admin\"}";
+test_get 'volume ownership', {'admin'=>[200,'application/json']}, "tiny$vol?o=acl", undef, sub { my $json = get_json(shift); my %is_priv = map { $_, 1 } @{$json->{'admin'}}; return is_array($json->{'admin'}) && $is_priv{'owner'}; };
+
+
+
+
 test_get 'listing all volumes', {'badauth'=>[401],$reader=>[200,'application/json'],$writer=>[200,'application/json'],'admin'=>[200,'application/json']}, '?volumeList', undef,
     sub {
         my $json_raw = shift;
@@ -839,6 +1064,82 @@ test_delete_job "volume deletion (nonempty)", admin_only(409), "$vol";
 test_delete_job "volume deletion", admin_only(200), "another.$vol";
 test_get 'deletion effect (via file list)', authed_only(404), "another.$vol";
 test_get 'deletion effect (via volume list)', {'badauth'=>[401],$reader=>[200,'application/json'],$writer=>[200,'application/json'],'admin'=>[200,'application/json']}, '?volumeList', undef, sub { my $json = get_json(shift) or return 0; return is_hash($json->{'volumeList'}) && exists($json->{'volumeList'}->{$vol}) && !exists($json->{'volumeList'}->{"another.$vol"}); };
+
+
+### Users cloning tests ###
+my $ru = "reader" . (random_string 32);
+my $wu = "writer" . (random_string 32);
+my $wc = $wu.'.clone';
+my $rc = $ru.'.clone';
+my $wk = random_data(20);
+my $rk = random_data(20);
+my $rcid = ""; # ID of reader user clone that needs to be saved inside authorisation token 
+my $wcid = ""; # ID of writer user clone that needs to be saved inside authorisation token 
+my $content;
+
+test_create_user $ru;
+test_create_user $wu;
+
+$content = { 'userType' => 'normal', 'userName' => $rc, => 'userKey' => bin_to_hex($rk), 'existingName' => $ru };
+test_put_job "$ru cloning ...", admin_only(200), '.users', encode_json($content);
+$content = { 'userType' => 'normal', 'userName' => $wc, => 'userKey' => bin_to_hex($wk), 'existingName' => $wu };
+test_put_job "$wu cloning ...", admin_only(200), '.users', encode_json($content);
+
+test_get "checking $rc ID", admin_only(200, 'application/json'), ".users/$rc", undef, sub { my $json = get_json(shift) or return 0; return 0 unless is_string($json->{'userID'}); $rcid = $json->{'userID'}; };
+test_get "checking $wc ID", admin_only(200, 'application/json'), ".users/$wc", undef, sub { my $json = get_json(shift) or return 0; return 0 unless is_string($json->{'userID'}); $wcid = $json->{'userID'}; };
+fail 'Invalid user ID' unless $rcid ne "" && $wcid ne "";
+
+$TOK{$wc} = encode_base64(hex_to_bin($wcid) . $wk . chr(0) . chr(0));
+$TOK{$rc} = encode_base64(hex_to_bin($rcid) . $rk . chr(0) . chr(0));
+
+test_put_job "volume creation (clones' volume)", admin_only(200), "clones$vol", "{\"volumeSize\":$tinyvolumesize,\"owner\":\"$wu\"}";
+test_put_job 'granting rights on newly created volume', {$wc=>[200],'badauth'=>[401],$rc=>[403],$wu=>[200],$ru=>[403],'admin'=>[200]}, "clones$vol?o=acl", "{\"grant-read\":[\"$ru\",\"$wu\"],\"grant-write\":[\"$wu\"] }";
+test_get 'the newly created volume ownership', {'badauth'=>[401],$wu=>[200,'application/json'],'admin'=>[200,'application/json'],$wc=>[200,'application/json']}, "clones$vol?o=acl", undef, sub { my $json = get_json(shift) or return 0; return is_array($json->{$wu}) && @{$json->{$wu}} == 3 && is_array($json->{$ru}) && @{$json->{$ru}} == 1 && is_array($json->{$wc}) && @{$json->{$wc}} == 3 };
+
+test_upload 'file upload (empty file)', $wc, '', "clones$vol", 'empty.clone';
+test_get 'listing as cloned users too', {'badauth'=>[401],$ru=>[200,'application/json'],$wu=>[200,'application/json'],'admin'=>[200,'application/json'],$rc=>[200,'application/json'],$wc=>[200,'application/json']},
+    "clones$vol?filter=empty.clone", undef, sub { my $json = get_json(shift) or return 0; return is_hash($json->{'fileList'}) && scalar keys %{$json->{'fileList'}} == 1 && is_hash($json->{'fileList'}->{'/empty.clone'}) };
+
+test_delete_job "$wu.clone deletion", admin_only(200), ".users/$wc";
+test_upload 'file upload (empty file) again', $wu, '', "clones$vol", 'empty.clone';
+test_get 'listing as cloned users too', {'badauth'=>[401],$ru=>[200,'application/json'],$wu=>[200,'application/json'],'admin'=>[200,'application/json'],$rc=>[200,'application/json'],$wc=>[401]},
+    "clones$vol?filter=empty.clone", undef, sub { my $json = get_json(shift) or return 0; return is_hash($json->{'fileList'}) && scalar keys %{$json->{'fileList'}} == 1 && is_hash($json->{'fileList'}->{'/empty.clone'}) };
+
+test_get 'if volume is still owned by $wu', {$wu=>[200, 'application/json'],'admin'=>[200, 'application/json']}, "clones$vol?o=acl", undef, sub { my $json = get_json(shift) or return 0; return is_array($json->{$wu}) && @{$json->{$wu}} == 3; };
+test_delete_job "$wu deletion", {'admin'=>[200, 'application/json']}, ".users/$wu";
+test_get 'if volume is no longer owned by $wu', {'admin'=>[200, 'application/json']}, "clones$vol?o=acl", undef, sub { my $json = get_json(shift) or return 0; return !is_array($json->{$wu}) && is_array($json->{'admin'}) && @{$json->{'admin'}} == 3; };
+test_get 'listing as cloned users too', {'badauth'=>[401],$ru=>[200,'application/json'],$wu=>[401],'admin'=>[200,'application/json'],$rc=>[200,'application/json'],$wc=>[401]},
+        "clones$vol?filter=empty.clone", undef, sub { my $json = get_json(shift) or return 0; return is_hash($json->{'fileList'}) && scalar keys %{$json->{'fileList'}} == 1 && is_hash($json->{'fileList'}->{'/empty.clone'}) };
+
+# Check listing users by ID
+test_get "listing clones of $ru", admin_only(200, 'application/json'), ".users?clones=$ru", undef, sub { my $json = get_json(shift) or return 0; return scalar keys %{$json} == 2 && is_hash($json->{$ru}) && is_hash($json->{$rc}) };
+
+test_delete_job "$rc deletion with all its clones", admin_only(200), ".users/$rc?all";
+test_get "checking if $ru was also deleted", admin_only(404), ".users/$ru";
+
+# Check listing users by ID ($ru was removed, this should not return any user)
+test_get "listing clones of $ru", admin_only(404), ".users?clones=$ru";
+
+# Check if .status query returns node status
+test_get "node status", admin_only(200, 'application/json'), ".status", undef, sub { my $json = get_json(shift); return 0 unless is_string($json->{'osType'}) && is_string($json->{'osArch'}) && is_string($json->{'osRelease'})
+    && is_string($json->{'osVersion'}) && is_string($json->{'osEndianness'}) && is_string($json->{'libsxVersion'}) && is_string($json->{'hashFSVersion'}) && is_string($json->{'localTime'}) && is_string($json->{'utcTime'})
+    && is_string($json->{'address'}) && is_string($json->{'internalAddress'}) && is_string($json->{'UUID'}) && is_string($json->{'nodeDir'}) && is_int($json->{'storageAllocated'}) && is_int($json->{'storageUsed'}) && is_int($json->{'fsBlockSize'})
+    && is_int($json->{'fsTotalBlocks'}) && is_int($json->{'fsAvailBlocks'}) && is_int($json->{'memTotal'}); };
+
+
+# Check .lock query correctness
+test_put_job "distribution lock acquisition", admin_only(200), ".distlock", "{\"op\":\"lock\"}";
+test_put_job "distribution lock acquisition (should fail)", admin_only(409), ".distlock", "{\"op\":\"lock\"}";
+test_put_job "distribution lock release", admin_only(200), ".distlock", "{\"op\":\"unlock\"}";
+
+
+# Check switching cluster read-only/read-write modes
+test_put_job "switching cluster to read-only mode", {'admin'=>[200]}, ".mode", "{\"mode\":\"ro\"}";
+test_upload 'file upload to read-only cluster', $writer, '', "large$vol", 'empty', undef, {}, 503;
+test_get 'listing all files (GET should work)', authed_only(200), $vol;
+test_put_job "switching cluster back to read-write mode", , {'admin'=>[200]}, ".mode", "{\"mode\":\"rw\"}";
+# PUT should work again
+test_upload 'file upload to read-only cluster', $writer, '', "large$vol", 'empty';
 
 print "\nTests performed: ".($okies+$fails)." - $fails failed, $okies succeeded\n";
 exit ($fails > 0);

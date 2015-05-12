@@ -29,7 +29,6 @@ sxc_client_t *sxi_cluster_get_client(const sxc_cluster_t *cluster);
 int sxi_is_valid_cluster(const sxc_cluster_t *cluster);
 int sxi_cluster_hashcalc(const sxc_cluster_t *cluster, const void *buffer, unsigned int len, char *hash);
 sxc_cluster_lf_t *sxi_cluster_list_local_files(sxc_client_t *sx, const char *path, int recursive, unsigned int *nfiles);
-sxc_cluster_lf_t *sxi_conns_listfiles(sxi_conns_t *conns, const char *volume, sxi_hostlist_t *volhosts, const char *glob_pattern, int recursive, int64_t *volume_used_size, int64_t *volume_size, unsigned int *replica_count, unsigned int *nfiles, int reverse, int sizeOnly);
 char *sxi_urlencode(sxc_client_t *sx, const char *string, int encode_slash);
 sxi_conns_t *sxi_cluster_get_conns(sxc_cluster_t *cluster);
 #define sxi_cluster_get_name(CLUSTER) sxc_cluster_get_sslname(CLUSTER)
@@ -50,5 +49,14 @@ sxc_xfer_stat_t* sxi_xfer_new(sxc_client_t *sx, sxc_xfer_callback xfer_callback,
 
 /* Get transfer stats from cluster */
 sxc_xfer_stat_t *sxi_cluster_get_xfer_stat(sxc_cluster_t* cluster);
+
+typedef void (*node_status_cb_t)(sxc_client_t *sx, int http_code, const sxi_node_status_t *status, int human_readable);
+int sxi_cluster_status(sxc_cluster_t *cluster, const node_status_cb_t status_cb, int human_readable);
+int sxi_cluster_distribution_lock(sxc_cluster_t *cluster, const char *master);
+int sxi_cluster_distribution_unlock(sxc_cluster_t *cluster, const char *master);
+int sxi_cluster_set_mode(sxc_cluster_t *cluster, int readonly);
+
+/* Use getaddrinfo() to create a hostlist from a hostname */
+int sxi_conns_resolve_hostlist(sxi_conns_t *conns);
 
 #endif

@@ -80,7 +80,7 @@ typedef enum { VERB_UNSUP, VERB_GET, VERB_HEAD, VERB_POST, VERB_PUT, VERB_DELETE
 extern verb_t verb;
 extern uint8_t hashbuf[UPLOAD_CHUNK_SIZE];
 extern uint8_t user[AUTH_UID_LEN];
-extern sx_uid_t uid;
+extern sx_uid_t uid, common_id;
 
 void send_server_info(void);
 void handle_request(void);
@@ -98,6 +98,7 @@ int volume_exists(void);
 int arg_num(const char *arg);
 #define has_arg(a) (arg_num(a) >= 0)
 const char *get_arg(const char *arg);
+int get_arg_uint(const char *arg);
 int arg_is(const char *arg, const char *ref);
 void json_send_qstring(const char *s);
 int json_qstring(char *buf, unsigned int buflen, const char *s);

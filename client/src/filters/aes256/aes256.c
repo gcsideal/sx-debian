@@ -43,7 +43,6 @@
 
 #include "libsx/src/misc.h"
 #include "sx.h"
-#include "crypt_blowfish.h"
 
 /* logger prefixes with aes256: already */
 #define NOTICE(...)	{ sxc_filter_msg(handle, SX_LOG_NOTICE, __VA_ARGS__); }
@@ -51,7 +50,7 @@
 #define ERROR(...)	{ sxc_filter_msg(handle, SX_LOG_ERR, __VA_ARGS__); }
 
 #define FILTER_BLOCK_SIZE 16384
-#define BCRYPT_ITERATIONS_LOG2 14
+#define BCRYPT_AES_ITERATIONS_LOG2 14
 #define KEY_SIZE SHA512_DIGEST_LENGTH
 #define IV_SIZE 16
 #define MAC_SIZE 32
@@ -89,19 +88,12 @@ static int aes256_init(const sxf_handle_t *handle, void **ctx)
 
 static int derive_key(const sxf_handle_t *handle, const char *pass, const unsigned char *salt, unsigned salt_size, unsigned char *out, unsigned out_size)
 {
-    char keybuf[61], settingbuf[30];
-    const char *genkey, *setting;
+    char keybuf[61];
     EVP_MD_CTX ctx;
     int ret;
 
-    setting = _crypt_gensalt_blowfish_rn("$2b$", BCRYPT_ITERATIONS_LOG2, (const char*)salt, salt_size, settingbuf, sizeof(settingbuf));
-    if (!setting) {
-        ERROR("crypt_gensalt_blowfish_rn failed");
-        return -1;
-    }
-    genkey = _crypt_blowfish_rn(pass, setting, keybuf, sizeof(keybuf));
-    if (!genkey) {
-        ERROR("crypt_blowfish_rn failed");
+    if(sxi_derive_key(pass, (const char*)salt, salt_size, BCRYPT_AES_ITERATIONS_LOG2, keybuf, sizeof(keybuf))) {
+        ERROR("Failed to derive key");
         return -1;
     }
     /* crypt returns a string containing the setting, the salt and the hashed
@@ -115,7 +107,7 @@ static int derive_key(const sxf_handle_t *handle, const char *pass, const unsign
             ERROR("EVP_DigestInit_ex failed");
             break;
         }
-        if (EVP_DigestUpdate(&ctx, genkey, strlen(genkey)) != 1) {
+        if (EVP_DigestUpdate(&ctx, keybuf, strlen(keybuf)) != 1) {
             ERROR("EVP_DigestUpdate failed");
             break;
         }
@@ -338,6 +330,13 @@ static int aes256_data_prepare(const sxf_handle_t *handle, void **ctx, const cha
 	unsigned char key[KEY_SIZE], salt[SALT_SIZE], fp[FP_SIZE];
 	char *keyfile = NULL;
 	int fd, have_fp = 0;
+	uint32_t runtime_ver = SSLeay();
+	uint32_t compile_ver = SSLEAY_VERSION_NUMBER;
+
+    if((runtime_ver & 0xff0000000) != (compile_ver & 0xff0000000)) {
+	ERROR("OpenSSL library version mismatch: compiled: %x, runtime: %d", compile_ver, runtime_ver);
+	return -1;
+    }
 
     mlock(key, sizeof(key));
     if(cfgdata) {
@@ -382,7 +381,7 @@ static int aes256_data_prepare(const sxf_handle_t *handle, void **ctx, const cha
 	    close(fd);
 	}
 	if(!keyread) {
-	    while((ret = getpassword(handle, have_fp ? 0 : 1, mode, key, salt)) == 1);
+	    while((ret = getpassword(handle, have_fp ? 0 : (mode == SXF_MODE_UPLOAD ? 1 : 0), mode, key, salt)) == 1);
 	    if(ret) {
 		free(keyfile);
 		return -1;
@@ -686,7 +685,7 @@ sxc_filter_t sxc_filter={
 /* const char *options */	    "\n\tnogenkey (don't generate a key file when creating a volume)\n\tparanoid (don't use key files at all - always ask for a password)\n\tsalt:HEX (force given salt, HEX must be 32 chars long)",
 /* const char *uuid */		    "35a5404d-1513-4009-904c-6ee5b0cd8634",
 /* sxf_type_t type */		    SXF_TYPE_CRYPT,
-/* int version[2] */		    {1, 4},
+/* int version[2] */		    {1, 5},
 /* int (*init)(const sxf_handle_t *handle, void **ctx) */	    aes256_init,
 /* int (*shutdown)(const sxf_handle_t *handle, void *ctx) */    aes256_shutdown,
 /* int (*parse_cfgstr)(const char *cfgstr, void **cfgdata, unsigned int *cfgdata_len) */

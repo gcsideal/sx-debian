@@ -37,17 +37,19 @@ static void send_distribution(const sx_nodelist_t *nodes) {
     CGI_PUTC('[');
     for(i = 0; i < n; i++) {
 	const sx_node_t *node = sx_nodelist_get(nodes, i);
-	const char *uuid = sx_node_uuid_str(node);
+	const sx_uuid_t *uuid = sx_node_uuid(node);
 	const char *addr = sx_node_addr(node);
 	const char *int_addr = sx_node_internal_addr(node);
 
 	if(i)
 	    CGI_PUTC(',');
-	CGI_PRINTF("{\"nodeUUID\":\"%s\",\"nodeAddress\":\"%s\",", uuid, addr);
+	CGI_PRINTF("{\"nodeUUID\":\"%s\",\"nodeAddress\":\"%s\",", uuid->string, addr);
 	if(strcmp(addr, int_addr))
 	    CGI_PRINTF("\"nodeInternalAddress\":\"%s\",", int_addr);
 	CGI_PUTS("\"nodeCapacity\":");
 	CGI_PUTLL(sx_node_capacity(node));
+	if(sx_hashfs_is_node_ignored(hashfs, uuid))
+	    CGI_PUTS(",\"nodeFlags\":\"i\"");
 	CGI_PUTC('}');
     }
     CGI_PUTC(']');
@@ -62,7 +64,7 @@ void fcgi_handle_cluster_requests(void) {
 
     /* Allow caching of rarely changing hdist-based items but force
      * revalidation so we authenticate and authorize the request again */
-    if(has_arg("clusterStatus") + has_arg("nodeList") == nargs) {
+    if(has_arg("clusterStatus") + has_arg("nodeList") + has_arg("nodeMaps") == nargs) {
 	time_t lastmod = sx_hashfs_disttime(hashfs);
 	const char *ifmod;
 	CGI_PUTS("Last-Modified: ");
@@ -89,7 +91,7 @@ void fcgi_handle_cluster_requests(void) {
 	CGI_PUTS("\"clusterStatus\":{\"distributionModels\":[");
 
 	if(!sx_storage_is_bare(hashfs)) {
-	    const sx_nodelist_t *nodes = sx_hashfs_nodelist(hashfs, NL_PREV);
+	    const sx_nodelist_t *nodes = sx_hashfs_all_nodes(hashfs, NL_PREV);
 	    const sx_uuid_t *dist_uuid;
 	    unsigned int version;
 	    uint64_t checksum;
@@ -98,7 +100,7 @@ void fcgi_handle_cluster_requests(void) {
 		send_distribution(nodes);
 		if(sx_hashfs_is_rebalancing(hashfs)) {
 		    CGI_PUTC(',');
-		    send_distribution(sx_hashfs_nodelist(hashfs, NL_NEXT));
+		    send_distribution(sx_hashfs_all_nodes(hashfs, NL_NEXT));
 		}
 	    }
 	    dist_uuid = sx_hashfs_distinfo(hashfs, &version, &checksum);
@@ -116,15 +118,27 @@ void fcgi_handle_cluster_requests(void) {
 		} else if(status == INPRG_REPLACE_RUNNING) {
 		    op = "replace";
 		    complete = "false";
-		} else /* if(status == INPRG_REPLACE_COMPLETE) */ {
+		} else if(status == INPRG_REPLACE_COMPLETE) {
 		    op = "replace";
 		    complete = "true";
-		}
+		} else if(status == INPRG_UPGRADE_RUNNING) {
+                    op = "upgrade";
+                    complete = "false";
+		} else if(status == INPRG_UPGRADE_COMPLETE) {
+                    op = "upgrade";
+                    complete = "true";
+                } else {
+                    op = "error";
+                    complete = "false";
+                }
 		CGI_PRINTF(",\"opInProgress\":{\"opType\":\"%s\",\"isComplete\":%s,\"opInfo\":", op, complete);
 		json_send_qstring(progress_msg);
 		CGI_PUTC('}');
 	    }
-	    CGI_PRINTF(",\"clusterAuth\":\"%s\"}", sx_hashfs_authtoken(hashfs));
+	    CGI_PRINTF(",\"clusterAuth\":\"%s\"", sx_hashfs_authtoken(hashfs));
+            if(has_arg("operatingMode"))
+                CGI_PRINTF(",\"operatingMode\":\"%s\"", sx_hashfs_is_readonly(hashfs) ? "read-only" : "read-write");
+            CGI_PUTC('}');
 	} else
 	    CGI_PUTS("]}");
 	comma |= 1;
@@ -132,9 +146,10 @@ void fcgi_handle_cluster_requests(void) {
 
     if(has_arg("volumeList")) {
 	const sx_hashfs_volume_t *vol;
+        char owner[SXLIMIT_MAX_USERNAME_LEN+1];
 
 	CGI_PUTS("\"volumeList\":{");
-        int u = has_priv(PRIV_ADMIN) ? 0 : uid;/* uid = 0: list all volumes */
+        uint8_t *u = has_priv(PRIV_ADMIN) ? NULL : user;/* user = NULL: list all volumes */
 	for(s = sx_hashfs_volume_first(hashfs, &vol, u); s == OK; s = sx_hashfs_volume_next(hashfs)) {
             sx_priv_t priv = 0;
 
@@ -144,15 +159,21 @@ void fcgi_handle_cluster_requests(void) {
 		comma |= 1;
 
 	    json_send_qstring(vol->name);
-            if((s = sx_hashfs_get_access(hashfs, uid, vol->name, &priv)) != OK) {
+            if((s = sx_hashfs_get_access(hashfs, user, vol->name, &priv)) != OK) {
                 CGI_PUTS("}");
                 quit_itererr("Failed to get volume privs", s);
             }
+
+            if((s = sx_hashfs_uid_get_name(hashfs, vol->owner, owner, sizeof(owner))) != OK) {
+                CGI_PUTS("}");
+                quit_itererr("Failed to get volume owner name", s);
+            }
+
             if(has_priv(PRIV_ADMIN))
                 priv = PRIV_READ | PRIV_WRITE;
 
-	    CGI_PRINTF(":{\"replicaCount\":%u,\"maxRevisions\":%u,\"privs\":\"%c%c\",\"usedSize\":", vol->replica_count, vol->revisions,
-                (priv & PRIV_READ) ? 'r' : '-', (priv & PRIV_WRITE) ? 'w' : '-');
+	    CGI_PRINTF(":{\"owner\":\"%s\",\"replicaCount\":%u,\"maxRevisions\":%u,\"privs\":\"%c%c\",\"usedSize\":", owner,
+                vol->max_replica, vol->revisions, (priv & PRIV_READ) ? 'r' : '-', (priv & PRIV_WRITE) ? 'w' : '-');
 
 	    CGI_PUTLL(vol->cursize);
             CGI_PRINTF(",\"sizeBytes\":");
@@ -198,7 +219,7 @@ void fcgi_handle_cluster_requests(void) {
 	comma |= 1;
     }
     if(has_arg("nodeList")) {
-	const sx_nodelist_t *nodes = sx_hashfs_nodelist(hashfs, NL_NEXTPREV);
+	const sx_nodelist_t *nodes = sx_hashfs_effective_nodes(hashfs, NL_NEXTPREV);
 
 	if(comma) CGI_PUTC(',');
 	CGI_PUTS("\"nodeList\":");
@@ -210,6 +231,36 @@ void fcgi_handle_cluster_requests(void) {
 	send_nodes_randomised(nodes);
 	comma |= 1;
     }
+    if(has_arg("nodeMaps")) {
+	const sx_nodelist_t *nodes = sx_hashfs_all_nodes(hashfs, NL_NEXTPREV);
+	unsigned int nnode, nnodes = sx_nodelist_count(nodes);
+
+	if(comma) CGI_PUTC(',');
+	CGI_PUTS("\"nodeMaps\":{");
+
+	/* We only have a single map for now */
+	for(nnode=0; nnode<nnodes; nnode++) {
+	    const sx_node_t *node = sx_nodelist_get(nodes, nnode);
+	    if(strcmp(sx_node_addr(node), sx_node_internal_addr(node)))
+		break;
+	}
+	if(nnode < nnodes) {
+	    CGI_PUTS("\"InternalNetwork\":{");
+	    nnode=0;
+	    while(nnode<nnodes) {
+		const sx_node_t *node = sx_nodelist_get(nodes, nnode);
+		json_send_qstring(sx_node_addr(node));
+		CGI_PUTC(':');
+		json_send_qstring(sx_node_internal_addr(node));
+		nnode++;
+		if(nnode != nnodes)
+		    CGI_PUTC(',');
+	    }
+	    CGI_PUTC('}'); /* "InternalNetwork" ends */
+	}
+	CGI_PUTC('}'); /* "nodeMaps" ends */
+	comma |= 1;
+    }
     if(has_arg("whoami")) {
         char self[SXLIMIT_MAX_USERNAME_LEN+2];
         if(comma) CGI_PUTC(',');
@@ -218,6 +269,11 @@ void fcgi_handle_cluster_requests(void) {
         if (s != OK)
             quit_errmsg(rc2http(s), msg_get_reason());
         json_send_qstring(self);
+        comma |= 1;
+    }
+    if(has_arg("role")) {
+        if(comma) CGI_PUTC(',');
+        CGI_PRINTF("\"role\":\"%s\"", has_priv(PRIV_ADMIN) ? "admin" : "normal");
         comma |= 1;
     }
 

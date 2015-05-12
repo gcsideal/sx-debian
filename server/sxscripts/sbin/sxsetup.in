@@ -8,8 +8,12 @@ while [ $OPTNUM -le $# ]; do
 
     if [ "$OPTION" = "--help" -o "$OPTION" = "-h" ]; then
 	HELP_GIVEN="yes"
+    elif [ "$OPTION" = "--version" -o "$OPTION" = "-V" ]; then
+	VERSION_GIVEN="yes"
     elif [ "$OPTION" = "--info" -o "$OPTION" = "-i" ]; then
 	INFO_GIVEN="yes"
+    elif [ "$OPTION" = "--upgrade" ]; then
+	UPGRADE_GIVEN="yes"
     elif [ "$OPTION" = "--config-file" ]; then
 	CONFIG_FILE_GIVEN="yes"
 	OPTNUM=`expr $OPTNUM + 1`
@@ -25,6 +29,9 @@ while [ $OPTNUM -le $# ]; do
 
     elif [ "$OPTION" = "--advanced" ]; then
 	ADVANCED_GIVEN="yes"
+
+    elif [ "$OPTION" = "--no-remote-copy" ]; then
+	NO_REMOTE_COPY_GIVEN="yes"
 
     elif [ "$OPTION" = "--bare" ]; then
 	BARE_GIVEN="yes"
@@ -53,9 +60,12 @@ if [ "$HELP_GIVEN" = "yes" ]; then
     echo "Usage: $0 [OPTIONS]"
     echo
     echo "-h, --help              Print help and exit"
+    echo "-V, --version           Print version and exit"
     echo "-i, --info              Show current node configuration and exit"
+    echo "    --upgrade           Upgrade local storage format and cluster databases to the latest version"
     echo "    --config-file FILE  Use config FILE to configure the node automatically"
     echo "    --advanced          Enable advanced configuration"
+    echo "    --no-remote-copy    Don't make and use remote copy of sxsetup.conf"
     echo "    --bare              Create a bare (unprogrammed) node"
     echo "    --force-reinit      Overwrite existing configuration"
     echo "    --wait              Wait till rebalance finishes after joining the cluster"
@@ -64,11 +74,16 @@ if [ "$HELP_GIVEN" = "yes" ]; then
     exit 0
 fi
 
+if [ "$VERSION_GIVEN" = "yes" ]; then
+    echo "sxsetup @VERSION@"
+    exit 0
+fi
+
 CFG_VERSION=2
 ETCDIR="@sysconfdir@"
 CONFIG="$ETCDIR/sxserver/sxsetup.conf"
 
-if [ "$INFO_GIVEN" = "yes" ]; then
+if [ "$INFO_GIVEN" = "yes" -o "$UPGRADE_GIVEN" = "yes" ]; then
     if [ ! -f "$CONFIG" ]; then
 	echo "Not configured. You have to run sxsetup in configuration mode first."
 	exit 1
@@ -78,15 +93,63 @@ if [ "$INFO_GIVEN" = "yes" ]; then
 	exit 1
     fi
     . $CONFIG
-    echo "--- SX INFO ---"
-    echo "SX Version: `@sbindir@/sx.fcgi --version | cut -d\  -f2`"
-    echo "Cluster name: $SX_CLUSTER_NAME"
-    echo "Cluster port: $SX_PORT"
-    @sbindir@/sxadm node --info --human-readable $SX_DATA_DIR | grep -v "HashFS Version"
-    echo "Storage location: $SX_DATA_DIR"
-    test "$SX_USE_SSL" = "yes" && echo "SSL private key: $SX_SSL_KEY_FILE"
-    echo "SX Logfile: $SX_LOG_FILE"
-    exit 0
+    if [ "$INFO_GIVEN" = "yes" ]; then
+	echo "--- SX INFO ---"
+	echo "SX Version: `@sbindir@/sx.fcgi --version | cut -d\  -f2`"
+	echo "Cluster name: $SX_CLUSTER_NAME"
+	echo "Cluster port: $SX_PORT"
+	@sbindir@/sxadm node --info --human-readable $SX_DATA_DIR | grep -v "HashFS Version"
+	echo "Storage location: $SX_DATA_DIR"
+	test "$SX_USE_SSL" = "yes" && echo "SSL private key: $SX_SSL_KEY_FILE"
+	echo "SX Logfile: $SX_LOG_FILE"
+	exit 0
+    else
+        "@sbindir@/sxadm" node $OWNERFLAG --info "$SX_DATA_DIR" > /dev/null 2>&1
+	if [ $? -ne 0 ]; then
+	    echo "Upgrading local node..."
+	    "@sbindir@/sxserver" stop
+	    "@sbindir@/sxadm" node $OWNERFLAG --upgrade "$SX_DATA_DIR"
+	    if [ $? -ne 0 ]; then
+		echo "ERROR: Failed to upgrade the local node"
+		"@sbindir@/sxserver" start
+		exit 1
+	    fi
+	    "@sbindir@/sxserver" start
+	else
+	    echo "Local node is up-to-date."
+	fi
+	OUT=`mktemp /tmp/sxsetupXXXXXXX`
+	if [ $? -ne 0 ]; then
+	    echo "ERROR: Failed to create temporary file"
+	    exit 1
+	fi
+        "@sbindir@/sxadm" cluster --upgrade "sx://admin@$SX_CLUSTER_NAME" > $OUT 2>&1
+	RET=$?
+	if [ $RET -eq 2 ]; then
+	    cat $OUT
+	    echo
+	    echo "All components of the cluster are up-to-date!"
+	    rm $OUT
+	    exit 0
+	elif [ $RET -ne 0 ]; then
+	    echo
+	    echo "Could not upgrade the remote cluster data at this point. Please run"
+	    echo "sxsetup --upgrade again when all other nodes are locally upgraded and"
+	    echo "online. The cluster should also get upgraded automatically after the"
+	    echo "last node is locally upgraded."
+	    rm $OUT
+	    exit 1
+	fi
+	echo
+	echo "Upgrading remote cluster data..."
+	cat $OUT
+	rm $OUT
+        "@sbindir@/sxadm" cluster --info "sx://admin@$SX_CLUSTER_NAME"
+	echo
+	echo "Remote upgrade started. You can monitor the progress by running:"
+	echo "@sbindir@/sxadm cluster --info sx://admin@$SX_CLUSTER_NAME"
+	exit 0
+    fi
 fi
 
 # Read previous answers, and initialize the defaults with them
@@ -113,7 +176,7 @@ test `id -u` -ne 0 && SX_NO_ROOT="yes"
 # Set defaults if there are no previous answers
 SX_DATA_DIR=${SX_DATA_DIR:-"@localstatedir@/lib/sxserver/storage"}
 if [ -z "$SX_NODE_IP" ]; then
-    SX_NODE_IP=`/sbin/ifconfig eth0 2>/dev/null|grep 'inet addr'|cut -d ':' -f 2|cut -d ' ' -f 1`
+    SX_NODE_IP=`ip route get 8.8.8.8 2>/dev/null | awk 'NR==1 {print $NF}' | grep "[0-9]\+\.[0-9]\+\.[0-9]\+\.[0-9]\+"`
     if [ -z "$SX_NODE_IP" ]; then
         SX_NODE_IP="127.0.0.1"
     fi
@@ -151,11 +214,14 @@ fi
 chmod 700 $SXSETUP_TMPDIR
 test -z "$SX_NO_ROOT" && chown "$SX_SERVER_USER":"$SX_SERVER_GROUP" $SXSETUP_TMPDIR
 OUT_TMP=$SXSETUP_TMPDIR/out.tmp
+XCONF_TMP=$SXSETUP_TMPDIR/xconf.tmp
 SSLKEY_TMP=$SXSETUP_TMPDIR/sslkey.tmp
 SSLCERT_TMP=$SXSETUP_TMPDIR/sslcert.tmp
 CERTCONF_TMP=$SXSETUP_TMPDIR/certconf.tmp
 CLUSTKEY_TMP=$SXSETUP_TMPDIR/clustkey.tmp
 ADMINKEY_TMP=$SXSETUP_TMPDIR/adminkey.tmp
+touch $ADMINKEY_TMP
+chmod 600 $ADMINKEY_TMP
 trap "rm -rf $SXSETUP_TMPDIR; exit 1" EXIT INT
 
 ask_yn() {
@@ -524,42 +590,71 @@ EOF
 		    SX_SSL_CERT="`cat $SX_SSL_CERT_FILE`"
 		    CREATED=1
 		else
-		    echo
-		    echo "Please paste the SSL private key below (and press CTRL+D when done) or provide a path to it."
-		    echo "SSL private key:"
-		    # Cannot use read for multi-line input
-		    cat >$SSLKEY_TMP
-		    if [ -s "$SSLKEY_TMP" ]; then
-			if grep -q -F -- '-----BEGIN' "$SSLKEY_TMP"; then
-			    # it was pasted
-			    if grep -q -F -- 'PRIVATE KEY-----' "$SSLKEY_TMP"; then
-				cp "$SSLKEY_TMP" "$SX_SSL_KEY_FILE"
-			    else
-				echo
-				echo "*** The data provided is not a private key! ***"
-				continue
+		    if [ -n "$SX_EXISTING_NODE_IP" -a "$NO_REMOTE_COPY_GIVEN" != "yes" ]; then
+			# try to obtain existing node's sxsetup.conf (non-critical)
+			echo "$SX_ADMIN_KEY" > $ADMINKEY_TMP
+			"@bindir@/sxinit" --batch-mode --force-reinit --port="$SX_PORT" $NOSSL_FLAG --auth-file="$ADMINKEY_TMP" --host-list="$SX_EXISTING_NODE_IP" "sx://admin@$SX_CLUSTER_NAME" > /dev/null 2>&1
+			"@bindir@/sxcp" "sx://admin@$SX_CLUSTER_NAME/_sxsetup.conf/sxsetup.conf.$SX_EXISTING_NODE_IP" $XCONF_TMP > /dev/null 2>&1
+			if [ $? = 0 ]; then
+			    sed -e "s/SX_/XSX_/g" $XCONF_TMP > $OUT_TMP
+			    if [ $? = 0 ]; then
+				mv $OUT_TMP $XCONF_TMP
+				. $XCONF_TMP
 			    fi
-			else
-			    cp "`cat \"$SSLKEY_TMP\"`" "$SX_SSL_KEY_FILE"
 			fi
 		    fi
-		    rm -f $SSLKEY_TMP
 
-		    GOTSRVCERT=0
-		    if [ -n "$SX_EXISTING_NODE_IP" ]; then
+		    GOTSSLKEY=
+		    if [ -n "$XSX_SSL_KEY" ]; then
+			echo $XSX_SSL_KEY | sed -e 's/[ 	][ 	]*/\
+/g' | sed -e ':a' -e 'N' -e '$!ba' -e 's/BEGIN\n/BEGIN /g' | sed -e ':a' -e 'N' -e '$!ba' -e 's/END\n/END /g' | sed -e ':a' -e 'N' -e '$!ba' -e 's/PRIVATE\n/PRIVATE /g' > "$SSLKEY_TMP"
+			if [ $? = 0 ]; then
+			    echo "Automatically obtained SSL private key from $SX_EXISTING_NODE_IP"
+			    mv "$SSLKEY_TMP" "$SX_SSL_KEY_FILE"
+			    GOTSSLKEY=1
+			fi
+		    fi
+
+		    if [ "$GOTSSLKEY" != "1" ]; then
+			echo
+			echo "Please paste the SSL private key below (and press CTRL+D when done) or provide a path to it."
+			echo "SSL private key:"
+			# Cannot use read for multi-line input
+			cat >$SSLKEY_TMP
+			if [ -s "$SSLKEY_TMP" ]; then
+			    if grep -q -F -- '-----BEGIN' "$SSLKEY_TMP"; then
+				# it was pasted
+				if grep -q -F -- 'PRIVATE KEY-----' "$SSLKEY_TMP"; then
+				    cp "$SSLKEY_TMP" "$SX_SSL_KEY_FILE"
+				else
+				    echo
+				    echo "*** The data provided is not a private key! ***"
+				    continue
+				fi
+			    else
+				cp "`cat \"$SSLKEY_TMP\"`" "$SX_SSL_KEY_FILE"
+			    fi
+			fi
+			rm -f $SSLKEY_TMP
+		    fi
+
+		    GOTSRVCERT=
+		    if [ -n "$XSX_SSL_CERT" ]; then
+			echo $XSX_SSL_CERT | sed -e 's/[ 	][ 	]*/\
+/g' | sed -e ':a' -e 'N' -e '$!ba' -e 's/BEGIN\n/BEGIN /g' | sed -e ':a' -e 'N' -e '$!ba' -e 's/END\n/END /g' > "$SSLCERT_TMP"
+			test $? = 0 && GOTSRVCERT=1
+		    elif [ -n "$SX_EXISTING_NODE_IP" ]; then
 			SRVCERT="`echo \"HEAD / HTTP/1.0\n Host: $SX_EXISTING_NODE_IP:$SX_PORT\n\n EOT\n\" | openssl s_client -connect $SX_EXISTING_NODE_IP:$SX_PORT -prexit 2>/dev/null`"
 			if [ $? = 0 ]; then
 			    echo "$SRVCERT" | openssl x509 > "$SSLCERT_TMP"
-			    if [ $? = 0 ]; then
-				GOTSRVCERT=1
-			    fi
+			    test $? = 0 && GOTSRVCERT=1
 			fi
 		    fi
 
 		    echo
 		    if [ "$GOTSRVCERT" = "1" ]; then
-			echo "Successfully obtained SSL certificate from $SX_EXISTING_NODE_IP"
-			cp "$SSLCERT_TMP" "$SX_SSL_CERT_FILE"
+			echo "Automatically obtained SSL certificate from $SX_EXISTING_NODE_IP"
+			mv "$SSLCERT_TMP" "$SX_SSL_CERT_FILE"
 		    else
 			echo "Please paste the SSL certificate below (and press CTRL+D when done) or provide a path to it"
 			echo "SSL certificate: [default=$SX_SSL_CERT_FILE]"
@@ -836,7 +931,7 @@ if [ -z "$NOSSL_FLAG" ] ; then
 fi
 
 if [ -n "$SX_NODE_INTERNAL_IP" -a "$SX_NODE_IP" != "$SX_NODE_INTERNAL_IP" ]; then
-    if [ -n "`/sbin/ifconfig 2>/dev/null | grep $SX_NODE_IP`" ]; then
+    if [ -n "`ip addr show 2>/dev/null | grep $SX_NODE_IP`" -o -n "`/sbin/ifconfig 2>/dev/null | grep $SX_NODE_IP`" ]; then
 	# bind to both public and internal IPs
 	sed -e "s/listen 80/listen $SX_NODE_IP:$SX_PORT default_server;\n\
 	     listen $SX_NODE_INTERNAL_IP:$SX_PORT/"\
@@ -966,12 +1061,25 @@ if [ ! -f "$SX_DATA_DIR/hashfs.db" ]; then
 
 	echo "SX_CLUSTER_UUID=`@sbindir@/sxadm node --info $SX_DATA_DIR | grep 'Cluster UUID' | cut -d\  -f 3`" >> $CONFIG
 	echo "SX_CLUSTER_KEY=`@sbindir@/sxadm node --info $SX_DATA_DIR | grep 'Cluster key' | cut -d\  -f 3`" >> $CONFIG
-	echo "SX_ADMIN_KEY=`@sbindir@/sxadm node --info $SX_DATA_DIR | grep 'Admin key' | cut -d\  -f 3`" >> $CONFIG
+	SX_ADMIN_KEY="`@sbindir@/sxadm node --info $SX_DATA_DIR | grep 'Admin key' | cut -d\  -f 3`"
+	echo "SX_ADMIN_KEY=$SX_ADMIN_KEY" >> $CONFIG
 
 	"@sbindir@/sxserver" start
 	if [ $? -ne 0 ]; then
 	    echo "Failed to start the new node."
 	    exit 1
+	fi
+
+	# store sxsetup.conf (non-critical)
+	if [ "$NO_REMOTE_COPY_GIVEN" != "yes" ]; then
+	    echo "$SX_ADMIN_KEY" > $ADMINKEY_TMP
+	    "@bindir@/sxinit" --batch-mode --force-reinit --port="$SX_PORT" $NOSSL_FLAG --auth-file="$ADMINKEY_TMP" --host-list="$SX_NODE_IP" "sx://admin@$SX_CLUSTER_NAME" > /dev/null 2>&1
+	    if [ $? = 0 ]; then
+		if [ -n "`@bindir@/sxls sx://admin@$SX_CLUSTER_NAME/_sxsetup.conf 2>&1 | grep "No such volume"`" ]; then
+		    "@bindir@/sxvol" create -o admin -r 1 -s 10M "sx://admin@$SX_CLUSTER_NAME/_sxsetup.conf" > /dev/null 2>&1
+		fi
+		"@bindir@/sxcp" $CONFIG "sx://admin@$SX_CLUSTER_NAME/_sxsetup.conf/sxsetup.conf.$SX_NODE_IP" > /dev/null 2>&1
+	    fi
 	fi
 
     else
@@ -1036,30 +1144,44 @@ if [ ! -f "$SX_DATA_DIR/hashfs.db" ]; then
 	fi
 
 	# Commit new cluster config
-	REBCNT=1
+	LOCKCNT=1
 	MODCNT=1
 	while true; do
-	    "@sbindir@/sxadm" cluster --info "sx://admin@$SX_CLUSTER_NAME" > $OUT_TMP
-	    if [ $? -ne 0 ]; then
-		echo "Failed to retrieve current configuration of the cluster."
-		"@sbindir@/sxserver" stop
-		exit 1
-	    fi
-	    if [ -n "`cat $OUT_TMP | grep 'Operations in progress'`" ]; then
-		if [ $REBCNT -gt 10 ]; then
-		    echo "Failed to add the new node to the cluster, which is currently running"
-		    echo "another operation. Please try again later."
-		    "@sbindir@/sxserver" stop
-		    exit 1
-		fi
-		echo "Cluster is busy (another operation in progress)... retrying in 60 seconds (attempt $REBCNT of 10)."
-		REBCNT=`expr $REBCNT + 1`
+	    if [ -n "`@sbindir@/sxadm cluster --info sx://admin@$SX_CLUSTER_NAME 2>&1 | grep 'State of operations'`" ]; then
+		echo "Cluster is busy (another operation in progress)... retrying in 60 seconds (attempt $LOCKCNT of 10)."
+		LOCKCNT=`expr $LOCKCNT + 1`
 		sleep 60
 		continue
 	    fi
+	    "@sbindir@/sxadm" cluster --lock "sx://admin@$SX_CLUSTER_NAME" > $OUT_TMP 2>&1
+	    if [ $? -ne 0 ]; then
+		if [ -n "`grep 'Cluster is already locked' $OUT_TMP`" -a $LOCKCNT -le 10 ]; then
+		    echo "Cluster is busy (already locked for changes by another process)... retrying in 60 seconds (attempt $LOCKCNT of 10)."
+		    LOCKCNT=`expr $LOCKCNT + 1`
+		    sleep 60
+		    continue
+		fi
+		echo "Failed to add the new node to the cluster, which could not be properly"
+		echo "locked. The error message from 'sxadm cluster --lock' was:"
+		cat $OUT_TMP
+		echo
+		echo "Please check the error and try again later."
+		"@sbindir@/sxserver" stop
+		exit 1
+	    fi
+
+	    "@sbindir@/sxadm" cluster --info "sx://admin@$SX_CLUSTER_NAME" > $OUT_TMP
+	    if [ $? -ne 0 ]; then
+		echo "Failed to retrieve current configuration of the cluster."
+		"@sbindir@/sxadm" cluster --unlock "sx://admin@$SX_CLUSTER_NAME"
+		"@sbindir@/sxserver" stop
+		exit 1
+	    fi
+
 	    SXDIST=`cat $OUT_TMP | grep "Current configuration" | cut -d: -f 2`
 	    if [ -z "$SXDIST" ]; then
 		echo "Failed to obtain the node information."
+		"@sbindir@/sxadm" cluster --unlock "sx://admin@$SX_CLUSTER_NAME"
 		"@sbindir@/sxserver" stop
 		exit 1
 	    fi
@@ -1068,18 +1190,32 @@ if [ ! -f "$SX_DATA_DIR/hashfs.db" ]; then
 	    set -x
 	    "@sbindir@/sxadm" cluster --mod $SXDIST "sx://admin@$SX_CLUSTER_NAME" 2>$OUT_TMP
 	    )
-	    test $? = 0 && break
-	    if [ -n "`grep 'temporarily locked' $OUT_TMP`" -a $MODCNT -le 10 ]; then
+	    if [ $? = 0 ]; then
+		"@sbindir@/sxadm" cluster --unlock "sx://admin@$SX_CLUSTER_NAME"
+		break
+	    fi
+	    "@sbindir@/sxadm" cluster --unlock "sx://admin@$SX_CLUSTER_NAME"
+
+	    if [ -n "`grep -E 'temporarily locked|complex operation|Failed to setup job targets' $OUT_TMP`" -a $MODCNT -le 10 ]; then
 		echo "Cluster busy... retrying in 60 seconds (attempt $MODCNT of 10)."
 		MODCNT=`expr $MODCNT + 1`
 		sleep 60
 	    else
-		cat $OUT_TMP
+                cat $OUT_TMP
 		echo "Failed to modify cluster sx://$SX_CLUSTER_NAME"
 		"@sbindir@/sxserver" stop
 		exit 1
 	    fi
 	done
+
+	# store sxsetup.conf (non-critical)
+	if [ "$NO_REMOTE_COPY_GIVEN" != "yes" ]; then
+	    if [ -n "`@bindir@/sxls sx://admin@$SX_CLUSTER_NAME/_sxsetup.conf 2>&1 | grep "No such volume"`" ]; then
+		sleep 5
+		"@bindir@/sxvol" create -o admin -r 2 -s 10M "sx://admin@$SX_CLUSTER_NAME/_sxsetup.conf" > /dev/null 2>&1
+	    fi
+	    "@bindir@/sxcp" $CONFIG "sx://admin@$SX_CLUSTER_NAME/_sxsetup.conf/sxsetup.conf.$SX_NODE_IP" > /dev/null 2>&1
+	fi
 
 	if [ "$WAIT_GIVEN" = "yes" ]; then
 	    echo "Waiting for cluster to finish rebalancing..."
@@ -1089,7 +1225,7 @@ if [ ! -f "$SX_DATA_DIR/hashfs.db" ]; then
 		    sleep 1
 		    continue
 		fi
-		if [ -n "`cat $OUT_TMP | grep 'Operations in progress'`" ]; then
+		if [ -n "`cat $OUT_TMP | grep 'State of operations'`" ]; then
 		    sleep 1
 		    continue
 		else

@@ -60,6 +60,7 @@ typedef struct {
 curl_events_t *sxi_curlev_init(sxi_conns_t *conns);
 void sxi_curlev_set_cafile(curl_events_t *ev, const char *cafile);
 int sxi_curlev_has_cafile(curl_events_t *ev);
+const char* sxi_curlev_get_cafile(curl_events_t *ev);
 int sxi_curlev_set_save_rootCA(curl_events_t *ev, const char *filename, int quiet);
 int sxi_curlev_is_saved(curl_events_t *ev);
 void sxi_curlev_set_verbose(curl_events_t *ev, int is_verbose);
@@ -139,6 +140,9 @@ int sxi_cbdata_result_fail(curlev_context_t* ctx);
 sxi_conns_t *sxi_cbdata_get_conns(curlev_context_t *ctx);
 void sxi_cbdata_set_result(curlev_context_t *ctx, int status);
 
+void sxi_cbdata_set_etag(curlev_context_t *ctx, const char* etag, unsigned etag_len);
+char *sxi_cbdata_get_etag(curlev_context_t *ctx);
+
 /* Store error message and code into curlev context */
 void sxi_cbdata_seterr(curlev_context_t *ctx, enum sxc_error_t err, const char *fmt, ...);
 void sxi_cbdata_setsyserr(curlev_context_t *ctx, enum sxc_error_t err, const char *fmt, ...);
@@ -162,6 +166,13 @@ void sxi_cbdata_setclusterr(curlev_context_t *ctx, const char *nodeid, const cha
 void sxi_cbdata_set_operation(curlev_context_t *ctx, const char *op, const char *host, const char *vol, const char *path);
 void sxi_cbdata_clear_operation(curlev_context_t *ctx);
 
+/*
+ * Set timeouts (in seconds) which will be used for all requests sent with given curl_events_t reference as context.
+ * Soft timing is reset each time request succeeds to transfer any part of data. After hard_timeout request is going to fail.
+ * 0 means that no timeout will be considered. If both timouts are set, hard timeout cannot be lower than soft timeout.
+ */
+int sxi_cbdata_set_timeouts(curlev_context_t *e, unsigned int hard_timeout, unsigned int soft_timeout);
+
 struct sxi_retry;
 typedef struct sxi_retry sxi_retry_t;
 sxi_retry_t* sxi_retry_init(void *ctx, retry_ctx_type_t ctx_type);
@@ -169,6 +180,7 @@ int sxi_retry_check(sxi_retry_t *retry, unsigned current_try);
 void sxi_retry_msg(sxc_client_t *sx, sxi_retry_t *retry, const char *host);
 int sxi_retry_done(sxi_retry_t **retry);
 int sxi_curlev_fetch_certificates(curl_events_t *e, const char *url, int quiet);
+char *sxi_curlev_fetch_sxauthd_credentials(curl_events_t *e, const char *url, const char *username, const char *password, const char *label, const char *unique_name, int quiet);
 
 sxi_conns_t *sxi_curlev_get_conns(curlev_t *ev);
 void sxi_curlev_set_verified(curlev_t *ev, int value);
@@ -192,4 +204,8 @@ int sxi_curlev_set_conns_limit(curl_events_t *e, unsigned int max_active, unsign
 /* Nullify context for each curlev_t element from active and inactive cURL events */
 void sxi_curlev_nullify_upload_context(sxi_conns_t *conns, void *context);
 
+/* Get optimal node according to node preference set via sxc_set_node_preference() */
+const char *sxi_hostlist_get_optimal_host(sxi_conns_t * conns, const sxi_hostlist_t *list, sxc_xfer_direction_t direction);
+int sxi_get_host_speed_stats(sxi_conns_t *conns, const char *host, double *ul, double *dl);
+int sxi_set_host_speed_stats(sxi_conns_t *conns, const char *host, double ul, double dl);
 #endif

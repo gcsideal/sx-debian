@@ -36,13 +36,18 @@
 #include <arpa/inet.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <ctype.h>
 #include "fileops.h"
+#include "yajlwrap.h"
 
 #define ERRBUF_SIZE 512
 enum ctx_tag { CTX_UPLOAD, CTX_UPLOAD_HOST, CTX_DOWNLOAD, CTX_JOB, CTX_HASHOP, CTX_GENERIC };
 
+#define MAX_ETAG_SIZE 128
+
 struct recv_context {
     char errbuf[ERRBUF_SIZE+1];
+    char etag[MAX_ETAG_SIZE];
     int rc;
     int fail;
     int finished;
@@ -95,6 +100,8 @@ struct curlev_context {
     } u;
     void *context;
 
+    unsigned int hard_timeout; /* Timeout used for requests sent to cluster: total time a single request is allowed to exist */
+    unsigned int soft_timeout; /* Timeout for stalled requests: maximum time between successful data parts being transferred */
 };
 
 static struct curlev_context *sxi_cbdata_create(sxi_conns_t *conns, finish_cb_t cb)
@@ -102,6 +109,8 @@ static struct curlev_context *sxi_cbdata_create(sxi_conns_t *conns, finish_cb_t 
     struct curlev_context *ret;
     sxc_client_t *sx;
     const char *op = NULL, *op_host = NULL, *op_vol = NULL, *op_path = NULL;
+    unsigned int hard_timeout = 0, soft_timeout = 0;
+
     if (!conns)
         return NULL;
     sx = sxi_conns_get_client(conns);
@@ -110,6 +119,12 @@ static struct curlev_context *sxi_cbdata_create(sxi_conns_t *conns, finish_cb_t 
     ret = calloc(1, sizeof(*ret));
     if (!ret) {
         sxi_setsyserr(sx, SXE_EMEM, "OOM allocating cbdata");
+        return NULL;
+    }
+    if(sxi_conns_get_timeouts(conns, &hard_timeout, &soft_timeout) ||
+       sxi_cbdata_set_timeouts(ret, hard_timeout, soft_timeout)) {
+        sxi_seterr(sx, SXE_EARG, "Failed to set connection timeouts");
+        free(ret);
         return NULL;
     }
     ret->conns = conns;
@@ -418,6 +433,28 @@ void sxi_cbdata_seterr(curlev_context_t *ctx, enum sxc_error_t err, const char *
     ctx->errbuf[sizeof(ctx->errbuf)-1] = '\0';
 }
 
+void sxi_cbdata_set_etag(curlev_context_t *cbdata, const char* etag, unsigned etag_len)
+{
+    if (cbdata) {
+        struct recv_context *rctx = &cbdata->recv_ctx;
+        if (etag_len < sizeof(rctx->etag)) {
+            memcpy(rctx->etag, etag, etag_len);
+            rctx->etag[etag_len] = '\0';
+        }
+    }
+}
+
+char* sxi_cbdata_get_etag(curlev_context_t *ctx)
+{
+    char *etag = NULL;
+    if (ctx) {
+        etag = strdup(ctx->recv_ctx.etag);
+        if (!etag)
+            sxi_cbdata_setsyserr(ctx, SXE_EMEM, "failed to duplicate etag");
+    }
+    return etag;
+}
+
 void sxi_cbdata_setsyserr(curlev_context_t *ctx, enum sxc_error_t err, const char *fmt, ...) {
     struct sxi_fmt f;
     va_list ap;
@@ -550,11 +587,16 @@ static void sxi_cbdata_finish(curl_events_t *e, curlev_context_t **ctxptr, const
         if (rctx->rc != CURLE_WRITE_ERROR) {
             const char *msg = *rctx->errbuf ? rctx->errbuf : strerr;
             if (rctx->rc == CURLE_SSL_CACERT && sxi_curlev_has_cafile(e))
-                sxi_cbdata_seterr(ctx, SXE_ECURL, "%s: Possible MITM attack, see https://wiki.skylable.com/wiki/FAQ#Possible_MITM_attack",
+                sxi_cbdata_seterr(ctx, SXE_ECURL, "%s: Possible MITM attack, see http://www.skylable.com/docs/faq#Possible_MITM_attack",
                            strerr);
             else {
                 SXDEBUG("%s: %s", url ? url : "", msg);
-                sxi_cbdata_seterr(ctx, SXE_ECURL, "Failed to %s: %s", ctx->op ? ctx->op : "query cluster", msg);
+                if(rctx->rc != CURLE_ABORTED_BY_CALLBACK || !ctx->soft_timeout) {
+                    if(ctx->hard_timeout && rctx->rc == CURLE_OPERATION_TIMEDOUT)
+                        sxi_cbdata_seterr(ctx, SXE_ECURL, "Failed to %s: Request timeout", ctx->op ? ctx->op : "query cluster");
+                    else
+                        sxi_cbdata_seterr(ctx, SXE_ECURL, "Failed to %s: %s", ctx->op ? ctx->op : "query cluster", msg);
+                }
             }
         }
     } else if (rctx->reply_status > 0 && rctx->reason && rctx->reasonsz > 0) {
@@ -625,6 +667,9 @@ struct curlev {
     int is_http;
     int verify_peer;
     uint16_t port;
+
+    struct timeval last_progress_time; /* Start or last xfer progress timestamp on this multi handle */
+    int64_t total_xfer; /* Total number of bytes transferred so far */
 };
 
 static void ev_free(curlev_t *ev)
@@ -724,8 +769,8 @@ static size_t writefn(void *ptr, size_t size, size_t nmemb, void *ctxptr) {
 	} else if(wd->reply_status == 414) {
 	    sxi_cbdata_seterr(ctx, SXE_ECOMM, "URI too long: Path to the requested resource is too long");
 	} else {
-	    /* Reply is certainly not from sx */
-	    sxi_cbdata_seterr(ctx, SXE_ECOMM, "The server contacted is not an SX Cluster node (http status: %ld)", wd->reply_status);
+            /* Reply is certainly not from sx */
+            sxi_cbdata_seterr(ctx, SXE_ECOMM, "The server contacted is not an SX Cluster node (http status: %ld)", wd->reply_status);
 	}
 	wd->fail = 1;
     }
@@ -764,18 +809,28 @@ typedef struct {
 #define MAX_EVENTS                              64
 #define MAX_ACTIVE_CONNECTIONS                  5
 #define MAX_ACTIVE_PER_HOST                     2
+#define HOST_STATS_WINDOW_SIZE                  256
+#define MIN_XFER_THRESHOLD                      4096.0
+#define MIN_EVENTS_THRESHOLD                    4
 
 /* Hold information about active connections for each host */
 struct host_info {
-    char *host;
-    unsigned int active;
+    char *host; /* Host address */
+    unsigned int active; /* Number of active connections to host */
+    double dl_speed[HOST_STATS_WINDOW_SIZE];
+    unsigned int dl_index; /* Current position in dl_speed window */
+    unsigned int dl_counter; /* Number of dl measures (max is HOST_STATS_WINDOW_SIZE) */
+    double ul_speed[HOST_STATS_WINDOW_SIZE];
+    unsigned int ul_index; /* Current position in ul_speed window */
+    unsigned int ul_counter; /* Number of ul measures (max is HOST_STATS_WINDOW_SIZE) */
 };
 
-static struct host_info *host_active_info_new(const char *host) {
+static struct host_info *host_info_new(const char *host) {
     struct host_info *info = malloc(sizeof(struct host_info));
-    if(!info) {
+    unsigned int i;
+
+    if(!info)
         return NULL;
-    }
 
     info->host = strdup(host);
     if(!info->host) {
@@ -783,11 +838,19 @@ static struct host_info *host_active_info_new(const char *host) {
         return NULL;
     }
 
+    for(i = 0; i < HOST_STATS_WINDOW_SIZE; i++) {
+        info->ul_speed[i] = 0.0;
+        info->dl_speed[i] = 0.0;
+    }
+    info->ul_index = 0;
+    info->ul_counter = 0;
+    info->dl_index = 0;
+    info->dl_counter = 0;
     info->active = 0;
     return info;
 }
 
-static void host_active_info_free(struct host_info* info) {
+static void host_info_free(struct host_info* info) {
     if(info) {
         free(info->host);
     }
@@ -828,6 +891,121 @@ struct ev_queue {
 };
 
 typedef struct ev_queue ev_queue_t;
+
+static struct host_info *connection_pool_get_host_info(const connection_pool_t *pool, const char *host) {
+    struct host_info *ret = NULL;
+
+    if(!pool || !host)
+        return NULL;
+
+    /* Get active host information reference */
+    if(sxi_ht_get(pool->hosts, host, strlen(host), (void**)&ret)) {
+        sxi_seterr(pool->sx, SXE_EARG, "Host %s is not stored in active hosts hashtable", host);
+        return NULL;
+    }
+
+    if(!ret) {
+        sxi_seterr(pool->sx, SXE_EARG, "NULL active host information reference");
+        return NULL;
+    }
+    return ret;
+}
+
+/* Update connection information for host */
+static int update_active_host(connection_pool_t *pool, const curlev_t *ev) {
+    double dl_speed = 0, ul_speed = 0;
+    double dl_size = 0, ul_size = 0;
+    struct host_info *hi;
+
+    if(!ev)
+        return 1;
+
+    if(!pool) {
+        sxi_cbdata_seterr(ev->ctx, SXE_EARG, "NULL argument");
+        return 1;
+    }
+
+    /* Get download speed from curl handle */
+    if(curl_easy_getinfo(ev->curl, CURLINFO_SPEED_DOWNLOAD, &dl_speed)) {
+        sxi_cbdata_seterr(ev->ctx, SXE_ECURL, "Failed to get download speed");
+        return 1;
+    }
+
+    /* Get download size from curl handle */
+    if(curl_easy_getinfo(ev->curl, CURLINFO_SIZE_DOWNLOAD, &dl_size)) {
+        sxi_cbdata_seterr(ev->ctx, SXE_ECURL, "Failed to get download size");
+        return 1;
+    }
+
+    /* Get upload speed from curl handle */
+    if(curl_easy_getinfo(ev->curl, CURLINFO_SPEED_UPLOAD, &ul_speed)) {
+        sxi_cbdata_seterr(ev->ctx, SXE_ECURL, "Failed to get upload speed");
+        return 1;
+    }
+
+    /* Get upload size from curl handle */
+    if(curl_easy_getinfo(ev->curl, CURLINFO_SIZE_UPLOAD, &ul_size)) {
+        sxi_cbdata_seterr(ev->ctx, SXE_ECURL, "Failed to get upload size");
+        return 1;
+    }
+
+    /* Get active host information reference */
+    if(sxi_ht_get(pool->hosts, ev->host, strlen(ev->host), (void**)&hi)) {
+        sxi_cbdata_seterr(ev->ctx, SXE_EARG, "Host %s is not stored in active hosts hashtable", ev->host);
+        return 1;
+    }
+
+    if(!hi) {
+        sxi_cbdata_seterr(ev->ctx, SXE_EARG, "NULL active host information reference");
+        return 1;
+    }
+
+    /* Insert current upload measures into window if needed */
+    if(ul_size > MIN_XFER_THRESHOLD) {
+        hi->ul_speed[hi->ul_index] = ul_speed;
+        hi->ul_index = (hi->ul_index + 1) & (HOST_STATS_WINDOW_SIZE-1);
+        if(hi->ul_counter < HOST_STATS_WINDOW_SIZE)
+            hi->ul_counter++;
+    }
+
+    /* Insert current download measures into window if needed */
+    if(dl_size > MIN_XFER_THRESHOLD) {
+        hi->dl_speed[hi->dl_index] = dl_speed;
+        hi->dl_index = (hi->dl_index + 1) & (HOST_STATS_WINDOW_SIZE-1);
+        if(hi->dl_counter < HOST_STATS_WINDOW_SIZE)
+            hi->dl_counter++;
+    }
+
+    /* Decrease number of active connections for given host */
+    hi->active--;
+    return 0;
+}
+
+static int get_host_info_speed(const struct host_info *hi, double *ul, double *dl) {
+    double dl_speed = 0.0, ul_speed = 0.0;
+    unsigned int i;
+
+    if(!hi)
+        return 1;
+
+    if(hi->ul_counter >= MIN_EVENTS_THRESHOLD) {
+        for(i = 0; i < hi->ul_counter; i++)
+            ul_speed += hi->ul_speed[i];
+    }
+    if(hi->dl_counter >= MIN_EVENTS_THRESHOLD) {
+        for(i = 0; i < hi->dl_counter; i++)
+            dl_speed += hi->dl_speed[i];
+    }
+
+    ul_speed = hi->ul_counter >= MIN_EVENTS_THRESHOLD ? ul_speed / (double)hi->ul_counter : 0.0;
+    dl_speed = hi->dl_counter >= MIN_EVENTS_THRESHOLD ? dl_speed / (double)hi->dl_counter : 0.0;
+
+    if(ul)
+        *ul = ul_speed;
+    if(dl)
+        *dl = dl_speed;
+    return 0;
+}
 
 static ev_queue_t *ev_queue_new(connection_pool_t *pool, rm_check checker) {
     ev_queue_t *q = NULL;
@@ -1042,9 +1220,8 @@ static void connection_pool_free(connection_pool_t *pool) {
     ev_queue_free(pool->queue);
 
     sxi_ht_enum_reset(pool->hosts);
-    while(!sxi_ht_enum_getnext(pool->hosts, NULL, NULL, (const void **)&info)) {
-        host_active_info_free(info);
-    }
+    while(!sxi_ht_enum_getnext(pool->hosts, NULL, NULL, (const void **)&info))
+        host_info_free(info);
     sxi_ht_free(pool->hosts);
     free(pool->active);
     free(pool);
@@ -1071,6 +1248,204 @@ struct curl_events {
     /* Used for bandwidth throttling */
     bandwidth_t bandwidth;
 };
+
+/* Classify hosts by connection speed */
+static double *classify_hosts(sxi_conns_t *conns, const sxi_hostlist_t *hosts, float distribution, sxc_xfer_direction_t direction) {
+    unsigned int i;
+    double speed_sum = 0.0, dnhosts, speed_counter = 0.0;
+    double *speed_ratings;
+    curl_events_t *e = sxi_conns_get_curlev(conns);
+    struct host_info *hi = NULL;
+
+    if(!hosts)
+        return NULL;
+
+    if(!e) {
+        sxi_seterr(sxi_conns_get_client(conns), SXE_EARG, "NULL argument");
+        return NULL;
+    }
+
+    dnhosts = (double)hosts->nhosts;
+    speed_ratings = malloc(sizeof(double) * hosts->nhosts);
+    if(!speed_ratings) {
+        sxi_seterr(sxi_conns_get_client(conns), SXE_EMEM, "Failed to allocate ratings array");
+        return NULL;
+    }
+
+    /* Trivial list needs trivial assignment */
+    if(hosts->nhosts<2) {
+        if(hosts->nhosts)
+            speed_ratings[0] = 1.0;
+        return speed_ratings;
+    }
+
+    for(i = 0; i < hosts->nhosts; i++) {
+        if(sxi_ht_get(e->conn_pool->hosts, hosts->hosts[i], strlen(hosts->hosts[i]), (void**)&hi) || !hi) {
+            speed_ratings[i] = 0.0;
+        } else {
+            if(get_host_info_speed(hi, direction == SXC_XFER_DIRECTION_UPLOAD ? &speed_ratings[i] : NULL, direction == SXC_XFER_DIRECTION_UPLOAD ? NULL : &speed_ratings[i])) {
+                sxi_seterr(sxi_conns_get_client(conns), SXE_EARG, "Failed to get average speed for host %s", hi->host);
+                free(speed_ratings);
+                return NULL;
+            }
+            if(speed_ratings[i] > 0.0) {
+                /* Square speed to get higher variance */
+                speed_ratings[i] *= speed_ratings[i];
+                speed_sum += speed_ratings[i];
+                speed_counter++;
+            }
+        }
+    }
+
+    /* Normalize ratings */
+    for(i = 0; i < hosts->nhosts; i++) {
+        if(speed_ratings[i] > 0.0)
+            speed_ratings[i] = ((speed_ratings[i] / speed_sum) * speed_counter) / dnhosts;
+        else
+            speed_ratings[i] = 1.0 / dnhosts;
+    }
+
+    return speed_ratings;
+}
+
+const char *sxi_hostlist_get_optimal_host(sxi_conns_t * conns, const sxi_hostlist_t *list, sxc_xfer_direction_t direction) {
+    unsigned int i;
+    double *ratings;
+    unsigned int r = sxi_rand();
+    float rd = (float)r / UINT_MAX;
+    sxc_client_t *sx = sxi_conns_get_client(conns);
+    float distribution = sxi_get_node_preference(sx);
+
+    if(!conns || !list || !list->nhosts)
+        return NULL;
+
+    if(distribution < 0.0 || distribution > 1.0) {
+        sxi_seterr(sx, SXE_EARG, "Invalid argument: %.2f", distribution);
+        return NULL;
+    }
+    if(distribution < 1.0 && rd > distribution)
+        return list->hosts[0];
+
+    ratings = classify_hosts(conns, list, distribution, direction);
+    if(!ratings)
+        return NULL;
+
+    if(distribution < 1.0) {
+        r = sxi_rand();
+        rd = (float)r / UINT_MAX;
+        double sum = 0.0;
+
+        for(i = 0; i < list->nhosts; i++) {
+            sum += ratings[i];
+            if(rd < sum) {
+                free(ratings);
+                return list->hosts[i];
+            }
+        }
+    } else {
+        unsigned int max = 0;
+
+        /* Choose the fastest node */
+        for(i = 1; i < list->nhosts; i++) {
+            if(ratings[i] > ratings[max])
+                max = i;
+        }
+
+        free(ratings);
+        return list->hosts[max];
+    }
+
+    free(ratings);
+    if(list->nhosts)
+        return list->hosts[list->nhosts-1];
+    return NULL;
+}
+
+int sxi_set_host_speed_stats(sxi_conns_t *conns, const char *host, double ul, double dl) {
+    struct host_info *hi;
+    connection_pool_t *pool;
+    curl_events_t *e;
+    sxc_client_t *sx = sxi_conns_get_client(conns);
+    unsigned int i;
+
+    if(!conns)
+        return 1;
+    if(!host) {
+        sxi_seterr(sx, SXE_EARG, "NULL argument");
+        return 1;
+    }
+
+    e = sxi_conns_get_curlev(conns);
+    if(!e || !e->conn_pool) {
+        sxi_seterr(sx, SXE_EARG, "Invalid argument");
+        return 1;
+    }
+    pool = e->conn_pool;
+
+    hi = connection_pool_get_host_info(pool, host);
+
+    /* Get active host information reference */
+    if(sxi_ht_get(pool->hosts, host, strlen(host), (void**)&hi)) {
+        /* Host could not be found, add given host */
+        hi = host_info_new(host);
+        if(!hi) {
+            SXDEBUG("OOM Could not allocate memory for host");
+            return 1;
+        }
+        if(sxi_ht_add(pool->hosts, host, strlen(host), (void*)hi)) {
+            SXDEBUG("OOM Could not allocate memory for host");
+            host_info_free(hi);
+            return 1;
+        }
+    }
+
+    if(!hi) {
+        sxi_seterr(sx, SXE_EARG, "NULL active host information reference");
+        return 1;
+    }
+
+    /* Fill the table at minimum threshold to make speed to be taken into account for speed averages */
+    for(i = 0; i < MIN_EVENTS_THRESHOLD; i++) {
+        hi->dl_speed[i] = dl;
+        hi->ul_speed[i] = ul;
+    }
+    hi->ul_counter = i;
+    hi->ul_index = i;
+    hi->dl_counter = i;
+    hi->dl_index = i;
+
+    return 0;
+}
+
+int sxi_get_host_speed_stats(sxi_conns_t *conns, const char *host, double *ul, double *dl) {
+    struct host_info *hi;
+    curl_events_t *e;
+    sxc_client_t *sx = sxi_conns_get_client(conns);
+
+    if(!conns)
+        return 1;
+    if(!host) {
+        sxi_seterr(sx, SXE_EARG, "NULL argument");
+        return 1;
+    }
+
+    e = sxi_conns_get_curlev(conns);
+    if(!e || !e->conn_pool) {
+        sxi_seterr(sx, SXE_EARG, "Invalid argument");
+        return 1;
+    }
+
+    hi = connection_pool_get_host_info(e->conn_pool, host);
+    if(!hi) /* Error should already be set */
+        return 1;
+
+    if(get_host_info_speed(hi, ul, dl)) {
+        sxi_seterr(sxi_conns_get_client(conns), SXE_EARG, "Failed to get host %s speed", host);
+        return 1;
+    }
+
+    return 0;
+}
 
 /* Nullify context for each curlev_t element from active and inactive cURL events */
 void sxi_curlev_nullify_upload_context(sxi_conns_t *conns, void *ctx) {
@@ -1140,13 +1515,13 @@ static void ctx_err(curlev_context_t *ctx, CURLcode rc, const char *msg)
 #define EVENTSDEBUG(e, ...) do {\
     if (e && e->conns) {\
         sxc_client_t *_sx = sxi_conns_get_client(e->conns); \
-	sxi_debug(_sx, __FUNCTION__, __VA_ARGS__);\
+	sxi_debug(_sx, __func__, __VA_ARGS__);\
     }} while (0)
 
 #define EVDEBUG(ev, ...) do {\
     if (ev && ev->ctx && ev->ctx->conns) {\
         sxc_client_t *_sx = sxi_conns_get_client(ev->ctx->conns); \
-	sxi_debug(_sx, __FUNCTION__, __VA_ARGS__);\
+	sxi_debug(_sx, __func__, __VA_ARGS__);\
     }} while (0)
 
 int sxi_curlev_set_bandwidth_limit(curl_events_t *e, int64_t global_bandwidth_limit, unsigned int running) {
@@ -1333,6 +1708,11 @@ int sxi_curlev_has_cafile(curl_events_t *ev)
     return ev && ev->cafile && *ev->cafile;
 }
 
+const char* sxi_curlev_get_cafile(curl_events_t *ev)
+{
+    return ev && ev->cafile && *ev->cafile ? ev->cafile : NULL;
+}
+
 int sxi_curlev_set_save_rootCA(curl_events_t *ev, const char *filename, int quiet)
 {
     if (!ev)
@@ -1517,6 +1897,24 @@ static int xferinfo(void *p, curl_off_t dltotal, curl_off_t dlnow,
     /* If we want to abort transfers, other cURL transfers will be killed now */
     if(sxc_geterrnum(sx) == SXE_ABORT)
         return 1;
+
+    if(ulnow + dlnow != ev->total_xfer) {
+        /* Total number of bytes transferred has changed, update timing */
+        gettimeofday(&ev->last_progress_time, NULL);
+        ev->total_xfer = ulnow + dlnow;
+    } else if(ev->ctx->soft_timeout) {
+        struct timeval now;
+        double diff;
+
+        gettimeofday(&now, NULL);
+        diff = sxi_timediff(&now, &ev->last_progress_time);
+
+        /* Check if xfer is not stalled for too long */
+        if(diff > ev->ctx->soft_timeout) {
+            sxi_cbdata_seterr(ev->ctx, SXE_ETIME, "Failed to %s: Request timeout", ev->ctx->op ? ev->ctx->op : "query cluster");
+            return 1;
+        }
+    }
 
     switch(ev->ctx->tag) {
         case CTX_DOWNLOAD: {
@@ -1804,6 +2202,12 @@ static int curlev_apply(curl_events_t *e, curlev_t *ev, curlev_t *src)
             }
         }
 
+        /* If set, apply hard limit for request */
+        if(ev->ctx && ev->ctx->hard_timeout) {
+            rc = curl_easy_setopt(ev->curl, CURLOPT_TIMEOUT, ev->ctx->hard_timeout);
+            if (curl_check(ev, rc, "set request timeout"))
+                break;
+        }
         ret = 0;
     } while(0);
     free(src->url);
@@ -1867,6 +2271,7 @@ static int compute_headers_url(curl_events_t *e, curlev_t *ev, curlev_t *src)
         {"Expect", NULL},
         {"Date", datebuf },
         {"Authorization", auth },
+        {"If-None-Match", ev->ctx->recv_ctx.etag},
         { content_type_field, content_type_value }
     };
 
@@ -2011,15 +2416,14 @@ static int enqueue_request(curl_events_t *e, curlev_t *ev, int re)
     /* Get information about active connections for each host */
     if(sxi_ht_get(e->conn_pool->hosts, (void*)ev->host, strlen(ev->host), (void**)&host) || !host) {
         /* Host could not be found, add given host */
-        host = host_active_info_new(ev->host);
+        host = host_info_new(ev->host);
         if(!host) {
             SXDEBUG("OOM Could not allocate memory for host");
             return -1;
         }
         if(sxi_ht_add(e->conn_pool->hosts, (void*)ev->host, strlen(ev->host), (void*)host)) {
             SXDEBUG("Could not add host to hashtable");
-            free(host->host);
-            free(host);
+            host_info_free(host);
             return -1;
         }
     }
@@ -2043,7 +2447,9 @@ static int enqueue_request(curl_events_t *e, curlev_t *ev, int re)
                 ev = o;
 
                 /* Update per-host active connections counters */
-                host->active++;                
+                host->active++;
+                /* Reset last successful xfer update */
+                gettimeofday(&ev->last_progress_time, NULL);
                 break;
             }
         }
@@ -2148,8 +2554,10 @@ static int ev_add(curl_events_t *e,
                 break;
             }
         }
-        if (e->used >= MAX_EVENTS)
+        if (e->used >= MAX_EVENTS) {
+            sxi_cbdata_seterr(ctx, SXE_EARG, "Events queue is overloaded");
             break;
+        }
         ev = calloc(1, sizeof(*ev));
         if (!ev) {
             ctx_err(ctx, CURLE_OUT_OF_MEMORY, "failed to allocate event");
@@ -2189,6 +2597,7 @@ static int ev_add(curl_events_t *e,
         if (enqueue_request(e, ev, 0) == -1) {
             /* TODO: remove all reuse[] handles if this fails */
             EVENTSDEBUG(e, "enqueue_request failed");
+            sxi_cbdata_seterr(ctx, SXE_EARG, "Failed to queue request");
             ev = NULL;
             break;
         }
@@ -2360,8 +2769,8 @@ int sxi_curlev_poll_immediate(curl_events_t *e)
                 char *urldup;
                 curlev_t *ev = (curlev_t*)priv;
                 struct recv_context *rctx = &ev->ctx->recv_ctx;
-                struct host_info *host = NULL;
                 int xfer_err = SXE_NOERROR;
+                curlev_context_t *ctx;
 
                 curl_easy_getinfo(msg->easy_handle, CURLINFO_RESPONSE_CODE, &rctx->reply_status);
                 rctx->errbuf[sizeof(rctx->errbuf)-1] = 0;
@@ -2373,6 +2782,14 @@ int sxi_curlev_poll_immediate(curl_events_t *e)
 
                 /* get url, it will get freed by curl_easy_cleanup */
                 curl_easy_getinfo(msg->easy_handle, CURLINFO_EFFECTIVE_URL, &url);
+
+                /* Update information about connection with given host */
+                if(update_active_host(e->conn_pool, ev)) {
+                    EVDEBUG(ev, "Failed to update host %s speed: %s", ev->host, sxi_cbdata_geterrmsg(ev->ctx));
+                    e->depth--;
+                    return -1;
+                }
+
                 /* finish might add more queries, let it know
                  * there is room */
                 rc = curl_multi_remove_handle(e->multi, ev->curl);
@@ -2382,7 +2799,7 @@ int sxi_curlev_poll_immediate(curl_events_t *e)
                 }
                 EVDEBUG(ev, "::remove_handle %p", ev->curl);
                 e->used--;
-                curlev_context_t *ctx = ev->ctx;
+                ctx = ev->ctx;
                 ev->ctx = NULL;
 
                 /* 
@@ -2439,17 +2856,9 @@ int sxi_curlev_poll_immediate(curl_events_t *e)
                     return -1;
                 }
 
-                /* Look for host */
-                if(sxi_ht_get(e->conn_pool->hosts, (void*)ev->host, strlen(ev->host), (void **)&host) || !host) {
-                    EVDEBUG(ev, "Could not get host from hosts hash table");
-                    return -1;
-                }
-
-                /* Update per-host active connections counter */
-                host->active--;
                 /* Update global active connections counter */
                 e->conn_pool->active_count--;
- 
+
                 urldup = strdup(url);
                 queue_next_inactive(e);
                 sxi_cbdata_finish(e, &ctx, urldup, ev->error);
@@ -2852,6 +3261,218 @@ int sxi_curlev_fetch_certificates(curl_events_t *e, const char *url, int quiet)
     return !ok;
 }
 
+/* Passed to cURL as a header write context */
+struct sxauthd_hdr_ctx {
+    curlev_t *ev;
+    char *link; /* Will store configuration link generated by sxauthd */
+    int is_sxauthd_host; /* Will be used to propagate error message */
+};
+
+static size_t sxauthd_headfn(void *ptr, size_t size, size_t nmemb, struct sxauthd_hdr_ctx *ctx)
+{
+    char *q;
+    struct recv_context *rctx;
+    curlev_context_t *cbdata;
+    if (!ptr || !ctx || !ctx->ev || !ctx->ev->ctx)
+        return 0;
+    cbdata = ctx->ev->ctx;
+    rctx = &cbdata->recv_ctx;
+    curl_easy_getinfo(ctx->ev->curl, CURLINFO_RESPONSE_CODE, &rctx->reply_status);
+    if (check_ssl_cert(ctx->ev))
+        return 0;
+    if (ctx->ev->ssl_verified < 0 && !ctx->ev->is_http) {
+        sxi_cbdata_seterr(cbdata, SXE_ECURL, "SSL certificate not verified");
+        return 0;
+    }
+
+    q = ptr;
+    /* Header is parsed */
+    rctx->header_seen = 1;
+    /* We expect 302 response from the server */
+    if(rctx->reply_status != 302) {
+        if(size * nmemb > lenof("Content-Type: ") && !strncmp("Content-Type: ", q, lenof("Content-Type: ")) && strncmp("application/json", q + lenof("Content-Type: "), lenof("application/json"))) {
+            sxi_cbdata_seterr(cbdata, SXE_ECOMM, "This is not an sxauthd host");
+            ctx->is_sxauthd_host = 0;
+        }
+        /* Avoid overriding error message when node is not and sxauthd host */
+        if(ctx->is_sxauthd_host) {
+            if(rctx->reply_status == 401)
+                sxi_cbdata_seterr(cbdata, SXE_ECOMM, "Invalid credentials");
+            else
+                sxi_cbdata_seterr(cbdata, SXE_ECOMM, "Failed to get configuration link from sxauthd server");
+        }
+        return size*nmemb;
+    }
+
+    if(!ctx->link && size * nmemb > lenof("Location: ") && !strncmp("Location: ", q, lenof("Location: "))) {
+        unsigned int len;
+        q += lenof("Location: ");
+        ctx->link = strdup(q);
+        if(!ctx->link)
+            return 0;
+        len = strlen(ctx->link);
+        /* Trim carriage return and line feed chars */
+        if(len >= 2 && ctx->link[len-2] == '\r' && ctx->link[len-1] == '\n')
+            ctx->link[len-2] = '\0';
+    }
+    return size * nmemb;
+}
+
+static void sxauthd_errfn(curlev_context_t *ctx, int reply_code, const char *reason)
+{
+    struct cb_error_ctx yctx;
+    yajl_callbacks yacb;
+
+    ya_error_parser(&yacb);
+    yajl_handle yh = yajl_alloc(&yacb, NULL, &yctx);
+    if(yh) {
+        memset(&yctx, 0, sizeof(yctx));
+        yctx.status = reply_code;
+        yctx.cbdata = ctx;
+        if(yajl_parse(yh, (const uint8_t *)reason, strlen(reason)) != yajl_status_ok
+           || yajl_complete_parse(yh) != yajl_status_ok || strcmp("SXAUTHD", yctx.node)) {
+            sxi_cbdata_seterr(ctx, SXE_ECOMM, "This is not an sxauthd host");
+        }
+        yajl_free(yh);
+    } else
+        sxi_cbdata_seterr(ctx, SXE_EMEM, "Cluster query failed: Out of memory");
+}
+
+char *sxi_curlev_fetch_sxauthd_credentials(curl_events_t *e, const char *url, const char *username, const char *password, const char *display, const char *unique, int quiet)
+{
+    char* ret = NULL;
+    CURLcode rc;
+    sxc_client_t *sx = sxi_conns_get_client(e->conns);
+    curlev_t *ev;
+    curlev_context_t *cbdata;
+    char *display_enc = NULL, *unique_enc = NULL, *data = NULL;
+    unsigned int data_len;
+    /* This headers context will store configuration link (aka 'location') from sxauthd response */
+    struct sxauthd_hdr_ctx header_ctx = { NULL, NULL, 1 };
+    long contimeout;
+
+    ev = calloc(1, sizeof(*ev));
+    if(!ev) {
+        sxi_seterr(sx, SXE_EMEM, "curl_easy_init failed");
+        return NULL;
+    }
+    header_ctx.ev = ev;
+    memset(&cbdata, 0, sizeof(cbdata));
+    ev->curl = curl_easy_init();
+    /* cbdata will store and handle error messages */
+    cbdata = sxi_cbdata_create(e->conns, NULL);
+    if(!cbdata) {
+        free(ev);
+        return NULL;
+    }
+    ev->ctx = cbdata;
+    if (!ev->curl) {
+        sxi_seterr(sx, SXE_EMEM, "curl_easy_init failed");
+        sxi_cbdata_unref(&cbdata);
+        free(ev);
+        return NULL;
+    }
+    /* Set common query options */
+    if(easy_set_default_opt(e, ev))
+        goto sxi_curlev_fetch_sxauthd_credentials_err;
+    rc = curl_easy_setopt(ev->curl, CURLOPT_VERBOSE, sxc_is_verbose(sx));
+    if(curl_check(ev,rc, "set CURLOPT_VERBOSE") == -1)
+        goto sxi_curlev_fetch_sxauthd_credentials_err;
+    rc = curl_easy_setopt(ev->curl, CURLOPT_URL, url);
+    if (curl_check(ev,rc, "set CURLOPT_URL") == -1)
+        goto sxi_curlev_fetch_sxauthd_credentials_err;
+    contimeout = sxi_conns_get_timeout(e->conns, url);
+    rc = curl_easy_setopt(ev->curl, CURLOPT_CONNECTTIMEOUT_MS, contimeout);
+    if (curl_check(ev, rc, "set CURLOPT_CONNECTTIMEOUT_MS") == -1)
+        goto sxi_curlev_fetch_sxauthd_credentials_err;
+
+    /* This call should be done once, do not reuse this handle */
+    rc = curl_easy_setopt(ev->curl, CURLOPT_FORBID_REUSE, 1L);
+    if (curl_check(ev, rc, "set CURLOPT_FORBID_REUSE") == -1)
+        goto sxi_curlev_fetch_sxauthd_credentials_err;
+
+    /* Set header function which will handle configuration link parsing */
+    rc = curl_easy_setopt(ev->curl, CURLOPT_HEADERFUNCTION, (write_cb_t)sxauthd_headfn);
+    if (curl_check(ev,rc, "set CURLOPT_HEADERFUNCTION") == -1)
+        goto sxi_curlev_fetch_sxauthd_credentials_err;
+    rc = curl_easy_setopt(ev->curl, CURLOPT_HEADERDATA, &header_ctx);
+    if (curl_check(ev,rc, "set CURLOPT_HEADERFUNCTION") == -1)
+        goto sxi_curlev_fetch_sxauthd_credentials_err;
+
+    /* This will suppress printing contents of a body and assign failure in case of http error code returned */
+    rc = curl_easy_setopt(ev->curl, CURLOPT_WRITEFUNCTION, writefn);
+    if (curl_check(ev,rc, "set CURLOPT_WRITEFUNCTION") == -1)
+        goto sxi_curlev_fetch_sxauthd_credentials_err;
+    rc = curl_easy_setopt(ev->curl, CURLOPT_WRITEDATA, ev->ctx);
+    if (curl_check(ev,rc, "set CURLOPT_WRITEDATA") == -1)
+        goto sxi_curlev_fetch_sxauthd_credentials_err;
+
+    /* Set basic authentication method */
+    rc = curl_easy_setopt(ev->curl, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
+    if (curl_check(ev, rc, "set CURLOPT_HTTPAUTH") == -1)
+        goto sxi_curlev_fetch_sxauthd_credentials_err;
+    rc = curl_easy_setopt(ev->curl, CURLOPT_USERNAME, username);
+    if (curl_check(ev, rc, "set CURLOPT_USERNAME") == -1)
+        goto sxi_curlev_fetch_sxauthd_credentials_err;
+    rc = curl_easy_setopt(ev->curl, CURLOPT_PASSWORD, password);
+    if (curl_check(ev, rc, "set CURLOPT_PASSWORD") == -1)
+        goto sxi_curlev_fetch_sxauthd_credentials_err;
+
+    /* Prepare query data - urlencode inputs */
+    display_enc = sxi_urlencode(sx, display, 1);
+    if(!display_enc) {
+        sxi_seterr(sx, SXE_EMEM, "Out of memory");
+        goto sxi_curlev_fetch_sxauthd_credentials_err;
+    }
+    unique_enc = sxi_urlencode(sx, unique, 1);
+    if(!unique_enc) {
+        sxi_seterr(sx, SXE_EMEM, "Out of memory");
+        goto sxi_curlev_fetch_sxauthd_credentials_err;
+    }
+    data_len = strlen(display_enc) + strlen(unique_enc) + lenof("display=") + lenof("&unique=") + 1;
+    data = malloc(data_len);
+    if(!data) {
+        sxi_seterr(sx, SXE_EMEM, "Out of memory");
+        goto sxi_curlev_fetch_sxauthd_credentials_err;
+    }
+    snprintf(data, data_len, "display=%s&unique=%s", display_enc, unique_enc); /* 'data' stores url-encoded body required by sxauthd */
+
+    /* set verb and POST data */
+    rc = curl_easy_setopt(ev->curl, CURLOPT_POST, 1);
+    if(rc == CURLE_OK)
+        rc = curl_easy_setopt(ev->curl, CURLOPT_POSTFIELDSIZE, data_len);
+    if(rc == CURLE_OK)
+        rc = curl_easy_setopt(ev->curl, CURLOPT_POSTFIELDS, data);
+    if(curl_check(ev,rc,"set verb") == -1)
+        goto sxi_curlev_fetch_sxauthd_credentials_err;
+
+    /* Send the query */
+    rc = curl_easy_perform(ev->curl);
+    if (rc != CURLE_OK) {
+        /* location_headfn() stores error messages, get them if they are set */
+        if(sxi_cbdata_geterrnum(cbdata) != SXE_NOERROR)
+            sxi_seterr(sx, sxi_cbdata_geterrnum(cbdata), "%s", sxi_cbdata_geterrmsg(cbdata));
+        else
+            sxi_seterr(sx, SXE_ECOMM,"Cannot connect to %s: %s", url, curl_easy_strerror(rc));
+        free(header_ctx.link);
+        goto sxi_curlev_fetch_sxauthd_credentials_err;
+    }
+
+    /* Check if error was stored in cbdata error buffer */
+    if(cbdata->recv_ctx.reply_status != 302 || cbdata->recv_ctx.reasonsz || !header_ctx.is_sxauthd_host)
+        goto sxi_curlev_fetch_sxauthd_credentials_err;
+
+    ret = header_ctx.link;
+sxi_curlev_fetch_sxauthd_credentials_err:
+    curl_easy_cleanup(ev->curl);
+    free(display_enc);
+    free(unique_enc);
+    free(data);
+    free(ev);
+    sxi_cbdata_finish(e, &cbdata, url, sxauthd_errfn);
+    return ret;
+}
+
 sxi_conns_t *sxi_curlev_get_conns(curlev_t *ev)
 {
     return ev && ev->ctx ? ev->ctx->conns : NULL;
@@ -2872,5 +3493,17 @@ int sxi_curlev_disable_proxy(curl_events_t *ev)
     if (!ev)
         return -1;
     ev->disable_proxy = 1;
+    return 0;
+}
+
+int sxi_cbdata_set_timeouts(curlev_context_t *e, unsigned int hard_timeout, unsigned int soft_timeout) {
+    if(!e)
+        return 1;
+    if(hard_timeout && soft_timeout && soft_timeout > hard_timeout) {
+        sxi_cbdata_seterr(e, SXE_EARG, "Invalid argument: hard timeout cannot be lower than soft timeout");
+        return 1;
+    }
+    e->hard_timeout = hard_timeout;
+    e->soft_timeout = soft_timeout;
     return 0;
 }

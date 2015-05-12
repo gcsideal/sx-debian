@@ -41,9 +41,10 @@ enum sxi_hashop_kind {
     HASHOP_DELETE
 };
 
-sxi_query_t *sxi_useradd_proto(sxc_client_t *sx, const char *username, const uint8_t *key, int admin);
-sxi_query_t *sxi_useronoff_proto(sxc_client_t *sx, const char *username, int enable);
-sxi_query_t *sxi_userdel_proto(sxc_client_t *sx, const char *username, const char *newowner);
+sxi_query_t *sxi_useradd_proto(sxc_client_t *sx, const char *username, const uint8_t *uid, const uint8_t *key, int admin, const char *desc);
+sxi_query_t *sxi_userclone_proto(sxc_client_t *sx, const char *existingname, const char *username, const uint8_t *uid, const uint8_t *key, const char *desc);
+sxi_query_t *sxi_useronoff_proto(sxc_client_t *sx, const char *username, int enable, int all_clones);
+sxi_query_t *sxi_userdel_proto(sxc_client_t *sx, const char *username, const char *newowner, int all_clones);
 sxi_query_t *sxi_usernewkey_proto(sxc_client_t *sx, const char *username, const uint8_t *key);
 sxi_query_t *sxi_volumeadd_proto(sxc_client_t *sx, const char *volname, const char *owner, int64_t size, unsigned int replica, unsigned int revisions, sxc_meta_t *metadata);
 sxi_query_t *sxi_flushfile_proto(sxc_client_t *sx, const char *token);
@@ -53,13 +54,14 @@ sxi_query_t *sxi_fileadd_proto_end(sxc_client_t *sx, sxi_query_t *query, sxc_met
 sxi_query_t *sxi_filedel_proto(sxc_client_t *sx, const char *volname, const char *path, const char *revision);
 
 typedef struct {
-    unsigned replica;
-    int count;
-} block_meta_entry_t;
-
-typedef struct {
     uint8_t b[SXI_SHA1_BIN_LEN];
 } sx_hash_t;
+
+typedef struct {
+    sx_hash_t revision_id;
+    unsigned replica;
+    int op;
+} block_meta_entry_t;
 
 typedef struct {
     uint8_t b[1+SXI_SHA1_BIN_LEN];
@@ -71,26 +73,15 @@ typedef struct {
     unsigned int blocksize;
     block_meta_entry_t *entries;
     unsigned int count;
-    int64_t blockid;
 } block_meta_t;
 
-typedef enum {
-    SX_ID_TOKEN=1,
-    SX_ID_REBALANCE,
-    SX_ID_REPAIR
-} hashop_kind_t;
-
-int sxi_hashop_generate_id(sxc_client_t *sx, hashop_kind_t kind,
-                           const void *global, unsigned global_size,
-                           const void *local, unsigned local_size, sx_hash_t *id);
-
 sxi_query_t *sxi_hashop_proto_check(sxc_client_t *sx, unsigned blocksize, const char *hashes, unsigned hashes_len);
-sxi_query_t *sxi_hashop_proto_reserve(sxc_client_t *sx, unsigned blocksize, const char *hashes, unsigned hashes_len, const char *id, uint64_t op_expires_at);
-sxi_query_t *sxi_hashop_proto_inuse_begin(sxc_client_t *sx, hashop_kind_t kind, const char *id, uint64_t op_expires_at);
-sxi_query_t *sxi_hashop_proto_inuse_begin_bin(sxc_client_t *sx, hashop_kind_t kind, const void *id, unsigned int id_size, uint64_t op_expires_at);
+sxi_query_t *sxi_hashop_proto_reserve(sxc_client_t *sx, unsigned blocksize, const char *hashes, unsigned hashes_len, const sx_hash_t *reserve_id, const sx_hash_t *revision_id, unsigned replica, uint64_t op_expires_at);
+sxi_query_t *sxi_hashop_proto_inuse_begin(sxc_client_t *sx, const sx_hash_t *reserve_id);
 sxi_query_t *sxi_hashop_proto_inuse_hash(sxc_client_t *sx, sxi_query_t *query, const block_meta_t *blockmeta);
 sxi_query_t *sxi_hashop_proto_decuse_hash(sxc_client_t *sx, sxi_query_t *query, const block_meta_t *blockmeta);
 sxi_query_t *sxi_hashop_proto_inuse_end(sxc_client_t *sx, sxi_query_t *query);
+sxi_query_t *sxi_hashop_proto_revision(sxc_client_t *sx, unsigned blocksize, const sx_hash_t *revision_id, int op);
 
 sxi_query_t *sxi_nodeinit_proto(sxc_client_t *sx, const char *cluster_name, const char *node_uuid, uint16_t http_port, int ssl_flag, const char *ssl_file);
 sxi_query_t *sxi_distribution_proto_begin(sxc_client_t *sx, const void *cfg, unsigned int cfg_len);
@@ -101,13 +92,19 @@ sxi_query_t *sxi_volsizes_proto_begin(sxc_client_t *sx);
 sxi_query_t *sxi_volsizes_proto_add_volume(sxc_client_t *sx, sxi_query_t *query, const char *volname, int64_t size);
 sxi_query_t *sxi_volsizes_proto_end(sxc_client_t *sx, sxi_query_t *query);
 
-sxi_query_t *sxi_volume_mod_proto(sxc_client_t *sx, const char *volume, const char *newowner, int64_t newsize);
+sxi_query_t *sxi_volume_mod_proto(sxc_client_t *sx, const char *volume, const char *newowner, int64_t newsize, int max_revs);
+
+/* Distribution lock proto: set lock=1 to acquire lock, 0 to release it */
+sxi_query_t *sxi_distlock_proto(sxc_client_t *sx, int lock, const char *lockid);
 
 typedef const char* (*acl_cb_t)(void *ctx);
 sxi_query_t *sxi_volumeacl_proto(sxc_client_t *sx, const char *volname,
                                  acl_cb_t grant_read, acl_cb_t grant_write,
                                  acl_cb_t revoke_read, acl_cb_t revoke_write,
                                  void *ctx);
+
+sxi_query_t *sxi_cluster_mode_proto(sxc_client_t *sx, int readonly);
+sxi_query_t *sxi_cluster_upgrade_proto(sxc_client_t *sx);
 
 void sxi_query_free(sxi_query_t *query);
 

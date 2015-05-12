@@ -16,13 +16,16 @@ http {
         '"$http_referer" "$http_user_agent"';
 #       access_log @localstatedir@/log/sxserver/sxhttpd-access.log ours;
        access_log off;
-       gzip on;
+       gzip @GZIP@;
        gzip_disable "msie6";
        gzip_vary on;
        gzip_types text/plain text/css application/json application/x-javascript text/xml application/xml application/xml+rss text/javascript;
        client_max_body_size 150M;
        client_body_temp_path @localstatedir@/lib/sxserver/sxhttpd;
        fastcgi_temp_path @localstatedir@/lib/sxserver/sxhttpd;
+       proxy_temp_path @localstatedir@/lib/sxserver/sxhttpd;
+       uwsgi_temp_path @localstatedir@/lib/sxserver/sxhttpd;
+       scgi_temp_path @localstatedir@/lib/sxserver/sxhttpd;
        server {
 #            ssl on;
 #            ssl_certificate @sysconfdir@/ssl/certs/sxcert.pem;

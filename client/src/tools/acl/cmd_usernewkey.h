@@ -40,6 +40,9 @@ struct usernewkey_args_info
   const char *help_help; /**< @brief Print help and exit help description.  */
   const char *full_help_help; /**< @brief Print help, including hidden options, and exit help description.  */
   const char *version_help; /**< @brief Print version and exit help description.  */
+  char * pass_file_arg;	/**< @brief File containing user password (instead of stdin).  */
+  char * pass_file_orig;	/**< @brief File containing user password (instead of stdin) original value given at command line.  */
+  const char *pass_file_help; /**< @brief File containing user password (instead of stdin) help description.  */
   char * auth_file_arg;	/**< @brief Store authentication token in given file (instead of stdout).  */
   char * auth_file_orig;	/**< @brief Store authentication token in given file (instead of stdout) original value given at command line.  */
   const char *auth_file_help; /**< @brief Store authentication token in given file (instead of stdout) help description.  */
@@ -49,17 +52,21 @@ struct usernewkey_args_info
   char * force_key_arg;	/**< @brief Change user key with an old authentication token.  */
   char * force_key_orig;	/**< @brief Change user key with an old authentication token original value given at command line.  */
   const char *force_key_help; /**< @brief Change user key with an old authentication token help description.  */
-  int batch_mode_flag;	/**< @brief Disable additional information and only print the authentication token (default=off).  */
-  const char *batch_mode_help; /**< @brief Disable additional information and only print the authentication token help description.  */
+  int generate_key_flag;	/**< @brief Generate a random key (default=off).  */
+  const char *generate_key_help; /**< @brief Generate a random key help description.  */
+  int batch_mode_flag;	/**< @brief Disable additional information and only print the automatically generated key (default=off).  */
+  const char *batch_mode_help; /**< @brief Disable additional information and only print the automatically generated key help description.  */
   int debug_flag;	/**< @brief Enable debug messages (default=off).  */
   const char *debug_help; /**< @brief Enable debug messages help description.  */
   
   unsigned int help_given ;	/**< @brief Whether help was given.  */
   unsigned int full_help_given ;	/**< @brief Whether full-help was given.  */
   unsigned int version_given ;	/**< @brief Whether version was given.  */
+  unsigned int pass_file_given ;	/**< @brief Whether pass-file was given.  */
   unsigned int auth_file_given ;	/**< @brief Whether auth-file was given.  */
   unsigned int config_dir_given ;	/**< @brief Whether config-dir was given.  */
   unsigned int force_key_given ;	/**< @brief Whether force-key was given.  */
+  unsigned int generate_key_given ;	/**< @brief Whether generate-key was given.  */
   unsigned int batch_mode_given ;	/**< @brief Whether batch-mode was given.  */
   unsigned int debug_given ;	/**< @brief Whether debug was given.  */
 

@@ -40,13 +40,20 @@ struct gengetopt_args_info
   const char *help_help; /**< @brief Print help and exit help description.  */
   const char *full_help_help; /**< @brief Print help, including hidden options, and exit help description.  */
   const char *version_help; /**< @brief Print version and exit help description.  */
+  char * config_link_arg;	/**< @brief Use a configuration link for an automated setup.  */
+  char * config_link_orig;	/**< @brief Use a configuration link for an automated setup original value given at command line.  */
+  const char *config_link_help; /**< @brief Use a configuration link for an automated setup help description.  */
+  char * sxauthd_arg;	/**< @brief Use sxauthd credentials (provide https://[username@]host/ uri).  */
+  char * sxauthd_orig;	/**< @brief Use sxauthd credentials (provide https://[username@]host/ uri) original value given at command line.  */
+  const char *sxauthd_help; /**< @brief Use sxauthd credentials (provide https://[username@]host/ uri) help description.  */
   const char *list_help; /**< @brief List configured profiles and aliases help description.  */
+  const char *info_help; /**< @brief Show information about a configured cluster help description.  */
   const char *delete_help; /**< @brief Delete a profile help description.  */
   int no_ssl_flag;	/**< @brief Disable secure communication (default=off).  */
   const char *no_ssl_help; /**< @brief Disable secure communication help description.  */
-  char * auth_file_arg;	/**< @brief File containing user key (instead of stdin).  */
-  char * auth_file_orig;	/**< @brief File containing user key (instead of stdin) original value given at command line.  */
-  const char *auth_file_help; /**< @brief File containing user key (instead of stdin) help description.  */
+  char * pass_file_arg;	/**< @brief File containing user password (instead of stdin).  */
+  char * pass_file_orig;	/**< @brief File containing user password (instead of stdin) original value given at command line.  */
+  const char *pass_file_help; /**< @brief File containing user password (instead of stdin) help description.  */
   int port_arg;	/**< @brief Set the cluster destination TCP port (default 443 in secure mode and 80 in insecure mode).  */
   char * port_orig;	/**< @brief Set the cluster destination TCP port (default 443 in secure mode and 80 in insecure mode) original value given at command line.  */
   const char *port_help; /**< @brief Set the cluster destination TCP port (default 443 in secure mode and 80 in insecure mode) help description.  */
@@ -60,6 +67,11 @@ struct gengetopt_args_info
   const char *batch_mode_help; /**< @brief Turn off interactive confirmations and assume yes for all questions help description.  */
   int force_reinit_flag;	/**< @brief Remove old cluster configuration and init from scratch (default=off).  */
   const char *force_reinit_help; /**< @brief Remove old cluster configuration and init from scratch help description.  */
+  int key_flag;	/**< @brief Ask for a key instead of a password (default=off).  */
+  const char *key_help; /**< @brief Ask for a key instead of a password help description.  */
+  char * auth_file_arg;	/**< @brief File containing user key (instead of stdin).  */
+  char * auth_file_orig;	/**< @brief File containing user key (instead of stdin) original value given at command line.  */
+  const char *auth_file_help; /**< @brief File containing user key (instead of stdin) help description.  */
   int debug_flag;	/**< @brief Enable debug messages (default=off).  */
   const char *debug_help; /**< @brief Enable debug messages help description.  */
   char * config_dir_arg;	/**< @brief Path to SX configuration directory.  */
@@ -69,15 +81,20 @@ struct gengetopt_args_info
   unsigned int help_given ;	/**< @brief Whether help was given.  */
   unsigned int full_help_given ;	/**< @brief Whether full-help was given.  */
   unsigned int version_given ;	/**< @brief Whether version was given.  */
+  unsigned int config_link_given ;	/**< @brief Whether config-link was given.  */
+  unsigned int sxauthd_given ;	/**< @brief Whether sxauthd was given.  */
   unsigned int list_given ;	/**< @brief Whether list was given.  */
+  unsigned int info_given ;	/**< @brief Whether info was given.  */
   unsigned int delete_given ;	/**< @brief Whether delete was given.  */
   unsigned int no_ssl_given ;	/**< @brief Whether no-ssl was given.  */
-  unsigned int auth_file_given ;	/**< @brief Whether auth-file was given.  */
+  unsigned int pass_file_given ;	/**< @brief Whether pass-file was given.  */
   unsigned int port_given ;	/**< @brief Whether port was given.  */
   unsigned int host_list_given ;	/**< @brief Whether host-list was given.  */
   unsigned int alias_given ;	/**< @brief Whether alias was given.  */
   unsigned int batch_mode_given ;	/**< @brief Whether batch-mode was given.  */
   unsigned int force_reinit_given ;	/**< @brief Whether force-reinit was given.  */
+  unsigned int key_given ;	/**< @brief Whether key was given.  */
+  unsigned int auth_file_given ;	/**< @brief Whether auth-file was given.  */
   unsigned int debug_given ;	/**< @brief Whether debug was given.  */
   unsigned int config_dir_given ;	/**< @brief Whether config-dir was given.  */
 

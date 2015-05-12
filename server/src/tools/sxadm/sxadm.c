@@ -161,6 +161,23 @@ int yesno(const char *prompt, int def)
     return 0;
 }
 
+static int handle_owner(struct node_args_info *args) {
+    if(args->owner_given) {
+	uid_t uid;
+	gid_t gid;
+	if(parse_usergroup(args->owner_arg, &uid, &gid))
+	    return 1;
+
+	if(chown(args->inputs[0], uid, gid)) {
+	    printf("Can't set ownership of %s to %u:%u\n", args->inputs[0], (unsigned int) uid, (unsigned int) gid);
+	    return 1;
+	}
+	if(runas(args->owner_arg))
+	    return 1;
+    }
+    return 0;
+}
+
 static int create_node(struct node_args_info *args) {
     struct token_pair_t auth;
     sx_uuid_t cluster_uuid;
@@ -170,8 +187,8 @@ static int create_node(struct node_args_info *args) {
 	    CRIT("Invalid cluster UUID %s", args->cluster_uuid_arg);
 	    return 1;
 	}
-    } else
-	uuid_generate(&cluster_uuid);
+    } else if (uuid_generate(&cluster_uuid))
+        return 1;
 
     if(read_or_gen_key(args->cluster_key_arg, ROLE_CLUSTER, &auth))
 	return 1;
@@ -189,20 +206,8 @@ static int create_node(struct node_args_info *args) {
 	return 1;
     }
 
-    if(args->owner_given) {
-	uid_t uid;
-	gid_t gid;
-	if(parse_usergroup(args->owner_arg, &uid, &gid))
-	    return 1;
-
-	if(chown(args->inputs[0], uid, gid)) {
-	    printf("Can't set ownership of %s to %u:%u\n", args->inputs[0], (unsigned int) uid, (unsigned int) gid);
-	    return 1;
-	}
-	if(runas(args->owner_arg))
-	    return 1;
-    }
-
+    if(handle_owner(args))
+        return 1;
     rc_ty create_fail = sx_storage_create(args->inputs[0], &cluster_uuid, auth.key, sizeof(auth.key));
     if(create_fail) {
 	printf("Failed to create storage for new node: %s\n", rc2str(create_fail));
@@ -286,8 +291,8 @@ static sx_node_t *parse_nodef(const char *nodef) {
 	    }
 	}
 
-	if(!uuid)
-	    uuid_generate(&nodeid);
+	if(!uuid && uuid_generate(&nodeid))
+            break;
 
 	ret = sx_node_new(&nodeid, addr, int_addr, capa);
 
@@ -333,7 +338,7 @@ static int create_cluster(sxc_client_t *sx, struct cluster_args_info *args) {
     sxc_cluster_t *clust = NULL;
     sx_nodelist_t *single_node = NULL;
     struct addrinfo *nodeai = NULL, *uriai = NULL, hint;
-    const char *profile, *clust_token;
+    const char *clust_token;
     const sx_uuid_t *clust_uuid;
     struct token_pair_t auth;
     char *copy_cafile = NULL;
@@ -361,7 +366,6 @@ static int create_cluster(sxc_client_t *sx, struct cluster_args_info *args) {
 	CRIT("Invalid SX URI %s", args->inputs[1]);
 	goto create_cluster_err;
     }
-    profile = uri->profile ? uri->profile : "admin";
 
     memset(&hint, 0, sizeof(hint));
     hint.ai_family = AF_UNSPEC;
@@ -499,8 +503,8 @@ static int create_cluster(sxc_client_t *sx, struct cluster_args_info *args) {
     if(read_or_gen_key(args->admin_key_arg, ROLE_ADMIN, &auth))
 	goto create_cluster_err;
 
-    if(sxc_cluster_add_access(clust, profile, auth.token) ||
-       sxc_cluster_set_access(clust, profile)) {
+    if(sxc_cluster_add_access(clust, uri->profile, auth.token) ||
+       sxc_cluster_set_access(clust, uri->profile)) {
 	CRIT("Failed to set profile authentication");
 	goto create_cluster_err;
     }
@@ -574,7 +578,7 @@ static int create_cluster(sxc_client_t *sx, struct cluster_args_info *args) {
 
     rc_ty rs = sx_storage_activate(stor, sxc_cluster_get_sslname(clust), sx_node_uuid(node), auth.uid, AUTH_UID_LEN, auth.key, AUTH_KEY_LEN, http_port, copy_cafile ? "ca.pem" : NULL, single_node);
     if(rs != OK) {
-	CRIT("Failed to activate node");
+	CRIT("Failed to activate node: %s", sx_hashfs_geterrmsg(stor));
 	goto create_cluster_err;
     }
     if(!args->batch_mode_given)
@@ -599,7 +603,6 @@ static sxc_cluster_t *cluster_load(sxc_client_t *sx, struct cluster_args_info *a
     const char *uristr = args->inputs[args->inputs_num - 1];
     sxc_cluster_t *clust = NULL;
     sxc_uri_t *uri;
-    int r;
 
     uri = sxc_parse_uri(sx, uristr);
     if(!uri) {
@@ -618,16 +621,10 @@ static sxc_cluster_t *cluster_load(sxc_client_t *sx, struct cluster_args_info *a
 	return NULL;
     }
 
-    if(uri->profile) /* Use the given profile */
-	r = sxc_cluster_set_access(clust, uri->profile);
-    else if((r = sxc_cluster_set_access(clust, "admin"))) /* or "admin" as default */
-	r = sxc_cluster_set_access(clust, NULL); /* or fall back to default, just in case */
-    if(r) {
+    if(sxc_cluster_set_access(clust, uri->profile)) {
 	printf("The selected SX profile could not be loaded.\n");
 	if(uri->profile)
 	    printf("Do you have a typo in \"%s\" ?\n", uri->profile);
-	else
-	    printf("If you intended to select a non admin profile, please use the sx://profile@%s syntax\n", uri->host);
 	sxc_cluster_free(clust);
 	sxc_free_uri(uri);
 	return NULL;
@@ -994,6 +991,124 @@ static int replace_nodes(sxc_client_t *sx, struct cluster_args_info *args) {
     return ret;
 }
 
+static int setfaulty_nodes(sxc_client_t *sx, struct cluster_args_info *args) {
+    unsigned int i, j, query_at, nnodes = args->inputs_num - 1;
+    sx_node_t **nodes;
+    sxc_cluster_t *clust = cluster_load(sx, args, 0);
+    sxi_conns_t *conns;
+    sxi_hostlist_t *hlist;
+    sxi_hostlist_t usblhlist;
+    char *query = NULL;
+    clst_t *clst = NULL;
+    int ret = 1;
+
+    if(!clust)
+	return 1;
+
+    sxi_hostlist_init(&usblhlist);
+    nodes = (sx_node_t **) calloc(nnodes, sizeof(sx_node_t *));
+    if(!nodes) {
+	CRIT("OOM allocating nodes");
+	return 1;
+    }
+    for(i = 0; i < nnodes; i++) {
+	nodes[i] = parse_nodef(args->inputs[i]);
+	if(!nodes[i])
+	    goto setfaulty_err;
+	for(j = 0; j < i; j++) {
+	    if(!sx_node_cmp(nodes[i], nodes[j])) {
+		CRIT("Node '%s' was specified multiple times", sx_node_uuid_str(nodes[i]));
+		goto setfaulty_err;
+	    }
+	}
+    }
+
+    conns = sxi_cluster_get_conns(clust);
+    hlist = sxi_conns_get_hostlist(conns);
+    /* We don't really care about addresses at this point,
+     * we just remove the addresses we don't want to connect to */
+    for(i = 0; i < sxi_hostlist_get_count(hlist); i++) {
+	const char *h = sxi_hostlist_get_host(hlist, i);
+	int faulty = 0;
+	for(j = 0; j < nnodes; j++) {
+	    if(!strcmp(sx_node_addr(nodes[j]), h) || !strcmp(sx_node_internal_addr(nodes[j]), h)) {
+		faulty = 1;
+		break;
+	    }
+	}
+	if(!faulty && sxi_hostlist_add_host(sx, &usblhlist, h)) {
+	    CRIT("Cannot update list of nodes: %s", sxc_geterrmsg(sx));
+	    goto setfaulty_err;
+	}
+    }
+    sxi_hostlist_empty(hlist);
+    if(sxi_hostlist_add_list(sx, hlist, &usblhlist)) {
+	CRIT("Cannot update list of nodes: %s", sxc_geterrmsg(sx));
+	goto setfaulty_err;
+    }
+
+    if(!sxi_hostlist_get_count(hlist)) {
+	CRIT("Failed to update list of usable nodes");
+	goto setfaulty_err;
+    }
+    sxi_hostlist_shuffle(hlist);
+
+    clst = clst_query(conns, NULL);
+    if(!clst) {
+	CRIT("Failed to query cluster status: %s", sxc_geterrmsg(sx));
+	goto setfaulty_err;
+    }
+
+    if(clst_ndists(clst) != 1) {
+	CRIT("Cluster is currently rebalancing, cannot update node status");
+	goto setfaulty_err;
+    }
+
+    for(i = 0; i < nnodes; i++) {
+	const sx_uuid_t *nid = sx_node_uuid(nodes[i]);
+	const sx_node_t *refnode = sx_nodelist_lookup(clst_nodes(clst, 0), nid);
+	if(refnode && !sx_node_cmp_addrs(nodes[i], refnode))
+	    continue;
+	CRIT("Node %lld/%s/%s/%s doesn't match any node in the cluster definition",
+	     (long long)sx_node_capacity(nodes[i]), sx_node_addr(nodes[i]), sx_node_internal_addr(nodes[i]), nid->string);
+	goto setfaulty_err;
+    }
+
+    query = malloc((UUID_STRING_SIZE+3) * nnodes + sizeof("{\"faultyNodes\":[]}"));
+    if(!query) {
+	CRIT("Out of memory when allocating the update query");
+	goto setfaulty_err;
+    }
+    query_at = lenof("{\"faultyNodes\":[");
+    strcpy(query, "{\"faultyNodes\":[");
+
+    for(i=0; i<nnodes; i++) {
+	sprintf(query + query_at, "\"%s\"%s", sx_node_uuid_str(nodes[i]), i != nnodes-1 ? "," : "]}");
+	query_at += strlen(query + query_at);
+    }
+
+    if(sxi_job_submit_and_poll(conns, NULL, REQ_PUT, ".nodes?setfaulty", query, strlen(query))) {
+	CRIT("Failed to update node health: %s", sxc_geterrmsg(sx));
+	goto setfaulty_err;
+    }
+
+    if(sxc_cluster_fetchnodes(clust) ||
+       sxc_cluster_save(clust, args->config_dir_arg))
+	WARN("Cannot update local cluster configuration: %s", sxc_geterrmsg(sx));
+
+    ret = 0;
+
+ setfaulty_err:
+    for(i = 0; i < nnodes; i++)
+	sx_node_delete(nodes[i]);
+    free(nodes);
+    free(query);
+    sxi_hostlist_empty(&usblhlist);
+    clst_destroy(clst);
+    sxc_cluster_free(clust);
+    return ret;
+}
+
 
 static int info_node(sxc_client_t *sx, const char *path, struct node_args_info *args)
 {
@@ -1038,7 +1153,7 @@ static int info_node(sxc_client_t *sx, const char *path, struct node_args_info *
     fmt_capa(dsk_used, capastr, sizeof(capastr), args->human_readable_flag);
     printf("Actual data size: %s\n", capastr);
 
-    nodes = sx_hashfs_nodelist(h, NL_NEXT);
+    nodes = sx_hashfs_all_nodes(h, NL_NEXT);
     if(nodes && sx_nodelist_count(nodes)) {
 	unsigned int i, nnodes = sx_nodelist_count(nodes);
 	const sx_node_t *self = sx_hashfs_self(h);
@@ -1059,6 +1174,67 @@ static int info_node(sxc_client_t *sx, const char *path, struct node_args_info *
     return ret;
 }
 
+/* sxadm node --rename-cluster <STORAGE_PATH> */
+static int rename_cluster(sxc_client_t *sx, const char *path, const char *name)
+{
+    int ret = 1;
+    sx_hashfs_t *h = NULL;
+    char *hpath;
+    const char *old_name;
+
+    if(!path || !name) {
+        fprintf(stderr, "Invalid argument\n");
+        return 1;
+    }
+
+    hpath = malloc(strlen(path) + 1 + sizeof("hashfs.db"));
+    if(!hpath) {
+        fprintf(stderr, "Failed to prepare storage database path\n");
+        return 1;
+    }
+    sprintf(hpath, "%s/hashfs.db", path);
+    if(access(hpath, R_OK)) {
+        if(errno == EACCES)
+            fprintf(stderr, "ERROR: Can't access %s\n", path);
+        else if(errno == ENOENT)
+            fprintf(stderr, "ERROR: No valid SX storage found at %s\n", path);
+        else
+            fprintf(stderr, "ERROR: Can't open SX storage at %s\n", path);
+        goto rename_cluster_err;
+    }
+
+    h = sx_hashfs_open(path, sx);
+    if(!h)
+        goto rename_cluster_err;
+
+    if(sx_hashfs_cluster_get_name(h, &old_name)) {
+        fprintf(stderr, "ERROR: Failed to get old cluster name\n");
+        goto rename_cluster_err;
+    }
+
+    if(!strcmp(name, old_name)) {
+        fprintf(stderr, "ERROR: New cluster name is the same as the old one\n");
+        goto rename_cluster_err;
+    }
+
+    if(!strlen(name)) {
+        fprintf(stderr, "ERROR: Cluster name is too short\n");
+        goto rename_cluster_err;
+    }
+
+    if(sx_hashfs_cluster_set_name(h, name)) {
+        fprintf(stderr, "ERROR: Failed to set cluster name\n");
+        goto rename_cluster_err;
+    }
+
+    printf("New cluster name is '%s'\n", name);
+    ret = 0;
+rename_cluster_err:
+    free(hpath);
+    sx_hashfs_close(h);
+    return ret;
+}
+
 static int force_gc_cluster(sxc_client_t *sx, struct cluster_args_info *args, int delete_reservations)
 {
     int ret;
@@ -1074,7 +1250,7 @@ static int force_gc_cluster(sxc_client_t *sx, struct cluster_args_info *args, in
     return ret;
 }
 
-void print_dist(const sx_nodelist_t *nodes) {
+static void print_dist(const sx_nodelist_t *nodes) {
     if(nodes) {
 	unsigned int i, nnodes = sx_nodelist_count(nodes);
 	for(i = 0; i < nnodes; i++) {
@@ -1095,7 +1271,7 @@ void print_dist(const sx_nodelist_t *nodes) {
 static int info_cluster(sxc_client_t *sx, struct cluster_args_info *args, int keyonly) {
     sxc_cluster_t *clust = cluster_load(sx, args, 1);
     clst_t *clst;
-    const sx_nodelist_t *nodes = NULL;
+    const sx_nodelist_t *nodes = NULL, *nodes_prev = NULL, *faulty_nodes = NULL;
     int ret = 0;
 
     if(!clust)
@@ -1119,14 +1295,23 @@ static int info_cluster(sxc_client_t *sx, struct cluster_args_info *args, int ke
 	    print_dist(nodes);
 	}
     case 1:
+	nodes_prev = clst_nodes(clst, 0);
 	if(!nodes)
-	    nodes = clst_nodes(clst, 0);
+	    nodes = nodes_prev;
 	if(!keyonly) {
 	    printf("Current configuration: ");
 	    print_dist(clst_nodes(clst, 0));
 	}
     }
 
+    faulty_nodes = clst_faulty_nodes(clst);
+    if(!keyonly && sx_nodelist_count(faulty_nodes)) {
+	printf("Faulty nodes: ");
+	print_dist(faulty_nodes);
+    }
+    
+    if(!keyonly)
+        printf("Operating mode: %s\n", clst_readonly(clst) ? "read-only" : "read-write");
     if(nodes) {
 	unsigned int i, nnodes = sx_nodelist_count(nodes), header = 0;
 	unsigned int version;
@@ -1145,11 +1330,34 @@ static int info_cluster(sxc_client_t *sx, struct cluster_args_info *args, int ke
 	    return 0;
 	}
 
+	if(nodes != nodes_prev) {
+	    unsigned int nnodes_prev = sx_nodelist_count(nodes_prev);
+	    for(i = 0; i < nnodes_prev; i++) {
+		const sx_node_t *node = sx_nodelist_get(nodes_prev, i);
+		if(!sx_nodelist_lookup(nodes, sx_node_uuid(node))) {
+		    if(!header) {
+			printf("State of operations:\n");
+			header = 1;
+		    }
+		    printf("  * node %s (%s): Node being removed from the cluster\n", sx_node_uuid_str(node), sx_node_internal_addr(node));
+		}
+	    }
+	}
+
 	sxi_hostlist_init(&hlist);
 	for(i = 0; i < nnodes; i++) {
 	    const sx_node_t *node = sx_nodelist_get(nodes, i);
 	    const char *op = NULL;
 	    clst_t *clstnode;
+
+	    if(sx_nodelist_lookup(faulty_nodes, sx_node_uuid(node))) {
+		if(!header) {
+		    printf("State of operations:\n");
+		    header = 1;
+		}
+		printf("  * node %s (%s): %s\n", sx_node_uuid_str(node), sx_node_internal_addr(node), "Faulty (this node is currently being ignored)");
+		continue;
+	    }
 
 	    if(sxi_hostlist_add_host(sx, &hlist, sx_node_internal_addr(node))) {
 		CRIT("OOM adding to hostlist");
@@ -1164,9 +1372,10 @@ static int info_cluster(sxc_client_t *sx, struct cluster_args_info *args, int ke
 		ret = 1;
 		continue;
 	    }
-	    if(clst_rebalance_state(clstnode, &op) != CLSTOP_NOTRUNNING || clst_replace_state(clstnode, &op) != CLSTOP_NOTRUNNING) {
+	    if(clst_rebalance_state(clstnode, &op) != CLSTOP_NOTRUNNING || clst_replace_state(clstnode, &op) != CLSTOP_NOTRUNNING ||
+               clst_upgrade_state(clstnode, &op) != CLSTOP_NOTRUNNING) {
 		if(!header) {
-		    printf("Operations in progress:\n");
+		    printf("State of operations:\n");
 		    header = 1;
 		}
 		printf("  * node %s (%s): %s\n", sx_node_uuid_str(node), sx_node_internal_addr(node), op);
@@ -1335,6 +1544,291 @@ extract_node_err:
     return ret;
 }
 
+static void print_status(sxc_client_t *sx, int http_code, const sxi_node_status_t *status, int human_readable) {
+    char str[64];
+
+    if(!sx)
+        return;
+
+    if(!status) {
+        printf("ERROR: %s\n\n", sxc_geterrmsg(sx));
+        return;
+    }
+
+    printf("Node %s status:\n", status->uuid);
+    printf("    Versions:\n");
+    printf("        SX: %s\n", status->libsx_version);
+    printf("        HashFS: %s\n", status->hashfs_version);
+    printf("    System:\n");
+    printf("        Name: %s\n", status->os_name);
+    printf("        Architecture: %s\n", status->os_arch);
+    printf("        Release: %s\n", status->os_release);
+    printf("        Version: %s\n", status->os_version);
+    printf("        CPU(s): %d\n", status->cores);
+    printf("        Endianness: %s\n", status->endianness);
+    printf("        Local time: %s\n", status->localtime);
+    printf("        UTC time: %s\n", status->utctime);
+    printf("    Network:\n");
+    printf("        Public address: %s\n", status->addr);
+    printf("        Internal address: %s\n", status->internal_addr);
+    printf("    Storage:\n");
+    printf("        Storage directory: %s\n", status->storage_dir);
+    fmt_capa(status->storage_allocated, str, sizeof(str), human_readable);
+    printf("        Allocated space: %s\n", str);
+    fmt_capa(status->storage_commited, str, sizeof(str), human_readable);
+    printf("        Used space: %s\n", str);
+    printf("    Storage filesystem:\n");
+    fmt_capa(status->block_size, str, sizeof(str), human_readable);
+    printf("        Block size: %s\n", str);
+    fmt_capa(status->block_size * status->total_blocks, str, sizeof(str), human_readable);
+    printf("        Total size: %s\n", str);
+    fmt_capa(status->block_size * status->avail_blocks, str, sizeof(str), human_readable);
+    printf("        Available: %s\n", str);
+    if(status->total_blocks && status->avail_blocks) /* Avoid division by 0 */
+        printf("        Used: %.2lf%%\n", (double)(status->total_blocks - status->avail_blocks) * 100.0 / status->total_blocks);
+    else
+        printf("        Used: N/A\n");
+    
+    printf("    Memory:\n");
+    fmt_capa(status->mem_total, str, sizeof(str), human_readable);
+    printf("        Total: %s\n", str);
+
+    /*printf("    Heal: %s\n", status->heal_status);*/
+    printf("\n");
+}
+
+static int cluster_status(sxc_client_t *sx, struct cluster_args_info *args) {
+    sxc_cluster_t *clust = cluster_load(sx, args, 1);
+    int ret;
+
+    if(!clust) {
+        fprintf(stderr, "ERROR: Failed to load cluster\n");
+        return 1;
+    }
+
+    ret = sxi_cluster_status(clust, print_status, args->human_readable_given);
+    if(ret)
+        fprintf(stderr, "ERROR: %s\n", sxc_geterrmsg(sx));
+
+    sxc_cluster_free(clust);
+    return ret;
+}
+
+enum mismatch {
+    NONE=0,
+    MISMATCH_STORAGE_VERSION,
+    MISMATCH_LIBSX_VERSION,
+    MISMATCH_OLD_VERSION,
+    MISMATCH_NOREPLY,
+    MISMATCH_OFFLINE,
+};
+static int check_upgrade_mismatch;
+static int upgrade_complete;
+static int upgrade_nodes;
+
+static void check_status(sxc_client_t *sx, int http_code, const sxi_node_status_t *status, int human_readable)
+{
+    static sxi_node_status_t last_status;
+    static int has_last_status = 0;
+    if (!sx)
+        return;
+    upgrade_nodes++;
+    if (!status) {
+        if (http_code == -1)
+            check_upgrade_mismatch |= 1 << MISMATCH_OFFLINE;
+        else if (sxc_geterrnum(sx) == SXE_EAGAIN)
+            check_upgrade_mismatch |= 1 << MISMATCH_OLD_VERSION;
+        else
+            check_upgrade_mismatch |= 1 << MISMATCH_NOREPLY;
+        fprintf(stderr, "ERROR: %s\n", sxc_geterrmsg(sx));
+        return;
+    }
+    printf("\t%s: %s (%s)\n", status->addr, status->hashfs_version, status->libsx_version);
+    if (!has_last_status) {
+        memcpy(&last_status, status, sizeof(last_status));
+        has_last_status = 1;
+    } else if (strcmp(last_status.hashfs_version, status->hashfs_version))
+        check_upgrade_mismatch |= 1 << MISMATCH_STORAGE_VERSION;
+    else if (strcmp(last_status.libsx_version, status->libsx_version))
+        check_upgrade_mismatch |= 1 << MISMATCH_LIBSX_VERSION;
+    if (!strcmp(status->heal_status, "DONE"))
+        upgrade_complete++;
+}
+
+static int cluster_upgrade(sxc_client_t *sx, struct cluster_args_info *args) {
+    sxc_cluster_t *clust = cluster_load(sx, args, 1);
+    int ret;
+
+    if(!clust) {
+        fprintf(stderr, "ERROR: Failed to load cluster\n");
+        return 1;
+    }
+
+    printf("Versions:\n");
+    ret = sxi_cluster_status(clust, check_status, 0);
+    if(ret)
+        fprintf(stderr, "ERROR: %s\n", sxc_geterrmsg(sx));
+    if (check_upgrade_mismatch) {
+        fprintf(stderr, "Warning: Upgrade aborted\n");
+        if (check_upgrade_mismatch & (1 << MISMATCH_OFFLINE))
+            fprintf(stderr,"\tSome nodes are offline\n");
+        if (check_upgrade_mismatch & (1 << MISMATCH_NOREPLY))
+            fprintf(stderr,"\tNot all replies could be parsed\n");
+        if (check_upgrade_mismatch & (1 << MISMATCH_OLD_VERSION))
+            fprintf(stderr,"\tSome nodes are still running version 1.0\n");
+        if (check_upgrade_mismatch & (1 << MISMATCH_STORAGE_VERSION))
+            fprintf(stderr,"\tSome nodes are still running an old server version\n");
+        if (check_upgrade_mismatch & (1 << MISMATCH_LIBSX_VERSION))
+            fprintf(stderr,"\tlibsx versions don't match\n");
+        ret = 1;
+    } else {
+        if (upgrade_complete == upgrade_nodes) {
+            printf("Cluster already fully upgraded\n");
+	    ret = 2;
+        } else {
+            printf("Triggering upgrade and garbage collector\n");
+            ret = force_gc_cluster(sx, args, 0);
+        }
+    }
+
+    sxc_cluster_free(clust);
+    return ret;
+}
+
+static int cluster_dist_lock(sxc_client_t *sx, struct cluster_args_info *args) {
+    sxc_cluster_t *cluster = cluster_load(sx, args, 1);
+    int ret;
+
+    if(!cluster)
+        return 1;
+    ret = sxi_cluster_distribution_lock(cluster, args->locking_node_given ? args->locking_node_arg : NULL);
+    sxc_cluster_free(cluster);
+    if(ret)
+        fprintf(stderr, "ERROR: %s\n", sxc_geterrmsg(sx));
+    else
+        printf("Successfully locked cluster for changes\n");
+    return ret;
+}
+
+static int cluster_dist_unlock(sxc_client_t *sx, struct cluster_args_info *args) {
+    sxc_cluster_t *cluster = cluster_load(sx, args, 1);
+    int ret;
+
+    if(!cluster)
+        return 1;
+    ret = sxi_cluster_distribution_unlock(cluster, args->locking_node_given ? args->locking_node_arg : NULL);
+    sxc_cluster_free(cluster);
+    if(ret)
+        fprintf(stderr, "ERROR: %s\n", sxc_geterrmsg(sx));
+    else
+        printf("Successfully unlocked cluster\n");
+    return ret;
+}
+
+static int cluster_set_mode(sxc_client_t *sx, struct cluster_args_info *args) {
+    sxc_cluster_t *cluster;
+    int ret;
+    int readonly = 0;
+
+    if(!args || !args->set_mode_arg) {
+        fprintf(stderr, "ERROR: Invalid argument\n");
+        return 1;
+    }
+
+    if(!strcmp(args->set_mode_arg, "ro"))
+        readonly = 1;
+    else if(strcmp(args->set_mode_arg, "rw")) {
+        fprintf(stderr, "ERROR: Invalid argument\n");
+        return 1;
+    }
+
+    cluster = cluster_load(sx, args, 1);
+    if(!cluster)
+        return 1;
+    ret = sxi_cluster_set_mode(cluster, readonly);
+    sxc_cluster_free(cluster);
+    if(ret)
+        fprintf(stderr, "ERROR: %s\n", sxc_geterrmsg(sx));
+    else
+        printf("Successfully switched cluster to %s mode\n", readonly ? "read-only" : "read-write");
+    return ret;
+}
+
+static int upgrade_node(sxc_client_t *sx, const char *path)
+{
+    unsigned hpath_len = strlen(path) + 1 + sizeof("hashfs.db");
+    char *hpath = wrap_malloc(hpath_len);
+    if (!hpath)
+        return 1;
+    snprintf(hpath, hpath_len, "%s/hashfs.db", path);
+    if (access(hpath, R_OK)) {
+	if(errno == EACCES)
+	    fprintf(stderr, "ERROR: Can't access %s\n", path);
+	else if(errno == ENOENT)
+	    fprintf(stderr, "ERROR: No valid SX storage found at %s\n", path);
+	else
+	    fprintf(stderr, "ERROR: Can't open SX storage at %s\n", path);
+	free(hpath);
+	return 1;
+    }
+    free(hpath);
+    log_setminlevel(sx, SX_LOG_INFO);
+    rc_ty rc = sx_storage_upgrade(path);
+    if (rc) {
+        fprintf(stderr, "ERROR: Failed to upgrade storage at path %s: %s\n", path, rc2str(rc));
+        return 1;
+    }
+    sx_hashfs_t *h = sx_hashfs_open(path, sx);
+    if (!h)
+        return 1;
+    if (sx_storage_is_bare(h)) {
+        sx_hashfs_close(h);
+        INFO("Bare node storage is up to date");
+        return 0;
+    }
+    job_t job_id = -1;
+    sx_nodelist_t *local = sx_nodelist_new();
+    if (local &&
+        !sx_nodelist_add(local, sx_node_dup(sx_hashfs_self(h)))) {
+        rc = sx_hashfs_job_new(h, 0, &job_id, JOBTYPE_UPGRADE_1_0_TO_1_1, JOB_NO_EXPIRY, "UPGRADE", &job_id, sizeof(job_id), local);
+        if (rc) {
+            if (rc == FAIL_LOCKED)
+                job_id = 0;
+            else
+                fprintf(stderr, "ERROR: Failed to insert upgrade job: %s (%s)\n", rc2str(rc), msg_get_reason());
+        }
+    } else {
+        fprintf(stderr, "Failed to allocate nodelist\n");
+    }
+    sx_nodelist_delete(local);
+    sx_hashfs_close(h);
+    if (job_id == -1)
+        return -1;
+    INFO("Storage is up to date");
+    return 0;
+}
+
+static int upgrade_job_node(sxc_client_t *sx, const char *path)
+{
+    log_setminlevel(sx, SX_LOG_INFO);
+    sx_hashfs_t *hashfs = sx_hashfs_open(path, sx);
+    if (!hashfs)
+        return 1;
+    rc_ty s;
+    do {
+        if ((s = sx_hashfs_upgrade_1_0_prepare(hashfs))) {
+            WARN("Failed to prepare upgrade job: %s", rc2str(s));
+            break;
+        }
+        if ((s = sx_hashfs_upgrade_1_0_local(hashfs))) {
+            WARN("Failed to run upgrade job: %s", rc2str(s));
+            break;
+        }
+    } while(0);
+    sx_hashfs_close(hashfs);
+    return s == OK ? 0 : 1;
+}
+
 int main(int argc, char **argv) {
     struct main_args_info main_args;
     struct node_args_info node_args;
@@ -1364,6 +1858,8 @@ int main(int argc, char **argv) {
 	    return 1;
         }
 	sxc_set_debug(sx, node_args.debug_flag);
+        if (node_args.debug_flag)
+            log_setminlevel(sx, SX_LOG_DEBUG);
 	if(node_args.version_given) {
 	    printf("%s %s\n", MAIN_CMDLINE_PARSER_PACKAGE, src_version());
 	    ret = 0;
@@ -1378,12 +1874,22 @@ int main(int argc, char **argv) {
 	}
 	if(node_args.new_given)
 	    ret = create_node(&node_args);
-	else if(node_args.info_given)
-	    ret = info_node(sx, node_args.inputs[0], &node_args);
-        else if(node_args.check_given)
-            ret = check_node(sx, node_args.inputs[0], node_args.debug_flag);
-        else if(node_args.extract_given)
-            ret = extract_node(sx, node_args.inputs[0], node_args.extract_arg);
+	else {
+            if(handle_owner(&node_args))
+                ret = 1;
+            else if(node_args.info_given)
+                ret = info_node(sx, node_args.inputs[0], &node_args);
+            else if(node_args.check_given)
+                ret = check_node(sx, node_args.inputs[0], node_args.debug_flag);
+            else if(node_args.extract_given)
+                ret = extract_node(sx, node_args.inputs[0], node_args.extract_arg);
+            else if(node_args.rename_cluster_given)
+                ret = rename_cluster(sx, node_args.inputs[0], node_args.rename_cluster_arg);
+            else if(node_args.upgrade_given)
+                ret = upgrade_node(sx, node_args.inputs[0]);
+            else if(node_args.upgrade_job_given)
+                ret = upgrade_job_node(sx, node_args.inputs[0]);
+        }
     node_out:
 	node_cmdline_parser_free(&node_args);
         sx_done(&sx);
@@ -1408,16 +1914,28 @@ int main(int argc, char **argv) {
 	    ret = info_cluster(sx, &cluster_args, 0);
 	else if(cluster_args.get_cluster_key_given && cluster_args.inputs_num == 1)
 	    ret = info_cluster(sx, &cluster_args, 1);
-	else if(cluster_args.mod_given && cluster_args.inputs_num >= 2)
+	else if(cluster_args.modify_given && cluster_args.inputs_num >= 2)
 	    ret = change_cluster(sx, &cluster_args);
+        else if(cluster_args.lock_given && cluster_args.inputs_num == 1)
+            ret = cluster_dist_lock(sx, &cluster_args);
+        else if(cluster_args.unlock_given && cluster_args.inputs_num == 1)
+            ret = cluster_dist_unlock(sx, &cluster_args);
 	else if(cluster_args.resize_given && cluster_args.inputs_num == 1)
 	    ret = resize_cluster(sx, &cluster_args);
 	else if(cluster_args.replace_faulty_given && cluster_args.inputs_num >= 2)
 	    ret = replace_nodes(sx, &cluster_args);
+	else if(cluster_args.set_faulty_given && cluster_args.inputs_num >= 2)
+	    ret = setfaulty_nodes(sx, &cluster_args);
 	else if(cluster_args.force_gc_given && cluster_args.inputs_num == 1)
 	    ret = force_gc_cluster(sx, &cluster_args, 0);
 	else if(cluster_args.force_expire_given && cluster_args.inputs_num == 1)
 	    ret = force_gc_cluster(sx, &cluster_args, 1);
+        else if(cluster_args.list_nodes_given && cluster_args.inputs_num == 1)
+            ret = cluster_status(sx, &cluster_args);
+        else if(cluster_args.set_mode_given && cluster_args.inputs_num == 1)
+            ret = cluster_set_mode(sx, &cluster_args);
+        else if(cluster_args.upgrade_given && cluster_args.inputs_num == 1)
+            ret = cluster_upgrade(sx, &cluster_args);
 	else
 	    cluster_cmdline_parser_print_help();
     cluster_out:
