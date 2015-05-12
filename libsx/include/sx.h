@@ -52,8 +52,12 @@ typedef enum {
 } sxc_input_t;
 typedef int (*sxc_input_cb)(sxc_client_t *sx, sxc_input_t type, const char *prompt, const char *def, char *in, unsigned int insize, void *ctx);
 
+int sxc_lib_init(const char *client_version);
+sxc_client_t *sxc_client_init(const sxc_logger_t *func, sxc_input_cb input_cb, void *input_ctx);
 sxc_client_t *sxc_init(const char *client_version, const sxc_logger_t *func, sxc_input_cb input_cb, void *input_ctx);
 const char *sxc_get_version(void);
+void sxc_client_shutdown(sxc_client_t *sx, int signal);
+void sxc_lib_shutdown(int signal);
 void sxc_shutdown(sxc_client_t *sx, int signal);
 void sxc_set_debug(sxc_client_t *sx, int enabled);
 void sxc_set_verbose(sxc_client_t *sx, int enabled);
@@ -127,7 +131,8 @@ int sxc_cluster_trigger_gc(sxc_cluster_t *cluster, int delete_reservations);
 
 typedef struct _sxc_cluster_lu_t sxc_cluster_lu_t;
 sxc_cluster_lu_t *sxc_cluster_listusers(sxc_cluster_t *cluster);
-int sxc_cluster_listusers_next(sxc_cluster_lu_t *lu, char **user_name, int *is_admin);
+sxc_cluster_lu_t *sxc_cluster_listclones(sxc_cluster_t *cluster, const char *username);
+int sxc_cluster_listusers_next(sxc_cluster_lu_t *lu, char **user_name, int *is_admin, char **desc);
 void sxc_cluster_listusers_free(sxc_cluster_lu_t *lu);
 
 typedef struct _sxc_cluster_la_t sxc_cluster_la_t;
@@ -138,14 +143,16 @@ void sxc_cluster_listaclusers_free(sxc_cluster_la_t *la);
 typedef struct _sxi_ht_t sxc_meta_t;
 typedef struct _sxc_cluster_lv_t sxc_cluster_lv_t;
 sxc_cluster_lv_t *sxc_cluster_listvolumes(sxc_cluster_t *cluster, int get_meta);
-int sxc_cluster_listvolumes_next(sxc_cluster_lv_t *lv, char **volume_name, int64_t *volume_used_size, int64_t *volume_size, unsigned int *replica_count, unsigned int *revisions, char privs[3], sxc_meta_t **meta);
+int sxc_cluster_listvolumes_next(sxc_cluster_lv_t *lv, char **volume_name, char **volume_owner, int64_t *volume_used_size, int64_t *volume_size, unsigned int *replica_count, unsigned int *revisions, char privs[3], sxc_meta_t **meta);
 void sxc_cluster_listvolumes_free(sxc_cluster_lv_t *lv);
 
 typedef struct _sxc_cluster_lf_t sxc_cluster_lf_t;
 sxc_cluster_lf_t *sxc_cluster_listfiles(sxc_cluster_t *cluster, const char *volume, const char *glob_pattern, int recursive, int64_t *volume_used_size, int64_t *volume_size, unsigned int *replica_count, unsigned int *nfiles, int reverse);
+sxc_cluster_lf_t *sxc_cluster_listfiles_etag(sxc_cluster_t *cluster, const char *volume, const char *glob_pattern, int recursive, int64_t *volume_used_size, int64_t *volume_size, unsigned int *replica_count, unsigned int *nfiles, int reverse, const char *etag_file);
 int sxc_cluster_listfiles_next(sxc_cluster_lf_t *lf, char **file_name, int64_t *file_size, time_t *file_created_at, char **file_revision);
 int sxc_cluster_listfiles_prev(sxc_cluster_lf_t *lf, char **file_name, int64_t *file_size, time_t *file_created_at, char **file_revision);
 void sxc_cluster_listfiles_free(sxc_cluster_lf_t *lf);
+void sxc_cluster_listvolumes_reset(sxc_cluster_lv_t *lv);
 
 /*
  * Set active connections limits.
@@ -153,6 +160,22 @@ void sxc_cluster_listfiles_free(sxc_cluster_lf_t *lf);
  * max_active_per_host - maximal number of running connections with each host.
  */
 int sxc_cluster_set_conns_limit(sxc_cluster_t *cluster, unsigned int max_active, unsigned int max_active_per_host);
+
+/* Return configuration link that can be passed to cluster users */
+char *sxc_cluster_configuration_link(sxc_cluster_t *cluster, const char *username, const char *token);
+
+/*
+ * Return configuration link returned by sxaduthd
+ *
+ * uri: should be in form: https://[username@]host/
+ * unique: A unique name for sxauthd authentication that will be used for that particular account (device)
+ * display_name: A user friendly name that can be used to display while accessing device (can be non-unique)
+ * pass_file: A file name that contains user password, if not NULL, can be used instead of reading stdin.
+ * quiet: Do not prompt for cluster certificate when set to 1.
+ */
+char *sxc_fetch_sxauthd_credentials(sxc_client_t *sx, const char *username, const char *pass, const char *host, int port, int quiet);
+
+int sxc_read_pass_file(sxc_client_t *sx, const char *pass_file, char *pass, unsigned int pass_len);
 
 /* Transfer direction */
 typedef enum { SXC_XFER_DIRECTION_DOWNLOAD = 1, SXC_XFER_DIRECTION_UPLOAD = 2, SXC_XFER_DIRECTION_BOTH = 3 } sxc_xfer_direction_t;
@@ -264,8 +287,8 @@ typedef struct _sxc_exclude_t sxc_exclude_t;
 sxc_exclude_t *sxc_exclude_init(sxc_client_t *sx, const char **patterns, unsigned int npatterns, int mode);
 void sxc_exclude_delete(sxc_exclude_t *e);
 
-int sxc_copy(sxc_file_t *source, sxc_file_t *dest, int recursive, int onefs, int ignore_errors, const sxc_exclude_t *exclude);
-int sxc_copy_sxfile(sxc_file_t *source, sxc_file_t *dest);
+int sxc_copy(sxc_file_t *source, sxc_file_t *dest, int recursive, int onefs, int ignore_errors, const sxc_exclude_t *exclude, int fail_same_file);
+int sxc_copy_sxfile(sxc_file_t *source, sxc_file_t *dest, int fail_same_file);
 int sxc_cat(sxc_file_t *source, int dest);
 
 typedef struct _sxc_file_list_t sxc_file_list_t;
@@ -277,7 +300,7 @@ void sxc_file_list_free(sxc_file_list_t *sx);/* frees contained sx_file_t too */
 unsigned sxc_file_list_get_total(const sxc_file_list_t *lst);
 unsigned sxc_file_list_get_successful(const sxc_file_list_t *lst);
 
-int sxc_rm(sxc_file_list_t *target);
+int sxc_rm(sxc_file_list_t *target, int ignore_errors);
 int sxc_remove_sxfile(sxc_file_t *file);
 
 
@@ -293,16 +316,32 @@ int sxc_meta_setval_fromhex(sxc_meta_t *meta, const char *key, const char *value
 void sxc_meta_delval(sxc_meta_t *meta, const char *key);
 void sxc_meta_empty(sxc_meta_t *meta);
 
-char *sxc_user_add(sxc_cluster_t *cluster, const char *username, int admin, const char *oldtoken);
-int sxc_user_remove(sxc_cluster_t *cluster, const char *username);
-int sxc_user_getkey(sxc_cluster_t *cluster, const char *username, FILE *storeauth);
-char *sxc_user_newkey(sxc_cluster_t *cluster, const char *username, const char *oldtoken);
+/* Prompt for username */
+int sxc_prompt_username(sxc_client_t *sx, char *buff, unsigned int bufflen, const char *prefix);
+/* Prompt for user password */
+int sxc_prompt_password(sxc_client_t *sx, char *buff, unsigned int buff_len, const char *prefix, int repeat);
+/* Return authentication token based on user name and password */
+int sxc_pass2token(sxc_cluster_t *cluster, const char *username, const char *password, char *tok_buf, unsigned int tok_size);
 
-char *sxc_cluster_whoami(sxc_cluster_t *cluster);
+char *sxc_user_add(sxc_cluster_t *cluster, const char *username, const char *pass, int admin, const char *oldtoken, const char *desc, int generate_key);
+/*
+ * Clone existing user
+ * username: existing user name
+ * clonename: clone name
+ * oldtoken: old authorisation token that will assigned to newly created clone
+ * role: will receive cloned user role (same as existing users' role)
+ * desc: human readable description of the user
+ */
+char *sxc_user_clone(sxc_cluster_t *cluster, const char *username, const char *clonename, const char *oldtoken, int *role, const char *desc);
+int sxc_user_remove(sxc_cluster_t *cluster, const char *username, int remove_clones);
+int sxc_user_getinfo(sxc_cluster_t *cluster, const char *username, FILE *storeauth, int *is_admin, int get_config_link);
+char *sxc_user_newkey(sxc_cluster_t *cluster, const char *username, const char *pass, const char *oldtoken, int generate_key);
+
+int sxc_cluster_whoami(sxc_cluster_t *cluster, char **user, char **role);
 
 int sxc_volume_add(sxc_cluster_t *cluster, const char *name, int64_t size, unsigned int replica, unsigned int revisions, sxc_meta_t *metadata, const char *owner);
 int sxc_volume_remove(sxc_cluster_t *cluster, const char *name);
-int sxc_volume_modify(sxc_cluster_t *cluster, const char *volume, const char *newowner, int64_t newsize);
+int sxc_volume_modify(sxc_cluster_t *cluster, const char *volume, const char *newowner, int64_t newsize, int max_revs);
 int sxc_volume_acl(sxc_cluster_t *cluster, const char *url,
                   const char *user, const char *grant, const char *revoke);
 
@@ -332,13 +371,15 @@ typedef struct _sxc_uri_t {
 
 sxc_uri_t *sxc_parse_uri(sxc_client_t *sx, const char *uri);
 void sxc_free_uri(sxc_uri_t *uri);
+/* Print basic cluster information */
+int sxc_cluster_info(sxc_cluster_t *cluster, const char *profile, const char *host);
 
 int sxc_fgetline(sxc_client_t *sx, FILE *f, char **ret);
 
 int sxc_input_fn(sxc_client_t *sx, sxc_input_t type, const char *prompt, const char *def, char *in, unsigned int insize, void *ctx); /* default input function */
 
 /* filters */
-#define SXF_ABI_VERSION	9
+#define SXF_ABI_VERSION	10
 
 /** Defines a filter's type
  * This is used to prioritize filters, for example
@@ -572,6 +613,11 @@ int sxc_filter_get_input(const sxf_handle_t *h, sxc_input_t type, const char *pr
 
 /* Escape string */
 char *sxc_escstr(char *str);
+
+/* URL-decode string */
+char *sxc_urldecode(sxc_client_t *sx, const char *s);
+
+int sxc_set_node_preference(sxc_client_t *sx, float preference);
 
 #ifdef __cplusplus
 } /* extern "C" */

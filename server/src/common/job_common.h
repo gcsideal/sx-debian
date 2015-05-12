@@ -49,7 +49,7 @@ typedef enum _jobtype_t {
     JOBTYPE_CREATE_USER,
     JOBTYPE_VOLUME_ACL,
     JOBTYPE_REPLICATE_BLOCKS,
-    JOBTYPE_FLUSH_FILE,
+    JOBTYPE_FLUSH_FILE_REMOTE,
     JOBTYPE_DELETE_FILE,
     JOBTYPE_DISTRIBUTION,
     JOBTYPE_STARTREBALANCE,
@@ -66,6 +66,13 @@ typedef enum _jobtype_t {
     JOBTYPE_REPLACE_BLOCKS,
     JOBTYPE_REPLACE_FILES,
     JOBTYPE_DUMMY,
+    JOBTYPE_REVSCLEAN,
+    JOBTYPE_DISTLOCK,
+    JOBTYPE_CLUSTER_MODE,
+    JOBTYPE_IGNODES,
+    JOBTYPE_BLOCKS_REVISION,
+    JOBTYPE_FLUSH_FILE_LOCAL,
+    JOBTYPE_UPGRADE_1_0_TO_1_1,
 } jobtype_t;
 
 typedef enum {
@@ -84,7 +91,7 @@ typedef struct {
     int (*to_blob)(sxc_client_t *sx, int nodes, void *ctx, sx_blob_t *blob);
     rc_ty (*execute_blob)(struct _sx_hashfs_t *hashfs, sx_blob_t *blob, jobphase_t phase, int remote);
     sxi_query_t* (*proto_from_blob)(sxc_client_t *sx, sx_blob_t *blob, jobphase_t phase);
-    int (*nodes)(sxc_client_t *sx, sx_blob_t *blob, sx_nodelist_t **nodes);
+    int (*nodes)(struct _sx_hashfs_t *hashfs, sx_blob_t *blob, sx_nodelist_t **nodes);
     unsigned (*timeout)(sxc_client_t *sx, int nodes);
 } job_2pc_t;
 
@@ -93,6 +100,8 @@ extern const job_2pc_t user_spec;
 extern const job_2pc_t userdel_spec;
 extern const job_2pc_t user_newkey_spec;
 extern const job_2pc_t volmod_spec;
+extern const job_2pc_t cluster_mode_spec;
+extern const job_2pc_t revision_spec;
 
 void job_2pc_handle_request(sxc_client_t *sx, const job_2pc_t *spec, void *yctx);
 #endif

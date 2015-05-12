@@ -31,6 +31,7 @@
 #include <errno.h>
 #include <unistd.h>
 #include <pwd.h>
+#include <fcntl.h>
 
 #include "libsx-int.h"
 #include "cluster.h"
@@ -42,6 +43,9 @@
 #include "curlevents.h"
 #include "vcrypto.h"
 #include "misc.h"
+#include <sys/mman.h>
+
+#define BCRYPT_TOKEN_ITERATIONS_LOG2 12
 
 struct _sxc_cluster_t {
     sxc_client_t *sx;
@@ -115,20 +119,21 @@ void sxc_cluster_free(sxc_cluster_t *cluster) {
     }
 }
 
-int sxc_cluster_set_dnsname(sxc_cluster_t *cluster, const char *dnsname) {
+int sxi_conns_resolve_hostlist(sxi_conns_t *conns) {
     struct addrinfo *res, *ungai;
     sxc_client_t *sx;
     sxi_hostlist_t dns_nodes;
     int rc;
+    const char *dnsname;
 
-    if (!cluster || sxi_conns_set_dnsname(cluster->conns, dnsname))
+    if(!conns)
         return 1;
-    if (!dnsname)
-        return 0;
-    sx = sxi_cluster_get_client(cluster);
+    sx = sxi_conns_get_client(conns);
+    dnsname = sxi_conns_get_dnsname(conns);
     if((rc = getaddrinfo(dnsname, NULL, NULL, &res)))
-	return 0;
+        return 0;
 
+    SXDEBUG("Resolving host name: %s", dnsname);
     sxi_hostlist_init(&dns_nodes);
     ungai = res;
     for(; res; res = res->ai_next) {
@@ -143,13 +148,22 @@ int sxc_cluster_set_dnsname(sxc_cluster_t *cluster, const char *dnsname) {
             continue;
         if(!inet_ntop(res->ai_family, addr, buf, sizeof(buf)))
             continue;
+        SXDEBUG("Adding DNS-resolved host '%s'", buf);
         if(sxi_hostlist_add_host(sx, &dns_nodes, buf))
             continue; /* FIXME: !? */
     }
     freeaddrinfo(ungai);
-    rc = sxi_hostlist_add_list(sx, sxi_conns_get_hostlist(cluster->conns), &dns_nodes);
+    rc = sxi_hostlist_add_list(sx, sxi_conns_get_hostlist(conns), &dns_nodes);
     sxi_hostlist_empty(&dns_nodes);
     return rc;
+}
+
+int sxc_cluster_set_dnsname(sxc_cluster_t *cluster, const char *dnsname) {
+    if (!cluster || sxi_conns_set_dnsname(cluster->conns, dnsname))
+        return 1;
+    if (!dnsname)
+        return 0;
+    return sxi_conns_resolve_hostlist(cluster->conns);
 }
 
 int sxc_cluster_set_sslname(sxc_cluster_t *cluster, const char *sslname) {
@@ -423,13 +437,53 @@ sxc_cluster_t *sxc_cluster_load(sxc_client_t *sx, const char *config_dir, const 
 	    break;
 	}
 	while((dent = readdir(d))) {
+            double ul_speed = 0.0, dl_speed = 0.0;
+            FILE *nodef;
+            char *node_fname;
+            unsigned int node_fname_len;
+
 	    if(dent->d_name[0] == '.' && (dent->d_name[1] == '\0' || (dent->d_name[1] == '.' && dent->d_name[2] == '\0')))
 		continue;
-	    if(sxc_cluster_add_host(cluster, dent->d_name)) {
-		SXDEBUG("failed to add node %s", dent->d_name);
-		err = 1;
-		break;
-	    }
+            if(sxc_cluster_add_host(cluster, dent->d_name)) {
+                SXDEBUG("failed to add node %s", dent->d_name);
+                err = 1;
+                break;
+            }
+            node_fname_len = confdir_len + strlen("/nodes") + strlen(dent->d_name) + 2;
+            node_fname = malloc(node_fname_len);
+            if(!node_fname) {
+                SXDEBUG("OOM allocating node file path");
+                sxi_seterr(sx, SXE_EMEM, "Cannot load cluster config: Out of memory");
+                err = 1;
+                break;
+            }
+            snprintf(node_fname, node_fname_len, "%s/%s", fname, dent->d_name);
+            if(!(nodef = fopen(node_fname, "r"))) {
+                SXDEBUG("Failed to open node file %s for reading", node_fname);
+                sxi_setsyserr(sx, SXE_ECFG, "Cannot load cluster config: Cannot open node file %s", dent->d_name);
+                err = 1;
+                free(node_fname);
+                break;
+            }
+            if(fscanf(nodef, "UploadSpeed=%lf\nDownloadSpeed=%lf\n", &ul_speed, &dl_speed) != 2)
+                SXDEBUG("Nodes speeds are not present, use 0.0");
+            else {
+                if(sxi_set_host_speed_stats(cluster->conns, dent->d_name, ul_speed, dl_speed)) {
+                    SXDEBUG("Failed to set host %s speed", dent->d_name);
+                    err = 1;
+                    if(fclose(nodef))
+                        SXDEBUG("Failed to close node file %s", node_fname);
+                    free(node_fname);
+                    break;
+                }
+            }
+            if(fclose(nodef)) {
+                SXDEBUG("Failed to close node file %s", node_fname);
+                err = 1;
+                free(node_fname);
+                break;
+            }
+            free(node_fname);
 	}
 	closedir(d);
 	if(err)
@@ -542,6 +596,73 @@ sxc_cluster_t *sxc_cluster_load(sxc_client_t *sx, const char *config_dir, const 
     free(fname);
     sxc_cluster_free(cluster);
     return NULL;
+}
+
+/* Print basic cluster information */
+int sxc_cluster_info(sxc_cluster_t *cluster, const char *profile, const char *host) {
+    sxc_client_t *sx;
+    const char *dnsname;
+    int port, secure;
+    sxi_hostlist_t *hlist;
+    struct sxi_access *access;
+    char *config_link;
+
+    if(!cluster)
+        return 1;
+    sx = sxi_cluster_get_client(cluster);
+    if(!host) {
+        sxi_seterr(sx, SXE_EARG, "NULL argument");
+        return 1;
+    }
+
+    access = sxc_cluster_get_access(cluster, profile);
+    if(!access || !access->auth) {
+        sxi_seterr(sx, SXE_ECFG, "Failed to get user access");
+        return 1;
+    }
+
+    dnsname = sxc_cluster_get_dnsname(cluster);
+    port = sxc_cluster_get_httpport(cluster);
+    secure = sxi_conns_is_secure(sxi_cluster_get_conns(cluster));
+    if(!port) {
+        /* Handle default ports */
+        if(secure)
+           port = 443;
+        else
+           port = 80;
+    }
+
+    printf("Cluster name: %s\n", sxc_cluster_get_sslname(cluster));
+    if(dnsname && strcmp(dnsname, host))
+        printf("Cluster DNS name: %s\n", dnsname);
+    printf("Cluster UUID: %s\n", sxc_cluster_get_uuid(cluster));
+
+    hlist = sxi_conns_get_hostlist(sxi_cluster_get_conns(cluster));
+    if(hlist) {
+        unsigned int i;
+
+        printf("Nodes: ");
+        for(i = 0; i < sxi_hostlist_get_count(hlist); i++)
+            printf("%s%s", i ? ", " : "", sxi_hostlist_get_host(hlist, i));
+        printf("\n");
+    }
+
+    printf("Port: %d\n", port);
+    printf("Use SSL: %s\n", secure ? "yes" : "no");
+    if(secure && cluster->cafile)
+        printf("CA file: %s\n", cluster->cafile);
+
+    printf("Current profile: %s\n", profile ? profile : "default");
+    printf("Configuration directory: %s\n", cluster->config_dir);
+    printf("libsx version: %s\n", sxc_get_version());
+
+    config_link = sxc_cluster_configuration_link(cluster, profile, access->auth);
+    if(!config_link)
+        return 1;
+    printf("Configuration link: %s\n", config_link);
+
+    free(config_link);
+    return 0;
 }
 
 int64_t sxc_cluster_get_bandwidth_limit(sxc_client_t *sx, const sxc_cluster_t *cluster) {
@@ -686,6 +807,7 @@ static int yacb_fetchnodes_end_map(void *ctx) {
 static int fetchnodes_setup_cb(curlev_context_t *cbdata, void *ctx, const char *host) {
     struct cb_fetchnodes_ctx *yactx = (struct cb_fetchnodes_ctx *)ctx;
 
+    yactx->cbdata = cbdata; /* must set before using CBDEBUG */
     if(yactx->yh)
 	yajl_free(yactx->yh);
 
@@ -696,7 +818,6 @@ static int fetchnodes_setup_cb(curlev_context_t *cbdata, void *ctx, const char *
     }
 
     yactx->state = FN_BEGIN;
-    yactx->cbdata = cbdata;
     sxi_hostlist_empty(&yactx->hlist);
 
     return 0;
@@ -732,6 +853,18 @@ int sxc_cluster_fetchnodes(sxc_cluster_t *cluster) {
     yctx.yh = NULL;
 
     orighlist = sxi_conns_get_hostlist(cluster->conns);
+
+    if(sxi_getenv("SX_DEBUG_SINGLEHOST")) {
+	sxi_hostlist_empty(orighlist);
+	if(sxi_hostlist_add_host(sx, orighlist, sxi_getenv("SX_DEBUG_SINGLEHOST"))) {
+	    if(sxc_geterrnum(sx) == SXE_EARG) {
+		sxc_clearerr(sx);
+		sxi_seterr(sx, SXE_EARG, "Invalid value of SX_DEBUG_SINGLEHOST");
+	    }
+	    return 1;
+	}
+    }
+
     if(!sxi_hostlist_get_count(orighlist)) {
         cluster_err(SXE_ECOMM, "Cannot update list of nodes: No node found%s in local cache", sxc_cluster_get_dnsname(cluster) ? " via dns resolution nor" : "");
 	goto config_fetchnodes_error;
@@ -799,8 +932,9 @@ struct cb_whoami_ctx {
     yajl_callbacks yacb;
     struct cb_error_ctx errctx;
     char *whoami;
+    char *role;
     yajl_handle yh;
-    enum whoami_state { FW_ERROR, FW_BEGIN, FW_CLUSTER, FW_WHOAMI, FW_COMPLETE } state;
+    enum whoami_state { FW_ERROR, FW_BEGIN, FW_CLUSTER, FW_WHOAMI, FW_ROLE, FW_COMPLETE } state;
 };
 #define expect_state(expst) do { if(yactx->state != (expst)) { CBDEBUG("bad state (in %d, expected %d)", yactx->state, expst); return 0; } } while(0)
 
@@ -836,6 +970,10 @@ static int yacb_whoami_map_key(void *ctx, const unsigned char *s, size_t l) {
 	    yactx->state = FW_WHOAMI;
 	    return 1;
 	}
+        if(l == lenof("role") && !memcmp(s, "role", lenof("role"))) {
+            yactx->state = FW_ROLE;
+            return 1;
+        }
 	CBDEBUG("unexpected cluster key '%.*s'", (unsigned)l, s);
 	return 0;
     }
@@ -851,19 +989,33 @@ static int yacb_whoami_string(void *ctx, const unsigned char *s, size_t l) {
     if (yactx->state == FW_ERROR)
         return yacb_error_string(&yactx->errctx, s, l);
 
-    expect_state(FW_WHOAMI);
-    if(l<=0)
-	return 0;
+    if(yactx->state == FW_WHOAMI) {
+        if(l<=0)
+            return 0;
 
-    if(!(yactx->whoami = malloc(l+1))) {
-	CBDEBUG("OOM duplicating username '%.*s'", (unsigned)l, s);
-	sxi_cbdata_seterr(yactx->cbdata, SXE_EMEM, "Out of memory");
-	return 0;
+        if(!(yactx->whoami = malloc(l+1))) {
+            CBDEBUG("OOM duplicating username '%.*s'", (unsigned)l, s);
+            sxi_cbdata_seterr(yactx->cbdata, SXE_EMEM, "Out of memory");
+            return 0;
+        }
+
+        memcpy(yactx->whoami, s, l);
+        yactx->whoami[l] = '\0';
+        yactx->state = FW_CLUSTER;
+    } else if(yactx->state == FW_ROLE) {
+        if(l<=0)
+            return 0;
+
+        if(!(yactx->role = malloc(l+1))) {
+            CBDEBUG("OOM duplicating user role '%.*s'", (unsigned)l, s);
+            sxi_cbdata_seterr(yactx->cbdata, SXE_EMEM, "Out of memory");
+            return 0;
+        }
+
+        memcpy(yactx->role, s, l);
+        yactx->role[l] = '\0';
+        yactx->state = FW_CLUSTER;
     }
-
-    memcpy(yactx->whoami, s, l);
-    yactx->whoami[l] = '\0';
-    yactx->state = FW_CLUSTER;
     return 1;
 }
 
@@ -897,6 +1049,7 @@ static int whoami_setup_cb(curlev_context_t *cbdata, void *ctx, const char *host
     yactx->state = FW_BEGIN;
     yactx->cbdata = cbdata;
     yactx->whoami = NULL;
+    yactx->role = NULL;
 
     return 0;
 }
@@ -913,11 +1066,16 @@ static int whoami_cb(curlev_context_t *cbdata, void *ctx, const void *data, size
     return 0;
 }
 
-char* sxc_cluster_whoami(sxc_cluster_t *cluster) {
+int sxc_cluster_whoami(sxc_cluster_t *cluster, char **user, char **role) {
     struct cb_whoami_ctx yctx;
     yajl_callbacks *yacb = &yctx.yacb;
     sxc_client_t *sx = cluster->sx;
-    char *ret = NULL;
+    int ret = -1;
+
+    if(!user) {
+        sxi_seterr(sx, SXE_EARG, "NULL argument");
+        return ret;
+    }
 
     ya_init(yacb);
     yacb->yajl_start_map = yacb_whoami_start_map;
@@ -927,7 +1085,7 @@ char* sxc_cluster_whoami(sxc_cluster_t *cluster) {
     yctx.yh = NULL;
 
     sxi_set_operation(sxi_cluster_get_client(cluster), "whoami", sxi_cluster_get_name(cluster), NULL, NULL);
-    if(sxi_cluster_query(cluster->conns, NULL, REQ_GET, "?whoami", NULL, 0, whoami_setup_cb, whoami_cb, &yctx) != 200) {
+    if(sxi_cluster_query(cluster->conns, NULL, REQ_GET, role ? "?whoami&role" : "?whoami", NULL, 0, whoami_setup_cb, whoami_cb, &yctx) != 200) {
 	SXDEBUG("query failed");
 	goto config_whoami_error;
     }
@@ -939,14 +1097,35 @@ char* sxc_cluster_whoami(sxc_cluster_t *cluster) {
         }
 	goto config_whoami_error;
     }
-    ret = yctx.whoami;
-    SXDEBUG("whoami: %s", ret);
 
+    if(!*yctx.whoami) {
+        sxi_seterr(sx, SXE_ECOMM, "Failed to get username");
+        goto config_whoami_error;
+    }
+
+    if(role && (!yctx.role || !*yctx.role)) {
+        sxi_seterr(sx, SXE_ECOMM, "Failed to get user role");
+        goto config_whoami_error;
+    }
+
+    if(role)
+        SXDEBUG("whoami: %s (%s)", yctx.whoami, yctx.role);
+    else
+        SXDEBUG("whoami: %s", yctx.whoami);
+
+    *user = yctx.whoami;
+    if(role)
+        *role = yctx.role;
+    ret = 0;
  config_whoami_error:
-    if(yctx.yh) {
-        if (!ret)
-            free(yctx.whoami);
+    if(yctx.yh)
 	yajl_free(yctx.yh);
+    if (ret) {
+        free(yctx.whoami);
+        free(yctx.role);
+        *user = NULL;
+        if(role)
+            *role = NULL;
     }
 
     return ret;
@@ -1376,6 +1555,7 @@ int sxc_cluster_save(sxc_cluster_t *cluster, const char *config_dir) {
 	const char *host = sxi_hostlist_get_host(hlist, i);
 	unsigned int len = clusterd_len + lenof("/nodes/") + strlen(host) + 1;
 	char *touchme = malloc(len);
+        double ul_speed = 0.0, dl_speed = 0.0;
 
 	if(!touchme) {
 	    CFGDEBUG("OOM allocating host file for %s", host);
@@ -1385,13 +1565,28 @@ int sxc_cluster_save(sxc_cluster_t *cluster, const char *config_dir) {
 	}
 	sprintf(touchme, "%s/%s", clusterd, host);
 	f = fopen(touchme, "w");
-	if(!f || fclose(f)) {
-	    CFGDEBUG("failed to touch host file %s", touchme);
+	if(!f) {
+	    CFGDEBUG("failed to open host file %s", touchme);
 	    cluster_syserr(SXE_EWRITE, "Cannot save config: Failed to touch file %s", touchme);
 	    free(clusterd);
 	    free(touchme);
 	    return 1;
 	}
+
+        if(sxi_get_host_speed_stats(cluster->conns, host, &ul_speed, &dl_speed)) {
+            CFGDEBUG("Failed to get host %s speed: %s", host, sxc_geterrmsg(cluster->sx));
+            ul_speed = 0.0;
+            dl_speed = 0.0;
+        }
+
+        fprintf(f, "UploadSpeed=%.2lf\nDownloadSpeed=%.2lf\n", ul_speed, dl_speed);
+        if(fclose(f)) {
+            CFGDEBUG("Failed to close host file %s", touchme);
+            cluster_syserr(SXE_EWRITE, "Cannot save config: Failed to close host file %s", touchme);
+            free(clusterd);
+            free(touchme);
+            return 1;
+        }
 	free(touchme);
     }
 
@@ -1560,6 +1755,8 @@ struct cb_listfiles_ctx {
     struct cbl_file_t file;
     unsigned int replica;
     unsigned int nfiles;
+    const char *etag_in;
+    char *etag_out;
     enum list_files_state { LF_ERROR, LF_BEGIN, LF_MAIN, LF_REPLICACNT, LF_VOLUMEUSEDSIZE, LF_VOLUMESIZE, LF_FILES, LF_FILE, LF_FILECONTENT, LF_FILEATTRS, LF_FILESIZE, LF_BLOCKSIZE, LF_FILETIME, LF_FILEREV, LF_COMPLETE } state;
 };
 
@@ -1821,10 +2018,11 @@ static int yacb_listfiles_end_map(void *ctx) {
 static int listfiles_setup_cb(curlev_context_t *cbdata, void *ctx, const char *host) {
     struct cb_listfiles_ctx *yactx = (struct cb_listfiles_ctx *)ctx;
 
+    sxi_cbdata_set_etag(cbdata, yactx->etag_in, yactx->etag_in ? strlen(yactx->etag_in) : 0);
     if(yactx->yh)
 	yajl_free(yactx->yh);
-
     yactx->cbdata = cbdata;
+    CBDEBUG("ETag: %s", yactx->etag_in ? yactx->etag_in : "");
     if(!(yactx->yh  = yajl_alloc(&yactx->yacb, NULL, yactx))) {
 	CBDEBUG("failed to allocate yajl structure");
 	sxi_cbdata_seterr(cbdata, SXE_EMEM, "List failed: Out of memory");
@@ -1857,6 +2055,8 @@ static int listfiles_cb(curlev_context_t *cbdata, void *ctx, const void *data, s
 	sxi_cbdata_seterr(yactx->cbdata, SXE_ECOMM, "communication error");
 	return 1;
     }
+    if (!yactx->etag_out)
+        yactx->etag_out = sxi_cbdata_get_etag(cbdata);
 
     return 0;
 }
@@ -1900,7 +2100,7 @@ char *sxi_ith_slash(char *s, unsigned int i) {
     return NULL;
 }
 
-sxc_cluster_lf_t *sxi_conns_listfiles(sxi_conns_t *conns, const char *volume, sxi_hostlist_t *volhosts, const char *glob_pattern, int recursive, int64_t *volume_used_size, int64_t *volume_size, unsigned int *replica_count, unsigned int *nfiles, int reverse, int sizeOnly) {
+static sxc_cluster_lf_t *sxi_conns_listfiles(sxi_conns_t *conns, const char *volume, sxi_hostlist_t *volhosts, const char *glob_pattern, int recursive, int64_t *volume_used_size, int64_t *volume_size, unsigned int *replica_count, unsigned int *nfiles, int reverse, int sizeOnly, const char *etag_in, char **etag_out) {
     char *enc_vol, *enc_glob = NULL, *url, *fname;
     struct cb_listfiles_ctx yctx;
     yajl_callbacks *yacb = &yctx.yacb;
@@ -1912,6 +2112,8 @@ sxc_cluster_lf_t *sxi_conns_listfiles(sxi_conns_t *conns, const char *volume, sx
     int qm = 1; /* state if we want to add quotation mark or ampersand */
 
     sxc_clearerr(sx);
+    yctx.etag_in = etag_in;
+    if (etag_out) *etag_out = NULL;
 
     if(!volume || !volhosts) {
         SXDEBUG("NULL argument");
@@ -1985,6 +2187,7 @@ sxc_cluster_lf_t *sxi_conns_listfiles(sxi_conns_t *conns, const char *volume, sx
     yctx.yh = NULL;
     yctx.fname = NULL;
     yctx.frev = NULL;
+    yctx.etag_out = NULL;
 
     sxi_set_operation(sx, "list volume files", sxi_conns_get_sslname(conns), volume, NULL);
     qret = sxi_cluster_query(conns, volhosts, REQ_GET, url, NULL, 0, listfiles_setup_cb, listfiles_cb, &yctx);
@@ -1995,9 +2198,12 @@ sxc_cluster_lf_t *sxi_conns_listfiles(sxi_conns_t *conns, const char *volume, sx
         SXDEBUG("query returned %d", qret);
 	if(yctx.yh)
 	    yajl_free(yctx.yh);
+        free(yctx.etag_out);
 	fclose(yctx.f);
 	unlink(fname);
 	free(fname);
+        if (qret == 304)
+            sxi_seterr(sxi_conns_get_client(conns), SXE_SKIP, "Not modified");
 	return NULL;
     }
 
@@ -2008,6 +2214,7 @@ sxc_cluster_lf_t *sxi_conns_listfiles(sxi_conns_t *conns, const char *volume, sx
         }
 	if(yctx.yh)
 	    yajl_free(yctx.yh);
+        free(yctx.etag_out);
 	fclose(yctx.f);
 	unlink(fname);
 	free(fname);
@@ -2021,6 +2228,7 @@ sxc_cluster_lf_t *sxi_conns_listfiles(sxi_conns_t *conns, const char *volume, sx
        ftruncate(fileno(yctx.f), ftell(yctx.f)) ||
        fseek(yctx.f, 0, reverse ? SEEK_END : SEEK_SET)) {
         sxi_seterr(sx, SXE_EWRITE, "List failed: Failed to write temporary data");
+        free(yctx.etag_out);
 	fclose(yctx.f);
 	unlink(fname);
 	free(fname);
@@ -2031,6 +2239,7 @@ sxc_cluster_lf_t *sxi_conns_listfiles(sxi_conns_t *conns, const char *volume, sx
     if(!ret) {
         SXDEBUG("OOM allocating results");
         sxi_seterr(sx, SXE_EMEM, "List failed: Out of memory");
+        free(yctx.etag_out);
 	fclose(yctx.f);
 	unlink(fname);
 	free(fname);
@@ -2055,12 +2264,24 @@ sxc_cluster_lf_t *sxi_conns_listfiles(sxi_conns_t *conns, const char *volume, sx
     ret->want_relative = glob_pattern && *glob_pattern && glob_pattern[strlen(glob_pattern)-1] == '/';
     ret->pattern_slashes = sxi_count_slashes(glob_pattern);
     ret->reverse = reverse;
+    if (yctx.etag_out) {
+        if (etag_out && *yctx.etag_out)
+            *etag_out = yctx.etag_out;
+        else
+            free(yctx.etag_out);
+    }
     return ret;
 }
 
-sxc_cluster_lf_t *sxc_cluster_listfiles(sxc_cluster_t *cluster, const char *volume, const char *glob_pattern, int recursive, int64_t *volume_used_size, int64_t *volume_size, unsigned int *replica_count, unsigned int *nfiles, int reverse) {
+
+sxc_cluster_lf_t *sxc_cluster_listfiles_etag(sxc_cluster_t *cluster, const char *volume, const char *glob_pattern, int recursive, int64_t *volume_used_size, int64_t *volume_size, unsigned int *replica_count, unsigned int *nfiles, int reverse, const char *etag_file) {
     sxi_hostlist_t volhosts;
     sxc_cluster_lf_t *ret;
+    const char *confdir = sxi_cluster_get_confdir(cluster);
+    char *path = NULL;
+    char etag[1024];
+    char *etag_out = NULL;
+    sxc_client_t *sx = sxi_cluster_get_client(cluster);
 
     sxi_hostlist_init(&volhosts);
     if(sxi_locate_volume(sxi_cluster_get_conns(cluster), volume, &volhosts, NULL, NULL)) {
@@ -2069,9 +2290,58 @@ sxc_cluster_lf_t *sxc_cluster_listfiles(sxc_cluster_t *cluster, const char *volu
         return NULL;
     }
 
-    ret = sxi_conns_listfiles(sxi_cluster_get_conns(cluster), volume, &volhosts, glob_pattern, recursive, volume_used_size, volume_size, replica_count, nfiles, reverse, 0);
+    etag[0] = '\0';
+    if (etag_file && strchr(etag_file, '/')) {
+        sxi_seterr(sx, SXE_EARG, "etag file cannot contain /");
+        return NULL;
+    }
+    if (etag_file && confdir) {
+        unsigned n = strlen(confdir) + strlen(volume) + strlen(etag_file) + sizeof("/volumes//etag/");
+        path = malloc(n);
+        if (!path) {
+            cluster_err(SXE_EMEM, "Cannot allocate etag path");
+            return NULL;
+        }
+        snprintf(path, n, "%s/volumes/%s", confdir, volume);
+        if(access(path, F_OK) && mkdir(path, 0700))
+                sxi_notice(sx, "Failed to mkdir %s", path);
+        snprintf(path, n, "%s/volumes/%s/etag", confdir, volume);
+        if(access(path, F_OK) && mkdir(path, 0700))
+                sxi_notice(sx, "Failed to mkdir %s", path);
+        snprintf(path, n, "%s/volumes/%s/etag/%s", confdir, volume, etag_file);
+        SXDEBUG("Trying to load ETag from %s", path);
+        FILE *f = fopen(path, "r");
+        if (f) {
+            if (!fgets(etag, sizeof(etag), f)) {
+                etag[0] = '\0';
+                sxi_notice(sx, "Failed to read old etag from %s", path);
+            }
+            fclose(f);
+        }
+    }
+    if (*etag)
+        SXDEBUG("ETag in: %s", etag);
+
+    ret = sxi_conns_listfiles(sxi_cluster_get_conns(cluster), volume, &volhosts, glob_pattern, recursive, volume_used_size, volume_size, replica_count, nfiles, reverse, 0, *etag ? etag : NULL, &etag_out);
     sxi_hostlist_empty(&volhosts);
+    SXDEBUG("ETag out: %s", etag_out ? etag_out : "");
+
+    if (etag_out && confdir && path) {
+        FILE *f = fopen(path, "w");
+        if (f) {
+            if (fwrite(etag_out, strlen(etag_out), 1, f) != 1)
+                sxi_notice(sx, "Failed to write etag to %s", path);
+            if (fclose(f))
+                sxi_notice(sx, "Failed to close etag file %s", path);
+        }
+    }
+    free(etag_out);
+    free(path);
     return ret;
+}
+
+sxc_cluster_lf_t *sxc_cluster_listfiles(sxc_cluster_t *cluster, const char *volume, const char *glob_pattern, int recursive, int64_t *volume_used_size, int64_t *volume_size, unsigned int *replica_count, unsigned int *nfiles, int reverse) {
+    return sxc_cluster_listfiles_etag(cluster, volume, glob_pattern, recursive, volume_used_size, volume_size, replica_count, nfiles, reverse, NULL);
 }
 
 int sxc_cluster_listfiles_prev(sxc_cluster_lf_t *lf, char **file_name, int64_t *file_size, time_t *file_created_at, char **file_revision) {
@@ -2297,14 +2567,354 @@ const char *sxi_cluster_get_confdir(const sxc_cluster_t *cluster) {
     return cluster ? cluster->config_dir : NULL;
 }
 
-char *sxc_user_add(sxc_cluster_t *cluster, const char *username, int admin, const char *oldtoken)
+static int get_user_info_wrap(sxc_cluster_t *cluster, const char *username, uint8_t *uid, int *role) {
+    FILE *authfile = NULL;
+    sxc_client_t *sx = sxi_cluster_get_client(cluster);
+    char *authfile_name;
+    int r = 0;
+    char token[AUTHTOK_ASCII_LEN+1];
+    uint8_t buf[AUTHTOK_BIN_LEN];
+    unsigned int buffsize = AUTHTOK_ASCII_LEN;
+
+    if(!uid) {
+        cluster_err(SXE_EARG, "NULL argument");
+        return 1;
+    }
+
+    authfile_name = sxi_tempfile_track(sx, NULL, &authfile);
+    if(!authfile || !authfile_name) {
+        SXDEBUG("Failed to create a tempfile");
+        if(authfile)
+            fclose(authfile);
+	if(authfile_name)
+            sxi_tempfile_unlink_untrack(sx, authfile_name);
+        return 1;
+    }
+
+    /* Get existing user ID */
+    if(sxc_user_getinfo(cluster, username, authfile, &r, 0)) {
+        SXDEBUG("Failed to get a user %s key", username);
+        fclose(authfile);
+        sxi_tempfile_unlink_untrack(sx, authfile_name);
+        return 1;
+    }
+
+    if(role)
+        *role = r;
+
+    fclose(authfile);
+    if(!(authfile = fopen(authfile_name, "r"))) {
+        cluster_err(SXE_ECFG, "Failed to reopen credentials file");
+        sxi_tempfile_unlink_untrack(sx, authfile_name);
+        return 1;
+    }
+    if(fread(token, AUTHTOK_ASCII_LEN, 1, authfile) != 1) {
+        cluster_err(SXE_ECOMM, "Failed to read an existing user common ID from tempfile");
+        fclose(authfile);
+        sxi_tempfile_unlink_untrack(sx, authfile_name);
+        return 1;
+    }
+    token[AUTHTOK_ASCII_LEN] = 0;
+    fclose(authfile);
+    sxi_tempfile_unlink_untrack(sx, authfile_name);
+
+    if(sxi_b64_dec(sx, token, buf, &buffsize)) {
+        SXDEBUG("Failed to decode base64 encoded token");
+        return 1;
+    }
+    memcpy(uid, buf, AUTH_UID_LEN);
+
+    return 0;
+}
+
+int sxc_read_pass_file(sxc_client_t *sx, const char *pass_file, char *pass, unsigned int pass_len) {
+    int fd, c;
+    struct stat st;
+    uid_t uid;
+
+    if(!pass_file || !pass) {
+        sxi_seterr(sx, SXE_EARG, "NULL argument");
+        return 1;
+    }
+
+    if(pass_len <= 8) {
+        sxi_seterr(sx, SXE_EARG, "Invalid argument: Password buffer too short");
+        return 1;
+    }
+
+    fd = open(pass_file, O_RDONLY);
+    if(fd < 0) {
+        sxi_seterr(sx, SXE_ECFG, "Failed to open password file %s: %s", pass_file, strerror(errno));
+        return 1;
+    }
+
+    if(fstat(fd, &st)) {
+        sxi_seterr(sx, SXE_ECFG, "Failed to stat file %s: %s", pass_file, strerror(errno));
+        close(fd);
+        return 1;
+    }
+
+    uid = geteuid();
+    if(st.st_uid != uid) {
+        struct passwd *pw = getpwuid(uid);
+        sxi_seterr(sx, SXE_ECFG, "User '%s' must be the owner of %s", pw ? pw->pw_name : "", pass_file);
+        close(fd);
+        return 1;
+    }
+
+    if(!S_ISREG(st.st_mode)) {
+        sxi_seterr(sx, SXE_ECFG, "%s is not a regular file", pass_file);
+        close(fd);
+        return 1;
+    }
+
+    if(st.st_mode & (S_IRGRP | S_IWGRP | S_IXGRP | S_IROTH | S_IWOTH | S_IXOTH)) {
+        sxi_seterr(sx, SXE_ECFG, "File %s is group or others accessible", pass_file);
+        close(fd);
+        return 1;
+    }
+
+    if((c = read(fd, pass, pass_len)) < 0) {
+        sxi_seterr(sx, SXE_EREAD, "Failed to read pass file %s: %s", pass_file, strerror(errno));
+        memset(pass, 0, pass_len);
+        close(fd);
+        return 1;
+    }
+    close(fd);
+
+    if((unsigned int)c >= pass_len) {
+        sxi_seterr(sx, SXE_EARG, "Password is too long");
+        memset(pass, 0, pass_len);
+        return 1;
+    }
+
+    if(c <= 8) {
+        sxi_seterr(sx, SXE_EARG, "Password is too short");
+        memset(pass, 0, pass_len);
+        return 1;
+    }
+
+    pass[c] = '\0';
+    if(c && pass[c-1] == '\n')
+        pass[c-1] = '\0';
+
+    return 0;
+}
+
+static int pass2key(sxc_cluster_t *cluster, const char *user, const char *pass, unsigned char *key, int repeat)
 {
-    uint8_t buf[AUTH_UID_LEN + AUTH_KEY_LEN + 2], *uid = buf, *key = &buf[AUTH_UID_LEN];
-    char *tok, *retkey = NULL;
-    sxc_client_t *sx;
-    sxi_query_t *proto;
+    char password[1024];
+    char salt[AUTH_UID_LEN];
+    char keybuf[61];
+    sxc_client_t *sx = sxi_cluster_get_client(cluster);
+    const char *uuid;
+    if(!cluster)
+        return -1;
+    if(!user || !key) {
+        sxi_seterr(sx, SXE_EARG, "NULL argument");
+        return -1;
+    }
+
+    if(pass && strlen(pass) >= sizeof(password)) {
+        sxi_seterr(sx, SXE_EARG, "Invalid argument: Password is too long");
+        return -1;
+    }
+
+    uuid = sxc_cluster_get_uuid(cluster);
+    if(!uuid) {
+        sxi_seterr(sx, SXE_EARG, "Cluster uuid is not set");
+        return 1;
+    }
+
+    if(sxi_sha1_calc(uuid, strlen(uuid), user, strlen(user), (unsigned char*)salt)) {
+        sxi_seterr(sx, SXE_ECRYPT, "Failed to compute hash of username");
+        return 1;
+    }
+
+    mlock(password, sizeof(password));
+    if(!pass) { /* Password not supplied, prompt user for it */
+        if(sxc_prompt_password(sx, password, sizeof(password), NULL, repeat)) {
+            munlock(password, sizeof(password));
+            return 1;
+        }
+    } else {/* Password supplied, copy it to local array */
+        if(strlen(pass) < 8) {
+            sxi_seterr(sx, SXE_EARG, "Password must be at least 8 characters long");
+            munlock(password, sizeof(password));
+            return 1;
+        }
+        sxi_strlcpy(password, pass, sizeof(password));
+    } 
+
+    if(sxi_derive_key(password, salt, AUTH_UID_LEN, BCRYPT_TOKEN_ITERATIONS_LOG2, keybuf, sizeof(keybuf))) {
+        sxi_seterr(sx, SXE_ECRYPT, "Failed to derive key");
+        memset(password, 0, sizeof(password));
+        munlock(password, sizeof(password));
+        return 1;
+    }
+
+    memset(password, 0, sizeof(password));
+    munlock(password, sizeof(password));
+
+    if(sxi_sha1_calc(uuid, strlen(uuid), keybuf, strlen(keybuf), key)) {
+        sxi_seterr(sx, SXE_ECRYPT, "Failed to compute hash of derived key");
+        return 1;
+    }
+
+    return 0;
+}
+
+static int username_hash(sxc_client_t *sx, const char *user, unsigned char *uid) {
+    unsigned int len;
     sxi_md_ctx *ch_ctx;
-    int l, qret;
+
+    if(!sx)
+        return 1;
+    if(!user) {
+        sxi_seterr(sx, SXE_EARG, "NULL argument");
+        return 1;
+    }
+    len = strlen(user);
+    ch_ctx = sxi_md_init();
+    if (!ch_ctx) {
+        sxi_seterr(sx, SXE_ECRYPT, "Cannot compute hash: Unable to initialize crypto library");
+        return 1;
+    }
+    if(!sxi_sha1_init(ch_ctx)) {
+        sxi_seterr(sx, SXE_ECRYPT, "Cannot compute hash: Unable to initialize crypto library");
+        return 1;
+    }
+    if(!sxi_sha1_update(ch_ctx, user, len) || !sxi_sha1_final(ch_ctx, uid, NULL)) {
+        sxi_seterr(sx, SXE_ECRYPT, "Cannot compute hash: Crypto library failure");
+        sxi_md_cleanup(&ch_ctx);
+        return 1;
+    }
+    sxi_md_cleanup(&ch_ctx);
+    return 0;
+}
+
+int sxc_prompt_username(sxc_client_t *sx, char *buff, unsigned int bufflen, const char *prefix) {
+    char prompt[1024];
+
+    if(!sx)
+        return 1;
+    if(!buff || bufflen < 65) {
+        sxi_seterr(sx, SXE_EARG, "Invalid argument");
+        return 1;
+    }
+
+    snprintf(prompt, sizeof(prompt), "%s%s", prefix ? prefix : "", "Username: ");
+    if(sxi_get_input(sx, SXC_INPUT_PLAIN, prompt, NULL, buff, bufflen)) {
+        sxi_seterr(sx, SXE_EARG, "Can't obtain username");
+        return 1;
+    }
+    if(!*buff) {
+        sxi_seterr(sx, SXE_EARG, "Can't obtain username");
+        return 1;
+    }
+    return 0;
+}
+
+/* Remember to mlock(buff, buff_len), buffer length must be greater than 8 characters */
+int sxc_prompt_password(sxc_client_t *sx, char *buff, unsigned int buff_len, const char *prefix, int repeat) {
+    char pass2[1024];
+    char prompt[1024];
+
+    if(!sx)
+        return 1;
+    if(!buff || buff_len < 1024 || (repeat && buff_len > sizeof(pass2))) {
+        sxi_seterr(sx, SXE_EARG, "Invalid argument");
+        return 1;
+    }
+
+    snprintf(prompt, sizeof(prompt), "%s%s", prefix ? prefix : "", "Enter password: ");
+    if(sxi_get_input(sx, SXC_INPUT_SENSITIVE, prompt, NULL, buff, buff_len)) {
+        memset(buff, 0, buff_len);
+        sxi_seterr(sx, SXE_EARG, "Can't obtain password");
+        return 1;
+    }
+
+    if(strlen(buff) < 8) {
+        memset(buff, 0, buff_len);
+        sxi_seterr(sx, SXE_EARG, "Password must be at least 8 characters long");
+        return 1;
+    }
+
+    if(repeat) {
+        snprintf(prompt, sizeof(prompt), "%s%s", prefix ? prefix : "", "Re-enter password: ");
+        mlock(pass2, sizeof(pass2));
+        if(sxi_get_input(sx, SXC_INPUT_SENSITIVE, prompt, NULL, pass2, sizeof(pass2))) {
+            memset(buff, 0, buff_len);
+            memset(pass2, 0, sizeof(pass2));
+            munlock(pass2, sizeof(pass2));
+            sxi_seterr(sx, SXE_EARG, "Can't obtain password");
+            return 1;
+        }
+        if(strcmp(buff, pass2)) {
+            memset(buff, 0, buff_len);
+            memset(pass2, 0, sizeof(pass2));
+            munlock(pass2, sizeof(pass2));
+            sxi_seterr(sx, SXE_EARG, "Passwords don't match");
+            return 1;
+        }
+        memset(pass2, 0, sizeof(pass2));
+        munlock(pass2, sizeof(pass2));
+    }
+
+    return 0;
+}
+
+int sxc_pass2token(sxc_cluster_t *cluster, const char *username, const char *password, char *tok_buf, unsigned int tok_size) {
+    uint8_t buf[AUTH_UID_LEN + AUTH_KEY_LEN + 2], *uid = buf, *key = &buf[AUTH_UID_LEN];
+    char *token;
+    sxc_client_t *sx;
+
+    if(!cluster)
+        return 1;
+    sx = sxi_cluster_get_client(cluster);
+    if(!username || !password || !tok_buf || tok_size < AUTHTOK_ASCII_LEN + 1) {
+        sxi_seterr(sx, SXE_EARG, "Invalid argument");
+        return 1;
+    }
+
+    memset(buf, 0, sizeof(buf));
+
+    /* UID part - unsalted username hash */
+    if(username_hash(sx, username, uid)) {
+        SXDEBUG("Failed to compute unsalted hash of username");
+        return 1;
+    }
+
+    /* Generate token from username and password */
+    if(pass2key(cluster, username, password, key, 0)) {
+        SXDEBUG("Failed to prompt user password");
+        return 1;
+    }
+
+    buf[sizeof(buf) - 2] = 0; /* First reserved byte */
+    buf[sizeof(buf) - 1] = 0; /* Second reserved byte */
+    token = sxi_b64_enc(sx, buf, sizeof(buf));
+    if(!token)
+        return 1;
+    if(strlen(token) != AUTHTOK_ASCII_LEN) {
+        /* Always false but it doesn't hurt to be extra careful */
+        sxi_seterr(sx, SXE_ECOMM, "The generated auth token has invalid size");
+        free(token);
+        return 1;
+    }
+
+    memcpy(tok_buf, token, tok_size);
+    free(token);
+    return 0;
+}
+
+static char *user_add(sxc_cluster_t *cluster, const char *username, const char *pass, int admin, const char *oldtoken, const char *existing, int *clone_role, const char *desc, int generate_key) {
+    uint8_t buf[AUTH_UID_LEN + AUTH_KEY_LEN + 2], *uid = buf, *key = &buf[AUTH_UID_LEN];
+    char *tok = NULL, *retkey = NULL;
+    sxc_client_t *sx;
+    sxi_query_t *proto = NULL;
+    unsigned int l;
+    int qret, role = 0;
 
     if(!cluster)
 	return NULL;
@@ -2312,91 +2922,125 @@ char *sxc_user_add(sxc_cluster_t *cluster, const char *username, int admin, cons
         cluster_err(SXE_EARG, "Null args");
         return NULL;
     }
-    sx = sxi_cluster_get_client(cluster);
-
-    /* UID part - unsalted username hash */
-    l = strlen(username);
-    ch_ctx = sxi_md_init();
-    if (!ch_ctx)
+    if(!generate_key && !oldtoken && existing) {
+        cluster_err(SXE_EARG, "Invalid argument: Cannot use password for user clones");
         return NULL;
-    if(!sxi_sha1_init(ch_ctx)) {
-	cluster_err(SXE_ECRYPT, "Cannot compute hash: Unable to initialize crypto library");
-	return NULL;
     }
-    if(!sxi_sha1_update(ch_ctx, username, l) || !sxi_sha1_final(ch_ctx, uid, NULL)) {
-	cluster_err(SXE_ECRYPT, "Cannot compute hash: Crypto library failure");
-        sxi_md_cleanup(&ch_ctx);
-	return NULL;
+    if(generate_key && (oldtoken || pass)) {
+        cluster_err(SXE_EARG, "Invalid argument: Cannot generate random key and use old token or password together");
+        return NULL;
     }
-    sxi_md_cleanup(&ch_ctx);
+    sx = sxi_cluster_get_client(cluster);
+    memset(buf, 0, sizeof(buf));
 
+    /* Key part */
     if (oldtoken) {
+        /* Use key from an existing authentication token */
         char old[AUTHTOK_BIN_LEN];
-        unsigned l = sizeof(old);
+        l = sizeof(old);
         if (sxi_b64_dec(sx, oldtoken, old, &l))
             return NULL;
         if (l != sizeof(old)) {
             cluster_err(SXE_EARG, "Bad length for old authentication token");
             return NULL;
         }
-        memcpy(key, &old[AUTH_UID_LEN], AUTH_KEY_LEN);
-    } else {
-        /* KEY part - really random bytes */
+        memcpy(buf, old, AUTHTOK_BIN_LEN);
+    } else if(generate_key) {
+        /* Generate random key */
         if (sxi_rand_bytes(key, AUTH_KEY_LEN) != 1) {
             cluster_err(SXE_ECRYPT, "Unable to produce a random key");
             return NULL;
         }
+    } else {
+        /* Prompt user for password */
+        if(pass2key(cluster, username, pass, key, 1)) {
+            SXDEBUG("Failed to prompt user password");
+            return NULL;
+        }
     }
+
+    /* Query */
+    if(existing)
+        proto = sxi_userclone_proto(sx, existing, username, oldtoken ? uid : NULL, key, desc);
+    else
+        proto = sxi_useradd_proto(sx, username, NULL, key, admin, desc);
+    if(!proto) {
+	cluster_err(SXE_EMEM, "Unable to allocate space for request data");
+	return NULL;
+    }
+    sxi_set_operation(sxi_cluster_get_client(cluster), "create user", sxi_cluster_get_name(cluster), NULL, NULL);
+    qret = sxi_job_submit_and_poll(sxi_cluster_get_conns(cluster), NULL, proto->verb, proto->path, proto->content, proto->content_len);
+    if(qret) {
+        SXDEBUG("Failed to send useradd query");
+        sxi_query_free(proto);
+        return NULL;
+    }
+    sxi_query_free(proto);
+
+    if(existing) {
+        if(get_user_info_wrap(cluster, username, uid, &role)) { /* Read existing user ID, which is stored along with his key */
+            SXDEBUG("Failed to get existing user common ID");
+            return NULL;
+        }
+    } else {
+        /* UID part - unsalted username hash */
+        if(username_hash(sx, username, uid)) {
+            SXDEBUG("Failed to compute unsalted hash of username");
+            return NULL;
+        }
+    }
+
+    /* Get existing user role */          
+    if(clone_role)
+        *clone_role = role;
 
     /* Encode token */
     buf[sizeof(buf) - 2] = 0; /* First reserved byte */
     buf[sizeof(buf) - 1] = 0; /* Second reserved byte */
     tok = sxi_b64_enc(sx, buf, sizeof(buf));
     if(!tok)
-	return NULL;
+        return NULL;
     if(strlen(tok) != AUTHTOK_ASCII_LEN) {
-	/* Always false but it doensn't hurt to be extra careful */
-	free(tok);
-	cluster_err(SXE_ECOMM, "The generated auth token has invalid size");
-	return NULL;
-    }
-
-    if (oldtoken && strcmp(tok, oldtoken)) {
+        /* Always false but it doensn't hurt to be extra careful */
+        cluster_err(SXE_ECOMM, "The generated auth token has invalid size");
         free(tok);
-        cluster_err(SXE_EARG, "The provided old authentication token and username don't match");
         return NULL;
     }
 
-    /* Query */
-    proto = sxi_useradd_proto(sx, username, key, admin);
-    if(!proto) {
-	cluster_err(SXE_EMEM, "Unable to allocate space for request data");
-	free(tok);
-	return NULL;
+    if (oldtoken && strcmp(tok, oldtoken)) {
+        cluster_err(SXE_EARG, "The provided old authentication token and username don't match");
+        free(tok);
+        return NULL;
     }
-    sxi_set_operation(sxi_cluster_get_client(cluster), "create user", sxi_cluster_get_name(cluster), NULL, NULL);
-    qret = sxi_job_submit_and_poll(sxi_cluster_get_conns(cluster), NULL, proto->verb, proto->path, proto->content, proto->content_len);
-    if(!qret) {
-	retkey = malloc(AUTHTOK_ASCII_LEN + 1);
-	if(!retkey) {
-	    cluster_err(SXE_EMEM, "Unable to allocate memory for user key");
-	} else {
-	    sxi_strlcpy(retkey, tok, AUTHTOK_ASCII_LEN+1);
-        }
-    }
-    sxi_query_free(proto);
+
+    retkey = malloc(AUTHTOK_ASCII_LEN + 1);
+    if(!retkey)
+        cluster_err(SXE_EMEM, "Unable to allocate memory for user key");
+    else
+        sxi_strlcpy(retkey, tok, AUTHTOK_ASCII_LEN+1);
+
     free(tok);
     return retkey;
 }
 
-char *sxc_user_newkey(sxc_cluster_t *cluster, const char *username, const char *oldtoken)
+char *sxc_user_add(sxc_cluster_t *cluster, const char *username, const char *pass, int admin, const char *oldtoken, const char *desc, int generate_key) {
+    return user_add(cluster, username, pass, admin, oldtoken, NULL, NULL, desc, generate_key);
+}
+
+char *sxc_user_clone(sxc_cluster_t *cluster, const char *username, const char *clonename, const char *oldtoken, int *role, const char *desc) {
+    return user_add(cluster, clonename, NULL, 0, oldtoken, username, role, desc, oldtoken ? 0 : 1);
+}
+
+char *sxc_user_newkey(sxc_cluster_t *cluster, const char *username, const char *pass, const char *oldtoken, int generate_key)
 {
     uint8_t buf[AUTH_UID_LEN + AUTH_KEY_LEN + 2], *uid = buf, *key = &buf[AUTH_UID_LEN];
     char *tok, *retkey = NULL;
+    const char *curtoken;
+    char curtoken_bin[AUTHTOK_BIN_LEN];
+    unsigned int curtoken_bin_len = AUTHTOK_BIN_LEN;
     sxc_client_t *sx;
     sxi_query_t *proto;
-    sxi_md_ctx *ch_ctx;
-    int l, qret;
+    int qret;
     long http_err;
 
     if(!cluster)
@@ -2405,25 +3049,64 @@ char *sxc_user_newkey(sxc_cluster_t *cluster, const char *username, const char *
         cluster_err(SXE_EARG, "Null args");
         return NULL;
     }
+    if(generate_key && (oldtoken || pass)) {
+        cluster_err(SXE_EARG, "Invalid argument: Cannot generate random key and use old token or password together");
+        return NULL;
+    }
     sx = sxi_cluster_get_client(cluster);
 
-    /* UID part - unsalted username hash */
-    l = strlen(username);
-    ch_ctx = sxi_md_init();
-    if (!ch_ctx)
+    curtoken = sxi_conns_get_auth(sxi_cluster_get_conns(cluster));
+    if(!curtoken) {
+        SXDEBUG("Failed to load current authentication token");
         return NULL;
-    if(!sxi_sha1_init(ch_ctx)) {
-	cluster_err(SXE_ECRYPT, "Cannot compute hash: Unable to initialize crypto library");
-	return NULL;
     }
-    if(!sxi_sha1_update(ch_ctx, username, l) || !sxi_sha1_final(ch_ctx, uid, NULL)) {
-	cluster_err(SXE_ECRYPT, "Cannot compute hash: Crypto library failure");
-        sxi_md_cleanup(&ch_ctx);
-	return NULL;
-    }
-    sxi_md_cleanup(&ch_ctx);
 
+    if(sxi_b64_dec(sx, curtoken, curtoken_bin, &curtoken_bin_len)) {
+        SXDEBUG("Failed to decode current authentication token");
+        return NULL;
+    }
+
+    if(username_hash(sx, username, uid)) {
+        SXDEBUG("Failed to compute hash of a username");
+        return NULL;
+    }
+
+    /* Only fetch uid if user is not changing his own key. If he's not allowed to do so, the operation will be rejected from get_user_info_wrap() */
+    if(memcmp(curtoken_bin, uid, AUTH_UID_LEN)) {
+        uint8_t tmpuid[AUTH_UID_LEN];
+
+        memcpy(tmpuid, uid, sizeof(tmpuid));
+        if(get_user_info_wrap(cluster, username, uid, NULL)) { /* Read existing user ID, which is stored along with his key */
+            SXDEBUG("Failed to get existing user UID");
+            if(sxc_geterrnum(sx) == SXE_EAUTH) { /* If not authorized, warn that only admin can change other user's key */
+               sxc_clearerr(sx);
+               sxi_seterr(sx, SXE_EARG, "Only admin can change other user's key");
+            }
+            return NULL;
+        }
+
+        if(memcmp(tmpuid, uid, AUTH_UID_LEN) && !oldtoken && !generate_key) {
+            char zerouid[AUTH_UID_LEN];
+            memset(zerouid, 0, AUTH_UID_LEN);
+
+            /* Compatibility notice:
+             * 1.0 version of SX server does not return a user UID from usergetkey query.
+             * get_user_info_wrap() memsets the uid and then fills it if some data was returned. In 1.0 server
+             * case it will be left zeroed, therefore we should first check if the field was filled. */
+            if(memcmp(zerouid, uid, AUTH_UID_LEN)) {
+                /* UID is not zeroed, it was returned from the server and is different than destination user UID, it is a clone. */
+                sxi_seterr(sx, SXE_EARG, "Cannot use username and password for clones");
+                return NULL;
+            } else {
+                SXDEBUG("User '%s' UID was not returned by the server, assuming the user is not a clone", username);
+                memcpy(uid, tmpuid, AUTH_UID_LEN);
+            }
+        }
+    }
+
+    /* Key part */
     if (oldtoken) {
+        /* Use key from an existing authentication token */
         char old[AUTHTOK_BIN_LEN];
         unsigned l = sizeof(old);
         if (sxi_b64_dec(sx, oldtoken, old, &l))
@@ -2433,10 +3116,16 @@ char *sxc_user_newkey(sxc_cluster_t *cluster, const char *username, const char *
             return NULL;
         }
         memcpy(key, &old[AUTH_UID_LEN], AUTH_KEY_LEN);
-    } else {
-        /* KEY part - really random bytes */
+    } else if(generate_key) {
+        /* Generate random key */
         if (sxi_rand_bytes(key, AUTH_KEY_LEN) != 1) {
             cluster_err(SXE_ECRYPT, "Unable to produce a random key");
+            return NULL;
+        }
+    } else {
+        /* Prompt user for a password */
+        if(pass2key(cluster, username, pass, key, 1)) {
+            SXDEBUG("Failed to prompt user password");
             return NULL;
         }
     }
@@ -2482,10 +3171,11 @@ char *sxc_user_newkey(sxc_cluster_t *cluster, const char *username, const char *
     return retkey;
 }
 
-int sxc_user_remove(sxc_cluster_t *cluster, const char *username) {
+int sxc_user_remove(sxc_cluster_t *cluster, const char *username, int remove_clones) {
     char *enc_name, *query;
     sxc_client_t *sx;
     int ret;
+    unsigned int len;
 
     if(!cluster)
 	return 1;
@@ -2501,13 +3191,16 @@ int sxc_user_remove(sxc_cluster_t *cluster, const char *username) {
 	return 1;
     }
 
-    query = malloc(lenof(".users/") + strlen(enc_name) + 1);
+    len = lenof(".users/") + strlen(enc_name) + 1;
+    if(remove_clones)
+        len += strlen("?all");
+    query = malloc(len);
     if(!query) {
 	free(enc_name);
 	cluster_err(SXE_EMEM, "Unable to allocate space for request data");
 	return 1;
     }
-    sprintf(query, ".users/%s", enc_name);
+    sprintf(query, ".users/%s%s", enc_name, (remove_clones ? "?all" : ""));
     free(enc_name);
 
     sxi_set_operation(sx, "remove user", sxi_cluster_get_name(cluster), NULL, NULL);
@@ -2517,19 +3210,20 @@ int sxc_user_remove(sxc_cluster_t *cluster, const char *username) {
     return ret;
 }
 
-struct cb_userkey_ctx {
-    enum userkey_state { USERKEY_ERROR, USERKEY_BEGIN, USERKEY_MAP, USERKEY_KEY, USERKEY_COMPLETE } state;
+struct cb_userinfo_ctx {
+    enum userkey_state { USERINFO_ERROR, USERINFO_BEGIN, USERINFO_MAP, USERINFO_KEY, USERINFO_ID, USERINFO_ROLE, USERINFO_COMPLETE } state;
     struct cb_error_ctx errctx;
     yajl_callbacks yacb;
     curlev_context_t *cbdata;
     yajl_handle yh;
-    const char *username;
+    uint8_t token[AUTHTOK_BIN_LEN];
     FILE *f;
+    char role[7];
 };
 
-static int userkey_setup_cb(curlev_context_t *cbdata, void *ctx, const char *host)
+static int userinfo_setup_cb(curlev_context_t *cbdata, void *ctx, const char *host)
 {
-    struct cb_userkey_ctx *yactx = ctx;
+    struct cb_userinfo_ctx *yactx = ctx;
     if (yactx->yh)
         yajl_free(yactx->yh);
 
@@ -2540,14 +3234,14 @@ static int userkey_setup_cb(curlev_context_t *cbdata, void *ctx, const char *hos
         return 1;
     }
 
-    yactx->state = USERKEY_BEGIN;
+    yactx->state = USERINFO_BEGIN;
     return 0;
 }
 
-static int userkey_cb(curlev_context_t *cbdata, void *ctx, const void *data, size_t size) {
-    struct cb_userkey_ctx *yactx = ctx;
+static int userinfo_cb(curlev_context_t *cbdata, void *ctx, const void *data, size_t size) {
+    struct cb_userinfo_ctx *yactx = ctx;
     if (yajl_parse(yactx->yh, data, size) != yajl_status_ok) {
-        if (yactx->state != USERKEY_ERROR) {
+        if (yactx->state != USERINFO_ERROR) {
             CBDEBUG("failed to parse JSON data: %s", sxi_cbdata_geterrmsg(yactx->cbdata));
             sxi_cbdata_seterr(yactx->cbdata, SXE_ECOMM, "communication error");
         }
@@ -2556,101 +3250,105 @@ static int userkey_cb(curlev_context_t *cbdata, void *ctx, const void *data, siz
     return 0;
 }
 
-static int yacb_userkey_start_map(void *ctx) {
-    struct cb_userkey_ctx *yactx = ctx;
+static int yacb_userinfo_start_map(void *ctx) {
+    struct cb_userinfo_ctx *yactx = ctx;
     if(!ctx)
 	return 0;
 
-    if(yactx->state == USERKEY_BEGIN) {
-	yactx->state = USERKEY_MAP;
+    if(yactx->state == USERINFO_BEGIN) {
+	yactx->state = USERINFO_MAP;
     } else {
-	CBDEBUG("bad state (in %d, expected %d)", yactx->state, USERKEY_BEGIN);
+	CBDEBUG("bad state (in %d, expected %d)", yactx->state, USERINFO_BEGIN);
 	return 0;
     }
     return 1;
 }
 
-static int yacb_userkey_map_key(void *ctx, const unsigned char *s, size_t l) {
-    struct cb_userkey_ctx *yactx = ctx;
+static int yacb_userinfo_map_key(void *ctx, const unsigned char *s, size_t l) {
+    struct cb_userinfo_ctx *yactx = ctx;
     if(!ctx)
 	return 0;
 
-    if (yactx->state == USERKEY_ERROR)
+    if (yactx->state == USERINFO_ERROR)
         return yacb_error_map_key(&yactx->errctx, s, l);
-    if (yactx->state == USERKEY_MAP) {
+    if (yactx->state == USERINFO_MAP) {
         if (ya_check_error(yactx->cbdata, &yactx->errctx, s, l)) {
-            yactx->state = USERKEY_ERROR;
+            yactx->state = USERINFO_ERROR;
             return 1;
         }
     }
-    if(yactx->state == USERKEY_MAP) {
+    if(yactx->state == USERINFO_MAP) {
 	if(l == lenof("userKey") && !memcmp(s, "userKey", lenof("userKey"))) {
-	    yactx->state = USERKEY_KEY;
+	    yactx->state = USERINFO_KEY;
 	    return 1;
 	}
+        if(l == lenof("userID") && !memcmp(s, "userID", lenof("userID"))) {
+            yactx->state = USERINFO_ID;
+            return 1;
+        }
+        if(l == lenof("userType") && !memcmp(s, "userType", lenof("userType"))) {
+            yactx->state = USERINFO_ROLE;
+            return 1;
+        }
 	return 1;
     }
 
-    CBDEBUG("bad state (in %d, expected %d)", yactx->state, USERKEY_KEY);
+    CBDEBUG("bad state (in %d, expected %d)", yactx->state, USERINFO_KEY);
     return 0;
 }
 
-static int yacb_userkey_string(void *ctx, const unsigned char *s, size_t l) {
-    struct cb_userkey_ctx *yactx = ctx;
+static int yacb_userinfo_string(void *ctx, const unsigned char *s, size_t l) {
+    struct cb_userinfo_ctx *yactx = ctx;
     if(!ctx)
 	return 0;
-    if (yactx->state == USERKEY_ERROR)
+    if (yactx->state == USERINFO_ERROR)
         return yacb_error_string(&yactx->errctx, s, l);
 
     if(l<=0)
 	return 0;
-    if (yactx->state == USERKEY_MAP)
+    if (yactx->state == USERINFO_MAP)
         return 1;
-    if (yactx->state == USERKEY_KEY) {
-        unsigned char token[AUTHTOK_BIN_LEN];
-        sxi_md_ctx *ch_ctx;
-        sxc_client_t *sx = sxi_conns_get_client(sxi_cbdata_get_conns(yactx->cbdata));
-
-        memset(token, 0, sizeof(token));
-	if(sxi_hex2bin((const char *)s, l, token + AUTH_UID_LEN, AUTH_KEY_LEN)) {
+    if (yactx->state == USERINFO_KEY) {
+	if(sxi_hex2bin((const char *)s, l, yactx->token + AUTH_UID_LEN, AUTH_KEY_LEN)) {
             sxi_cbdata_seterr(yactx->cbdata, SXE_ECOMM, "Failed to convert user key from hex");
             return 0;
         }
-
-        ch_ctx = sxi_md_init();
-        if(!sxi_sha1_init(ch_ctx)) {
-            sxi_cbdata_seterr(yactx->cbdata, SXE_ECRYPT, "Cannot compute hash: Unable to initialize crypto library");
-            sxi_md_cleanup(&ch_ctx);
-            return 1;
+        yactx->state = USERINFO_MAP;
+        return 1;
+    } else if(yactx->state == USERINFO_ID) {
+        if(sxi_hex2bin((const char *)s, l, yactx->token, AUTH_UID_LEN)) {
+            sxi_cbdata_seterr(yactx->cbdata, SXE_ECOMM, "Failed to convert user key from hex");
+            return 0;
         }
-        if(!sxi_sha1_update(ch_ctx, yactx->username, strlen(yactx->username)) ||
-           !sxi_sha1_final(ch_ctx, token, NULL)) {
-            sxi_cbdata_seterr(yactx->cbdata, SXE_ECRYPT, "Cannot compute hash: Crypto library failure");
-            sxi_md_cleanup(&ch_ctx);
-            return 1;
+        yactx->state = USERINFO_MAP;
+        return 1;
+    } else if(yactx->state == USERINFO_ROLE) {
+        if(l != 6 && l != 5) {
+            CBDEBUG("Invalid role: bad role string length");
+            return 0;
         }
-        sxi_md_cleanup(&ch_ctx);
-        char *tok = sxi_b64_enc(sx, token, sizeof(token));
 
-        /* FIXME: Do not store errors in global buffer (bb#751) */
-        sxi_cbdata_restore_global_error(sx, yactx->cbdata);
+        if(strncmp("admin", (const char*)s, l) && strncmp("normal", (const char*)s, l)) {
+            CBDEBUG("Invalid role: should be admin or normal");
+            return 0;
+        }
 
-        fprintf(yactx->f, "%s\n", tok);
-        free(tok);
-        yactx->state = USERKEY_MAP;
+        memcpy(yactx->role, s, l);
+        yactx->role[l] = '\0';
+        yactx->state = USERINFO_MAP;
         return 1;
     }
     return 0;
 }
 
-static int yacb_userkey_end_map(void *ctx) {
-    struct cb_userkey_ctx *yactx = ctx;
+static int yacb_userinfo_end_map(void *ctx) {
+    struct cb_userinfo_ctx *yactx = ctx;
     if(!ctx)
 	return 0;
-    if (yactx->state == USERKEY_ERROR)
+    if (yactx->state == USERINFO_ERROR)
         return yacb_error_end_map(&yactx->errctx);
-    if(yactx->state == USERKEY_MAP)
-	yactx->state = USERKEY_COMPLETE;
+    if(yactx->state == USERINFO_MAP)
+	yactx->state = USERINFO_COMPLETE;
     else {
 	CBDEBUG("bad state (in %d, expected %d)", yactx->state, FN_CLUSTER);
 	return 0;
@@ -2658,31 +3356,32 @@ static int yacb_userkey_end_map(void *ctx) {
     return 1;
 }
 
-int sxc_user_getkey(sxc_cluster_t *cluster, const char *username, FILE *storeauth)
+int sxc_user_getinfo(sxc_cluster_t *cluster, const char *username, FILE *storeauth, int *is_admin, int get_config_link)
 {
     sxc_client_t *sx;
-    struct cb_userkey_ctx yctx;
+    struct cb_userinfo_ctx yctx;
     yajl_callbacks *yacb;
     int ret = 1;
     unsigned n;
     char *url = NULL;
+    char *tok = NULL;
+    char *link = NULL;
 
     if(!cluster)
 	return 1;
-    if(!username || !storeauth) {
+    if(!username || (!storeauth && !is_admin)) {
         cluster_err(SXE_EARG, "Null args");
         return 1;
     }
     memset(&yctx, 0, sizeof(yctx));
     yacb = &yctx.yacb;
     ya_init(yacb);
-    yacb->yajl_start_map = yacb_userkey_start_map;
-    yacb->yajl_map_key = yacb_userkey_map_key;
-    yacb->yajl_string = yacb_userkey_string;
-    yacb->yajl_end_map = yacb_userkey_end_map;
+    yacb->yajl_start_map = yacb_userinfo_start_map;
+    yacb->yajl_map_key = yacb_userinfo_map_key;
+    yacb->yajl_string = yacb_userinfo_string;
+    yacb->yajl_end_map = yacb_userinfo_end_map;
     yctx.yh = NULL;
     yctx.f = storeauth;
-    yctx.username = username;
 
     sx = sxi_cluster_get_client(cluster);
 
@@ -2691,24 +3390,40 @@ int sxc_user_getkey(sxc_cluster_t *cluster, const char *username, FILE *storeaut
     url = malloc(n);
     if (!url) {
 	sxi_seterr(sx, SXE_EMEM, "Out of memory");
-        goto done;
+        goto sxc_user_getinfo_err;
     }
     snprintf(url, n, ".users/%s", username);
 
     sxi_set_operation(sxi_cluster_get_client(cluster), "get user's key", sxi_cluster_get_name(cluster), NULL, NULL);
     if (sxi_cluster_query(sxi_cluster_get_conns(cluster), NULL, REQ_GET, url, NULL, 0,
-                          userkey_setup_cb, userkey_cb, &yctx) != 200)
-        goto done;
-    if(yajl_complete_parse(yctx.yh) != yajl_status_ok || yctx.state != USERKEY_COMPLETE) {
-        if (yctx.state != USERKEY_ERROR) {
+                          userinfo_setup_cb, userinfo_cb, &yctx) != 200)
+        goto sxc_user_getinfo_err;
+    if(yajl_complete_parse(yctx.yh) != yajl_status_ok || yctx.state != USERINFO_COMPLETE) {
+        if (yctx.state != USERINFO_ERROR) {
             SXDEBUG("JSON parsing failed");
             sxi_seterr(sx, SXE_ECOMM, "Cannot get user key: Communication error");
         }
-        goto done;
+        goto sxc_user_getinfo_err;
     }
     ret = 0;
 
-done:
+    tok = sxi_b64_enc(sx, yctx.token, sizeof(yctx.token));
+    if(!tok)
+        goto sxc_user_getinfo_err;
+
+    if(get_config_link) {
+        link = sxc_cluster_configuration_link(cluster, username, tok);
+        if(!link)
+            goto sxc_user_getinfo_err;
+    }
+
+    if(storeauth)
+        fprintf(storeauth, "%s\n", get_config_link ? link : tok);
+    if(is_admin)
+        *is_admin = (!strncmp("admin", yctx.role, sizeof(yctx.role)-1) ? 1 : 0);
+sxc_user_getinfo_err:
+    free(tok);
+    free(link);
     free(url);
     if(yctx.yh)
 	yajl_free(yctx.yh);
@@ -2784,6 +3499,70 @@ int sxc_cluster_fetch_ca(sxc_cluster_t *cluster, int quiet)
     if (tmpcafile && sxc_cluster_set_cafile(cluster, tmpcafile))
         return 1;
     return 0;
+}
+
+char *sxc_fetch_sxauthd_credentials(sxc_client_t *sx, const char *username, const char *pass, const char *host, int port, int quiet) {
+    char *ret = NULL;
+    sxi_conns_t *conns = NULL;
+    const char *tmpcafile = NULL;
+    FILE *f = NULL;
+    char unique_name[1024];
+    char hostname[1024];
+    struct passwd *pw;
+    uid_t uid;
+
+    if(!username || !pass || !host || !username) {
+        sxi_seterr(sx, SXE_EARG, "NULL argument");
+        return NULL;
+    }
+
+    uid = geteuid();
+    pw = getpwuid(uid);
+    if(!pw) {
+        sxi_seterr(sx, SXE_ECFG, "Failed to obtain system username: %s", strerror(errno));
+        return NULL;
+    }
+
+    gethostname(hostname, sizeof(hostname));
+    if(!strlen(pw->pw_name) || !strlen(hostname) || strlen(pw->pw_name) + strlen(hostname) + 1 >= sizeof(unique_name)) {
+        sxi_seterr(sx, SXE_EARG, "Failed to obtain unique device name");
+        return NULL;
+    }
+    snprintf(unique_name, sizeof(unique_name), "%s@%s", pw->pw_name, hostname);
+
+    tmpcafile = sxi_tempfile_track(sx, NULL, &f);
+    if(!tmpcafile)
+        goto sxc_fetch_sxauthd_credentials_err;
+
+    conns = sxi_conns_new(sx);
+    if(!conns)
+        goto sxc_fetch_sxauthd_credentials_err;
+
+    if(sxi_conns_set_dnsname(conns, host))
+        goto sxc_fetch_sxauthd_credentials_err;
+
+    /* Create a hostlist from a dns name host (needed to fetch ca) */
+    if(sxi_conns_resolve_hostlist(conns)) {
+        sxi_seterr(sx, SXE_ECFG, "Failed to resolve hostlist from dns name '%s'\n", host);
+        goto sxc_fetch_sxauthd_credentials_err;
+    }
+    SXDEBUG("Successfully got list sxauthd of hosts");
+
+    sxi_set_operation(sx, "fetch certificate", NULL, NULL, NULL);
+    if(sxi_conns_root_noauth(conns, tmpcafile, quiet)) {
+        SXDEBUG("Failed to fetch sxauthd CA certificate");
+        goto sxc_fetch_sxauthd_credentials_err;
+    }
+    sxi_conns_set_cafile(conns, tmpcafile);
+
+    sxi_set_operation(sx, "fetch sxauthd credentials", NULL, NULL, NULL);
+    ret = sxi_conns_fetch_sxauthd_credentials(conns, username, pass, unique_name, unique_name, host, port, quiet);
+
+sxc_fetch_sxauthd_credentials_err:
+    if(f)
+        fclose(f);
+    sxi_conns_free(conns);
+    return ret;
 }
 
 int sxc_cluster_trigger_gc(sxc_cluster_t *cluster, int delete_reservations)
@@ -2873,4 +3652,626 @@ int sxc_cluster_set_conns_limit(sxc_cluster_t *cluster, unsigned int max_active,
         return 1;
 
     return sxi_conns_set_connections_limit(cluster->conns, max_active, max_active_per_host);
+}
+
+struct node_status_ctx {
+    sxi_node_status_t status;
+    yajl_handle yh;
+    yajl_callbacks yacb;
+    curlev_context_t *cbdata;
+    struct cb_error_ctx errctx;
+    enum node_status_state { NS_ERROR, NS_BEGIN, NS_KEY, NS_OSTYPE, NS_ARCH, NS_RELEASE, NS_VERSION, NS_CORES, NS_ENDIANNESS,
+        NS_LOCALTIME, NS_UTCTIME, NS_ADDR, NS_INTERNAL_ADDR, NS_UUID, NS_STORAGE_VERSION, NS_LIBSX_VERSION, NS_STORAGE_DIR,
+        NS_STORAGE_ALLOC, NS_STORAGE_USED, NS_FS_BLOCK_SIZE, NS_FS_TOTAL_BLOCKS, NS_FS_AVAIL_BLOCKS,
+        NS_MEM_TOTAL, NS_HEAL, NS_COMPLETE } state;
+};
+
+static int yacb_node_status_start_map(void *ctx) {
+    struct node_status_ctx *yactx = (struct node_status_ctx *)ctx;
+
+    if(!ctx)
+        return 0;
+    if(yactx->state == NS_BEGIN)
+        yactx->state = NS_KEY;
+    else
+        CBDEBUG("bad state (in %d, expected %d)", yactx->state, NS_BEGIN);
+    return 1;
+}
+
+static int yacb_node_status_end_map(void *ctx) {
+    struct node_status_ctx *yactx = (struct node_status_ctx *)ctx;
+
+    if(!ctx)
+        return 0;
+    if (yactx->state == NS_ERROR)
+        return yacb_error_end_map(&yactx->errctx);
+    if(yactx->state == NS_KEY)
+        yactx->state = NS_COMPLETE;
+    else
+        CBDEBUG("bad state (in %d, expected %d)", yactx->state, NS_KEY);
+    return 1;
+}
+
+static int yacb_node_status_string(void *ctx, const unsigned char *s, size_t l) {
+    struct node_status_ctx *yactx = (struct node_status_ctx *)ctx;
+
+    if (yactx->state == NS_ERROR)
+        return yacb_error_string(&yactx->errctx, s, l);
+    else if(yactx->state == NS_OSTYPE) {
+        if(l >= sizeof(yactx->status.os_name)) {
+            CBDEBUG("ostype string too long");
+            return 0;
+        }
+        memcpy(yactx->status.os_name, s, l);
+        yactx->status.os_name[sizeof(yactx->status.os_name)-1] = '\0';
+    } else if(yactx->state == NS_ARCH) {
+        if(l >= sizeof(yactx->status.os_arch)) {
+            CBDEBUG("arch string too long");
+            return 0;
+        }
+        memcpy(yactx->status.os_arch, s, l);
+        yactx->status.os_arch[sizeof(yactx->status.os_arch)-1] = '\0';
+    } else if(yactx->state == NS_RELEASE) {
+        if(l >= sizeof(yactx->status.os_release)) {
+            CBDEBUG("release string too long");
+            return 0;
+        }
+        memcpy(yactx->status.os_release, s, l);
+        yactx->status.os_release[sizeof(yactx->status.os_release)-1] = '\0';
+    } else if(yactx->state == NS_VERSION) {
+        if(l >= sizeof(yactx->status.os_version)) {
+            CBDEBUG("version string too long");
+            return 0;
+        }
+        memcpy(yactx->status.os_version, s, l);
+        yactx->status.os_version[sizeof(yactx->status.os_version)-1] = '\0';
+    } else if(yactx->state == NS_LOCALTIME) {
+        if(l >= sizeof(yactx->status.localtime)) {
+            CBDEBUG("localtime string too long");
+            return 0;
+        }
+        memcpy(yactx->status.localtime, s, l);
+        yactx->status.localtime[sizeof(yactx->status.localtime)-1] = '\0';
+    } else if(yactx->state == NS_UTCTIME) {
+        if(l >= sizeof(yactx->status.utctime)) {
+            CBDEBUG("utctime string too long");
+            return 0;
+        }
+        memcpy(yactx->status.utctime, s, l);
+        yactx->status.utctime[sizeof(yactx->status.utctime)-1] = '\0';
+    } else if(yactx->state == NS_ADDR) {
+        if(l >= sizeof(yactx->status.addr)) {
+            CBDEBUG("address string too long");
+            return 0;
+        }
+        memcpy(yactx->status.addr, s, l);
+        yactx->status.addr[sizeof(yactx->status.addr)-1] = '\0';
+    } else if(yactx->state == NS_ENDIANNESS) {
+        if(l >= sizeof(yactx->status.endianness)) {
+            CBDEBUG("endianness string too long");
+            return 0;
+        }
+        memcpy(yactx->status.endianness, s, l);
+        yactx->status.endianness[sizeof(yactx->status.endianness)-1] = '\0';
+    } else if(yactx->state == NS_INTERNAL_ADDR) {
+        if(l >= sizeof(yactx->status.internal_addr)) {
+            CBDEBUG("internal address string too long");
+            return 0;
+        }
+        memcpy(yactx->status.internal_addr, s, l);
+        yactx->status.internal_addr[sizeof(yactx->status.internal_addr)-1] = '\0';
+    } else if(yactx->state == NS_UUID) {
+        if(l >= sizeof(yactx->status.uuid)) {
+            CBDEBUG("uuid string too long");
+            return 0;
+        }
+        memcpy(yactx->status.uuid, s, l);
+        yactx->status.uuid[sizeof(yactx->status.uuid)-1] = '\0';
+    } else if(yactx->state == NS_STORAGE_DIR) {
+        if(l >= sizeof(yactx->status.storage_dir)) {
+            CBDEBUG("storage dir string too long");
+            return 0;
+        }
+        memcpy(yactx->status.storage_dir, s, l);
+        yactx->status.storage_dir[sizeof(yactx->status.storage_dir)-1] = '\0';
+    } else if(yactx->state == NS_STORAGE_VERSION) {
+        if(l >= sizeof(yactx->status.hashfs_version)) {
+            CBDEBUG("hashfs version string too long");
+            return 0;
+        }
+        memcpy(yactx->status.hashfs_version, s, l);
+        yactx->status.hashfs_version[sizeof(yactx->status.hashfs_version)-1] = '\0';
+    } else if(yactx->state == NS_LIBSX_VERSION) {
+        if(l >= sizeof(yactx->status.libsx_version)) {
+            CBDEBUG("hashfs version string too long");
+            return 0;
+        }
+        memcpy(yactx->status.libsx_version, s, l);
+        yactx->status.libsx_version[sizeof(yactx->status.libsx_version)-1] = '\0';
+    } else if(yactx->state == NS_HEAL) {
+        if (l >= sizeof(yactx->status.heal_status)) {
+            CBDEBUG("heal status too long");
+            return 0;
+        }
+        memcpy(yactx->status.heal_status, s, l);
+        yactx->status.heal_status[sizeof(yactx->status.heal_status)-1] = '\0';
+    } else if(yactx->state != NS_KEY) {
+        CBDEBUG("bad state (in %d, expected %d, %d, %d, %d, %d, %d, %d, %d, %d or %d)", yactx->state, NS_OSTYPE, NS_ARCH,
+            NS_RELEASE, NS_VERSION, NS_ADDR, NS_INTERNAL_ADDR, NS_UUID, NS_STORAGE_DIR, NS_STORAGE_VERSION, NS_LIBSX_VERSION);
+    }
+
+    yactx->state = NS_KEY;
+    return 1;
+}
+
+static int yacb_node_status_map_key(void *ctx, const unsigned char *s, size_t l) {
+    struct node_status_ctx *yactx = (struct node_status_ctx *)ctx;
+
+    if(!ctx)
+        return 0;
+    if (yactx->state == NS_ERROR)
+        return yacb_error_map_key(&yactx->errctx, s, l);
+    else if(yactx->state == NS_KEY) {
+        if(l == lenof("osType") && !memcmp(s, "osType", lenof("osType")))
+            yactx->state = NS_OSTYPE;
+        else if(l == lenof("osArch") && !memcmp(s, "osArch", lenof("osArch")))
+            yactx->state = NS_ARCH;
+        else if(l == lenof("osRelease") && !memcmp(s, "osRelease", lenof("osRelease")))
+            yactx->state = NS_RELEASE;
+        else if(l == lenof("osVersion") && !memcmp(s, "osVersion", lenof("osVersion")))
+            yactx->state = NS_VERSION;
+        else if(l == lenof("localTime") && !memcmp(s, "localTime", lenof("localTime")))
+            yactx->state = NS_LOCALTIME;
+        else if(l == lenof("utcTime") && !memcmp(s, "utcTime", lenof("utcTime")))
+            yactx->state = NS_UTCTIME;
+        else if(l == lenof("cores") && !memcmp(s, "cores", lenof("cores")))
+            yactx->state = NS_CORES;
+        else if(l == lenof("osEndianness") && !memcmp(s, "osEndianness", lenof("osEndianness")))
+            yactx->state = NS_ENDIANNESS;
+        else if(l == lenof("address") && !memcmp(s, "address", lenof("address")))
+            yactx->state = NS_ADDR;
+        else if(l == lenof("internalAddress") && !memcmp(s, "internalAddress", lenof("internalAddress")))
+            yactx->state = NS_INTERNAL_ADDR;
+        else if(l == lenof("UUID") && !memcmp(s, "UUID", lenof("UUID")))
+            yactx->state = NS_UUID;
+        else if(l == lenof("hashFSVersion") && !memcmp(s, "hashFSVersion", lenof("hashFSVersion")))
+            yactx->state = NS_STORAGE_VERSION;
+        else if(l == lenof("libsxVersion") && !memcmp(s, "libsxVersion", lenof("libsxVersion")))
+            yactx->state = NS_LIBSX_VERSION;
+        else if(l == lenof("nodeDir") && !memcmp(s, "nodeDir", lenof("nodeDir")))
+            yactx->state = NS_STORAGE_DIR;
+        else if(l == lenof("storageAllocated") && !memcmp(s, "storageAllocated", lenof("storageAllocated")))
+            yactx->state = NS_STORAGE_ALLOC;
+        else if(l == lenof("storageUsed") && !memcmp(s, "storageUsed", lenof("storageUsed")))
+            yactx->state = NS_STORAGE_USED;
+        else if(l == lenof("fsBlockSize") && !memcmp(s, "fsBlockSize", lenof("fsBlockSize")))
+            yactx->state = NS_FS_BLOCK_SIZE;
+        else if(l == lenof("fsTotalBlocks") && !memcmp(s, "fsTotalBlocks", lenof("fsTotalBlocks")))
+            yactx->state = NS_FS_TOTAL_BLOCKS;
+        else if(l == lenof("fsAvailBlocks") && !memcmp(s, "fsAvailBlocks", lenof("fsAvailBlocks")))
+            yactx->state = NS_FS_AVAIL_BLOCKS;
+        else if(l == lenof("memTotal") && !memcmp(s, "memTotal", lenof("memTotal")))
+            yactx->state = NS_MEM_TOTAL;
+        else if(l == lenof("heal") && !memcmp(s, "heal", lenof("heal")))
+            yactx->state = NS_HEAL;
+        else
+            CBDEBUG("unexpected key '%.*s'", (unsigned)l, s);
+        return 1;
+    }
+
+    CBDEBUG("bad state (in %d, expected %d)", yactx->state, NS_KEY);
+    return 1;
+}
+
+static int yacb_node_status_number(void *ctx, const char *s, size_t l) {
+    struct node_status_ctx *yactx = (struct node_status_ctx *)ctx;
+    char numb[24], *enumb;
+    long long number;
+
+    if(!ctx)
+        return 0;
+
+    if(l < 1 || l > 20) {
+        CBDEBUG("Invalid number '%.*s'", (unsigned)l, s);
+        return 0;
+    }
+    memcpy(numb, s, l);
+    numb[l] = '\0';
+    number = strtoll(numb, &enumb, 10);
+    if(*enumb) {
+        CBDEBUG("invalid number '%.*s'", (unsigned)l, s);
+        return 0;
+    }
+
+    switch(yactx->state) {
+        case NS_CORES:
+            yactx->status.cores = number;
+            break;
+        case NS_STORAGE_ALLOC:
+            yactx->status.storage_allocated = number;
+            break;
+        case NS_STORAGE_USED:
+            yactx->status.storage_commited = number;
+            break;
+        case NS_FS_BLOCK_SIZE:
+            yactx->status.block_size = number;
+            break;
+        case NS_FS_TOTAL_BLOCKS:
+            yactx->status.total_blocks = number;
+            break;
+        case NS_FS_AVAIL_BLOCKS:
+            yactx->status.avail_blocks = number;
+            break;
+        case NS_MEM_TOTAL:
+            yactx->status.mem_total = number;
+            break;
+        default:
+            CBDEBUG("bad state (in %d, expected %d, %d, %d, %d, %d, %d or %d)", yactx->state, NS_CORES,
+                NS_STORAGE_ALLOC, NS_STORAGE_USED, NS_FS_BLOCK_SIZE, NS_FS_TOTAL_BLOCKS, NS_FS_AVAIL_BLOCKS,
+                NS_MEM_TOTAL);
+    }
+
+    yactx->state = NS_KEY;
+    return 1;
+}
+
+static int node_status_cb(curlev_context_t *cbdata, void *ctx, const void *data, size_t size) {
+    struct node_status_ctx *yactx = (struct node_status_ctx *)ctx;
+    if(yajl_parse(yactx->yh, data, size) != yajl_status_ok) {
+        if (yactx->state != NS_ERROR) {
+            CBDEBUG("failed to parse JSON data: %s", sxi_cbdata_geterrmsg(yactx->cbdata));
+            sxi_cbdata_seterr(yactx->cbdata, SXE_ECOMM, "communication error");
+        }
+        return 1;
+    }
+    return 0;
+}
+
+static int node_status_setup_cb(curlev_context_t *cbdata, void *ctx, const char *host) {
+    struct node_status_ctx *yactx = (struct node_status_ctx *)ctx;
+
+    if(yactx->yh)
+        yajl_free(yactx->yh);
+
+    yactx->cbdata = cbdata;
+    if(!(yactx->yh  = yajl_alloc(&yactx->yacb, NULL, yactx))) {
+        CBDEBUG("failed to allocate yajl structure");
+        sxi_cbdata_seterr(cbdata, SXE_EMEM, "Getting node status failed: Out of memory");
+        return 1;
+    }
+    return 0;
+}
+
+int sxi_cluster_status(sxc_cluster_t *cluster, const node_status_cb_t status_cb, int human_readable) {
+    sxi_conns_t *conns = sxi_cluster_get_conns(cluster);
+    sxc_client_t *sx = sxi_cluster_get_client(cluster);
+    int ret = 1, fail = 0;
+    sxi_hostlist_t *hosts;
+    sxi_hostlist_t hlist;
+    unsigned int i;
+    unsigned int nnodes;
+
+    if(!cluster)
+        return 1;
+
+    if(!status_cb) {
+        sxi_seterr(sx, SXE_EARG, "NULL argument");
+        return 1;
+    }
+
+    hosts = sxi_conns_get_hostlist(conns);
+    if(!hosts) {
+        sxi_seterr(sx, SXE_ECOMM, "Failed to get cluster host list");
+        return 1;
+    }
+
+    nnodes = sxi_hostlist_get_count(hosts);
+    sxi_hostlist_init(&hlist);
+
+    sxi_set_operation(sx, "check cluster status", NULL, NULL, NULL);
+    for(i = 0; i < nnodes; i++) {
+        int qret;
+        const char *node = sxi_hostlist_get_host(hosts, i);
+        struct node_status_ctx *yctx = NULL;
+        yajl_callbacks *yacb;
+
+        if(sxi_hostlist_add_host(sx, &hlist, node)) {
+            SXDEBUG("Failed to get status of node %s: %s", node, sxc_geterrmsg(sx));
+            goto sxc_cluster_status_err;
+        }
+
+        if(!(yctx = calloc(1, sizeof(*yctx)))) {
+            SXDEBUG("Failed to allocate yajl handle");
+            goto sxc_cluster_status_err;
+        }
+
+        yacb = &yctx->yacb;
+        ya_init(yacb);
+        yacb->yajl_start_map = yacb_node_status_start_map;
+        yacb->yajl_map_key = yacb_node_status_map_key;
+        yacb->yajl_string = yacb_node_status_string;
+        yacb->yajl_number = yacb_node_status_number;
+        yacb->yajl_end_map = yacb_node_status_end_map;
+        yctx->state = NS_BEGIN;
+
+        qret = sxi_cluster_query(conns, &hlist, REQ_GET, ".status", NULL, 0, node_status_setup_cb, node_status_cb, yctx);
+        sxi_hostlist_empty(&hlist);
+        if(qret != 200) {
+            SXDEBUG("Failed to get status of node %s: %s", node, sxc_geterrmsg(sx));
+            yajl_free(yctx->yh);
+            free(yctx);
+            enum sxc_error_t code = SXE_ECOMM;
+            char *old_msg = strdup(sxc_geterrmsg(sx));
+            if (qret == 403 && strstr(old_msg, "Volume name is reserved")) {
+                free(old_msg);
+                old_msg = strdup("doesn't support status query (server version older than 1.1?)");
+                code = SXE_EAGAIN;
+            }
+            sxc_clearerr(sx);
+            sxi_seterr(sx, code, "Can't query node %s%s%s", node, old_msg ? ": " : "", old_msg ? old_msg : "");
+            free(old_msg);
+            fail = 1;
+            status_cb(sx, qret, NULL, human_readable);
+            sxc_clearerr(sx);
+            continue;
+        }
+
+        if(yajl_complete_parse(yctx->yh) != yajl_status_ok || yctx->state != NS_COMPLETE) {
+            SXDEBUG("Failed to complete parsing of node %s status", node);
+            yajl_free(yctx->yh);
+            free(yctx);
+            sxc_clearerr(sx);
+            sxi_seterr(sx, SXE_ECOMM, "Can't query node %s", node);
+            fail = 1;
+            status_cb(sx, qret, NULL, human_readable);
+            continue;
+        }
+
+        status_cb(sx, qret, &yctx->status, human_readable);
+        yajl_free(yctx->yh);
+        free(yctx);
+    }
+
+    if(fail) {
+        sxc_clearerr(sx);
+        sxi_seterr(sx, SXE_ECOMM, "Failed to communicate with all cluster nodes");
+        goto sxc_cluster_status_err;
+    }
+    ret = 0;
+sxc_cluster_status_err:
+    sxi_hostlist_empty(&hlist);
+    return ret;
+}
+
+static int distribution_lock_common(sxc_cluster_t *cluster, int op, const char *master) {
+    sxi_query_t *query;
+    sxc_client_t *sx = sxi_cluster_get_client(cluster);
+    sxi_conns_t *conns = sxi_cluster_get_conns(cluster);
+    sxi_hostlist_t *hosts, new_hosts;
+    const char *min_host = NULL;
+    unsigned int i;
+
+    if(!cluster) {
+        sxi_seterr(sx, SXE_EARG, "Invalid argument");
+        return 1;
+    }
+    
+    sx = sxi_cluster_get_client(cluster);
+    conns = sxi_cluster_get_conns(cluster);
+
+    if(!sx || !conns) {
+        sxi_seterr(sx, SXE_EARG, "Invalid argument");
+        return 1;
+    }
+
+    query = sxi_distlock_proto(sx, op, NULL);
+    if(!query) {
+        SXDEBUG("Failed to create distlock query");
+        return 1;
+    }
+
+    hosts = sxi_conns_get_hostlist(conns);
+    if(!hosts) {
+        sxi_seterr(sx, SXE_ECOMM, "Failed to get cluster host list");
+        sxi_query_free(query);
+        return 1;
+    }
+
+    for(i = 0; i < sxi_hostlist_get_count(hosts); i++) {
+        const char *host = sxi_hostlist_get_host(hosts, i);
+        if(master) {
+            if(!strcmp(master, host)) {
+                min_host = host;
+                break;
+            }
+        } else if(!min_host || strcmp(host, min_host) < 0)
+            min_host = host;
+    }
+
+    if(!min_host) {
+        sxi_seterr(sx, SXE_EARG, "Cannot determine master node");
+        sxi_query_free(query);
+        return 1;
+    }
+
+    sxi_hostlist_init(&new_hosts);
+    if(sxi_hostlist_add_host(sx, &new_hosts, min_host)) {
+        sxi_query_free(query);
+        sxi_hostlist_empty(&new_hosts);
+        return 1;
+    }
+
+    sxi_set_operation(sx, op ? "lock cluster" : "unlock cluster", NULL, NULL, NULL);
+    if(sxi_job_submit_and_poll(conns, &new_hosts, query->verb, query->path, query->content, query->content_len)) {
+        sxi_query_free(query);
+        sxi_hostlist_empty(&new_hosts);
+        return 1;
+    }
+
+    sxi_query_free(query);
+    sxi_hostlist_empty(&new_hosts);
+    return 0;
+}
+    
+int sxi_cluster_distribution_lock(sxc_cluster_t *cluster, const char *master) {
+    return distribution_lock_common(cluster, 1, master);
+}
+
+int sxi_cluster_distribution_unlock(sxc_cluster_t *cluster, const char *master) {
+    return distribution_lock_common(cluster, 0, master);
+}
+
+int sxi_cluster_set_mode(sxc_cluster_t *cluster, int readonly) {
+    sxi_query_t *query;
+    sxc_client_t *sx = sxi_cluster_get_client(cluster);
+    sxi_conns_t *conns = sxi_cluster_get_conns(cluster);
+    sxi_hostlist_t *hosts;
+
+    if(!cluster) {
+        sxi_seterr(sx, SXE_EARG, "Invalid argument");
+        return 1;
+    }
+
+    sx = sxi_cluster_get_client(cluster);
+    conns = sxi_cluster_get_conns(cluster);
+
+    if(!sx || !conns) {
+        sxi_seterr(sx, SXE_EARG, "Invalid argument");
+        return 1;
+    }
+
+    query = sxi_cluster_mode_proto(sx, readonly);
+    if(!query) {
+        SXDEBUG("Failed to create distlock query");
+        return 1;
+    }
+
+    hosts = sxi_conns_get_hostlist(conns);
+    if(!hosts) {
+        sxi_seterr(sx, SXE_ECOMM, "Failed to get cluster host list");
+        sxi_query_free(query);
+        return 1;
+    }
+
+    sxi_set_operation(sx, readonly ? "switch cluster to read-only mode" : "switch cluster to read-write mode", NULL, NULL, NULL);
+    if(sxi_job_submit_and_poll(conns, hosts, query->verb, query->path, query->content, query->content_len)) {
+        sxi_query_free(query);
+        return 1;
+    }
+
+    sxi_query_free(query);
+    return 0;
+}
+
+char *sxc_cluster_configuration_link(sxc_cluster_t *cluster, const char *username, const char *token) {
+    unsigned int len;
+    char *ret = NULL;
+    const char *cluster_name;
+    sxc_client_t *sx = sxi_cluster_get_client(cluster);
+    sxi_conns_t *conns = sxi_cluster_get_conns(cluster);
+    const char *host;
+    int port, ssl, is_dns = 1;
+    uint8_t certhash[SXI_SHA1_BIN_LEN];
+    char fingerprint[SXI_SHA1_TEXT_LEN+1];
+    unsigned int certhash_len = 0;
+    unsigned int offset;
+    char *enc_user = NULL, *enc_token, *enc_host = NULL;
+
+    if(!cluster)
+        return NULL;
+    if(!token) {
+        sxi_seterr(sx, SXE_EARG, "NULL argument: %s", !username ? "username" : "token");
+        return ret;
+    }
+    cluster_name = sxc_cluster_get_sslname(cluster);
+    if(!cluster_name) {
+        sxi_seterr(sx, SXE_EARG, "Cannot get cluster name");
+        return NULL;
+    }
+
+    host = sxi_conns_get_dnsname(conns);
+    if(!host) {
+        sxi_hostlist_t *hosts;
+
+        hosts = sxi_conns_get_hostlist(conns);
+        if(!hosts || !sxi_hostlist_get_count(hosts)) {
+            sxi_seterr(sx, SXE_ECFG, "Invalid host list");
+            return NULL;
+        }
+
+        host = sxi_hostlist_get_host(hosts, 0);
+        if(!host) {
+            sxi_seterr(sx, SXE_ECFG, "Invalid host list");
+            return NULL;
+        }
+        is_dns = 0;
+    }
+
+    ssl = sxi_conns_is_secure(conns);
+    port = sxc_cluster_get_httpport(cluster);
+    if(!port)
+        port = (ssl ? 443 : 80);
+
+    if(ssl) {
+        const char *cafile = sxi_conns_get_cafile(conns);
+        if(!cafile) {
+            sxi_seterr(sx, SXE_EMEM, "Failed to get ca file name");
+            return NULL;
+        }
+
+        if(sxi_vcrypt_get_cert_fingerprint(sx, cafile, certhash, &certhash_len) || certhash_len != SXI_SHA1_BIN_LEN) {
+            sxi_seterr(sx, SXE_EMEM, "Failed to get certificate fingerprint");
+            return NULL;
+        }
+
+        sxi_bin2hex(certhash, certhash_len, fingerprint);
+        fingerprint[SXI_SHA1_TEXT_LEN] = '\0';
+    }
+
+    len = lenof("sx:///?token=&port=&ssl=y") + strlen(cluster_name) + strlen(token) + 11 + 1;
+    if(username) {
+        enc_user = sxi_urlencode(sx, username, 1);
+        if(!enc_user)
+            return NULL;
+        len += strlen(enc_user) + 1; /* username@ */
+    }
+    if(ssl)
+        len += lenof("&certhash=") + strlen(fingerprint);
+    if(!is_dns) {
+        enc_host = sxi_urlencode(sx, host, 1);
+        if(!enc_host) {
+            free(enc_user);
+            return NULL;
+        }
+        len += lenof("&ip=") + strlen(enc_host);
+    }
+
+    enc_token = sxi_urlencode(sx, token, 1);
+    if(!enc_token) {
+        free(enc_user);
+        free(enc_host);
+        return NULL;
+    }
+
+    ret = malloc(len);
+    if(!ret) {
+        sxi_seterr(sx, SXE_EMEM, "Out of memory");
+        free(enc_user);
+        free(enc_host);
+        free(enc_token);
+        return NULL;
+    }
+    snprintf(ret, len, "sx://%s%s%s/?token=%s&port=%d&ssl=%c", enc_user ? enc_user : "", enc_user ? "@" : "", cluster_name, enc_token, port, ssl ? 'y' : 'n');
+    if(ssl) {
+        offset = strlen(ret);
+        snprintf(ret + offset, len - offset, "&certhash=%s", fingerprint);
+    }
+    if(!is_dns) {
+        offset = strlen(ret);
+        snprintf(ret + offset, len - offset, "&ip=%s", enc_host);
+    }
+    free(enc_user);
+    free(enc_host);
+    free(enc_token);
+    return ret;
 }

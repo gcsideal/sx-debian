@@ -3,6 +3,7 @@ args "--unamed-opts --no-handle-version --no-handle-error --file-name=cmd_userne
 usage "sxacl usernewkey [OPTIONS] <username> sx://[profile@]cluster"
 
 section "User key change options"
+option "pass-file" p "File containing user password (instead of stdin)" string optional
 option "auth-file" a "Store authentication token in given file (instead of stdout)" string optional
 
 section "Common options"
@@ -12,6 +13,8 @@ option  "config-dir"		c "Path to SX configuration directory"
 
 option  "force-key"                - "Change user key with an old authentication token" string typestr="TOKEN" optional hidden
 
-option "batch-mode" b		"Disable additional information and only print the authentication token" flag off
+option  "generate-key"      g "Generate a random key" flag off
+
+option "batch-mode" b		"Disable additional information and only print the automatically generated key" flag off
 
 option  "debug"		D "Enable debug messages" flag off

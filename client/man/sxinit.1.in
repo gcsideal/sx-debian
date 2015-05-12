@@ -17,8 +17,17 @@ Print help, including hidden options, and exit
 \fB\-V\fR, \fB\-\-version\fR
 Print version and exit
 .TP
+\fB\-C\fR, \fB\-\-config\-link\fR=\fI\,URI\/\fR
+Use a configuration link to perform an automated setup. The configuration link can be provided by a cluster administrator or obtained with \fBsxacl-usergetkey\fR(1).
+.TP
+\fB\-\-sxauthd\fR=\fI\,https://[username@]host/\/\fR
+Use sxauthd to access the cluster. sxauthd is part of SX Enterprise Edition and provides an enterprise login functionality by integrating with existing authentication mechanisms such as LDAP or PAM.
+.TP
 \fB\-L\fR, \fB\-\-list\fR
 List configured clusters and aliases
+.TP
+\fB\-I\fR, \fB\-\-info\fR
+Display information about a configured cluster.
 .TP
 \fB\-\-delete\fR
 Delete a profile and its associated aliases. When the last profile for a given cluster gets deleted, the entire local cluster configuration will be removed.
@@ -26,8 +35,8 @@ Delete a profile and its associated aliases. When the last profile for a given c
 \fB\-\-no\-ssl\fR
 Disable secure communication. For security reasons, only use this option when the cluster doesn't offer SSL connections.
 .TP
-\fB\-a\fR, \fB\-\-auth\-file\fR=\fI\,PATH\/\fR
-By default sxinit works in interactive mode and asks for the user key. With this option it will read it from the provided file.
+\fB\-p\fR, \fB\-\-pass\-file\fR=\fI\,PATH\/\fR
+By default sxinit works in interactive mode and asks for the user password on standard input. With this option it will read the password from the provided file.
 .TP
 \fB\-\-port\fR=\fI\,NUMBER\/\fR
 Set the cluster TCP port. By default, sxinit will use the port 443 (https) or 80 (http), when it's called with \-\-no\-ssl. The SX clusters can operate on custom ports and this option instructs sxinit to use a specific one.
@@ -43,6 +52,12 @@ Turn off interactive confirmations and assume yes for all questions. This option
 .TP
 \fB\-\-force\-reinit\fR
 Remove old cluster configuration and init from scratch. This option should be used when the remote cluster has been recreated and its identifier has changed (making sxinit report an error).
+.TP
+\fB\-k\fR, \fB\-\-key\fR
+Ask for an authentication key (used with SX 1.0 and older) instead of a password.
+.TP
+\fB\-a\fR, \fB\-\-auth\-file\fR=\fI\,PATH\/\fR
+By default sxinit works in interactive mode and when \fB\-\-key\fR is used it asks for the user key on standard input. With this option it will read it from the provided file.
 .TP
 \fB\-D\fR, \fB\-\-debug\fR
 Enable debug messages  (default=off)

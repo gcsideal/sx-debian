@@ -41,15 +41,23 @@ struct cluster_args_info
   const char *full_help_help; /**< @brief Print help, including hidden options, and exit help description.  */
   const char *version_help; /**< @brief Print version and exit help description.  */
   const char *new_help; /**< @brief Create a new SX cluster with a local node help description.  */
-  const char *mod_help; /**< @brief Modify an existing SX cluster help description.  */
+  const char *modify_help; /**< @brief Modify an existing SX cluster help description.  */
+  const char *lock_help; /**< @brief Lock an SX cluster for changes help description.  */
+  const char *unlock_help; /**< @brief Unlock an SX cluster help description.  */
   char * resize_arg;	/**< @brief Proportionally resize an existing SX cluster.  */
   char * resize_orig;	/**< @brief Proportionally resize an existing SX cluster original value given at command line.  */
   const char *resize_help; /**< @brief Proportionally resize an existing SX cluster help description.  */
   const char *replace_faulty_help; /**< @brief Replace faulty nodes in an existing SX cluster help description.  */
+  const char *set_faulty_help; /**< @brief Mark nodes of the cluster as faulty (without replacing them) help description.  */
   const char *info_help; /**< @brief Shows status and details of a running cluster help description.  */
   const char *force_gc_help; /**< @brief Force a garbage collection cycle on all nodes help description.  */
   const char *force_expire_help; /**< @brief Force GC and expiration of reservations on all nodes help description.  */
   const char *get_cluster_key_help; /**< @brief Obtain remote cluster key help description.  */
+  const char *list_nodes_help; /**< @brief List all nodes of the cluster and their current status help description.  */
+  char * set_mode_arg;	/**< @brief Set cluster operating mode ('ro' or 'rw' for read-only or write-only respectively).  */
+  char * set_mode_orig;	/**< @brief Set cluster operating mode ('ro' or 'rw' for read-only or write-only respectively) original value given at command line.  */
+  const char *set_mode_help; /**< @brief Set cluster operating mode ('ro' or 'rw' for read-only or write-only respectively) help description.  */
+  const char *upgrade_help; /**< @brief Check node versions and start cluster upgrade help description.  */
   char * node_dir_arg;	/**< @brief Path to the node directory.  */
   char * node_dir_orig;	/**< @brief Path to the node directory original value given at command line.  */
   const char *node_dir_help; /**< @brief Path to the node directory help description.  */
@@ -70,18 +78,27 @@ struct cluster_args_info
   char * config_dir_arg;	/**< @brief Path to SX configuration directory.  */
   char * config_dir_orig;	/**< @brief Path to SX configuration directory original value given at command line.  */
   const char *config_dir_help; /**< @brief Path to SX configuration directory help description.  */
+  char * locking_node_arg;	/**< @brief IP address of a node used to aqcuire cluster changes lock.  */
+  char * locking_node_orig;	/**< @brief IP address of a node used to aqcuire cluster changes lock original value given at command line.  */
+  const char *locking_node_help; /**< @brief IP address of a node used to aqcuire cluster changes lock help description.  */
   
   unsigned int help_given ;	/**< @brief Whether help was given.  */
   unsigned int full_help_given ;	/**< @brief Whether full-help was given.  */
   unsigned int version_given ;	/**< @brief Whether version was given.  */
   unsigned int new_given ;	/**< @brief Whether new was given.  */
-  unsigned int mod_given ;	/**< @brief Whether mod was given.  */
+  unsigned int modify_given ;	/**< @brief Whether modify was given.  */
+  unsigned int lock_given ;	/**< @brief Whether lock was given.  */
+  unsigned int unlock_given ;	/**< @brief Whether unlock was given.  */
   unsigned int resize_given ;	/**< @brief Whether resize was given.  */
   unsigned int replace_faulty_given ;	/**< @brief Whether replace-faulty was given.  */
+  unsigned int set_faulty_given ;	/**< @brief Whether set-faulty was given.  */
   unsigned int info_given ;	/**< @brief Whether info was given.  */
   unsigned int force_gc_given ;	/**< @brief Whether force-gc was given.  */
   unsigned int force_expire_given ;	/**< @brief Whether force-expire was given.  */
   unsigned int get_cluster_key_given ;	/**< @brief Whether get-cluster-key was given.  */
+  unsigned int list_nodes_given ;	/**< @brief Whether list-nodes was given.  */
+  unsigned int set_mode_given ;	/**< @brief Whether set-mode was given.  */
+  unsigned int upgrade_given ;	/**< @brief Whether upgrade was given.  */
   unsigned int node_dir_given ;	/**< @brief Whether node-dir was given.  */
   unsigned int port_given ;	/**< @brief Whether port was given.  */
   unsigned int ssl_ca_file_given ;	/**< @brief Whether ssl-ca-file was given.  */
@@ -90,6 +107,7 @@ struct cluster_args_info
   unsigned int human_readable_given ;	/**< @brief Whether human-readable was given.  */
   unsigned int debug_given ;	/**< @brief Whether debug was given.  */
   unsigned int config_dir_given ;	/**< @brief Whether config-dir was given.  */
+  unsigned int locking_node_given ;	/**< @brief Whether locking-node was given.  */
 
   char **inputs ; /**< @brief unamed options (options without names) */
   unsigned inputs_num ; /**< @brief unamed options number */

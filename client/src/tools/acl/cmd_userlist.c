@@ -39,6 +39,8 @@ const char *userlist_args_info_full_help[] = {
   "  -V, --version          Print version and exit",
   "\nCommon options:",
   "  -c, --config-dir=PATH  Path to SX configuration directory",
+  "      --clones=NAME      List all clones of a given user",
+  "  -v, --verbose          Always list user descriptions  (default=off)",
   "  -D, --debug            Enable debug messages  (default=off)",
     0
 };
@@ -51,11 +53,13 @@ init_help_array(void)
   userlist_args_info_help[2] = userlist_args_info_full_help[2];
   userlist_args_info_help[3] = userlist_args_info_full_help[3];
   userlist_args_info_help[4] = userlist_args_info_full_help[5];
-  userlist_args_info_help[5] = 0; 
+  userlist_args_info_help[5] = userlist_args_info_full_help[6];
+  userlist_args_info_help[6] = userlist_args_info_full_help[7];
+  userlist_args_info_help[7] = 0; 
   
 }
 
-const char *userlist_args_info_help[6];
+const char *userlist_args_info_help[8];
 
 typedef enum {ARG_NO
   , ARG_FLAG
@@ -82,6 +86,8 @@ void clear_given (struct userlist_args_info *args_info)
   args_info->full_help_given = 0 ;
   args_info->version_given = 0 ;
   args_info->config_dir_given = 0 ;
+  args_info->clones_given = 0 ;
+  args_info->verbose_given = 0 ;
   args_info->debug_given = 0 ;
 }
 
@@ -91,6 +97,9 @@ void clear_args (struct userlist_args_info *args_info)
   FIX_UNUSED (args_info);
   args_info->config_dir_arg = NULL;
   args_info->config_dir_orig = NULL;
+  args_info->clones_arg = NULL;
+  args_info->clones_orig = NULL;
+  args_info->verbose_flag = 0;
   args_info->debug_flag = 0;
   
 }
@@ -104,7 +113,9 @@ void init_args_info(struct userlist_args_info *args_info)
   args_info->full_help_help = userlist_args_info_full_help[1] ;
   args_info->version_help = userlist_args_info_full_help[2] ;
   args_info->config_dir_help = userlist_args_info_full_help[4] ;
-  args_info->debug_help = userlist_args_info_full_help[5] ;
+  args_info->clones_help = userlist_args_info_full_help[5] ;
+  args_info->verbose_help = userlist_args_info_full_help[6] ;
+  args_info->debug_help = userlist_args_info_full_help[7] ;
   
 }
 
@@ -202,6 +213,8 @@ userlist_cmdline_parser_release (struct userlist_args_info *args_info)
   unsigned int i;
   free_string_field (&(args_info->config_dir_arg));
   free_string_field (&(args_info->config_dir_orig));
+  free_string_field (&(args_info->clones_arg));
+  free_string_field (&(args_info->clones_orig));
   
   
   for (i = 0; i < args_info->inputs_num; ++i)
@@ -245,6 +258,10 @@ userlist_cmdline_parser_dump(FILE *outfile, struct userlist_args_info *args_info
     write_into_file(outfile, "version", 0, 0 );
   if (args_info->config_dir_given)
     write_into_file(outfile, "config-dir", args_info->config_dir_orig, 0);
+  if (args_info->clones_given)
+    write_into_file(outfile, "clones", args_info->clones_orig, 0);
+  if (args_info->verbose_given)
+    write_into_file(outfile, "verbose", 0, 0 );
   if (args_info->debug_given)
     write_into_file(outfile, "debug", 0, 0 );
   
@@ -479,11 +496,13 @@ userlist_cmdline_parser_internal (
         { "full-help",	0, NULL, 0 },
         { "version",	0, NULL, 'V' },
         { "config-dir",	1, NULL, 'c' },
+        { "clones",	1, NULL, 0 },
+        { "verbose",	0, NULL, 'v' },
         { "debug",	0, NULL, 'D' },
         { 0,  0, 0, 0 }
       };
 
-      c = getopt_long (argc, argv, "hVc:D", long_options, &option_index);
+      c = getopt_long (argc, argv, "hVc:vD", long_options, &option_index);
 
       if (c == -1) break;	/* Exit from `while (1)' loop.  */
 
@@ -520,6 +539,16 @@ userlist_cmdline_parser_internal (
             goto failure;
         
           break;
+        case 'v':	/* Always list user descriptions.  */
+        
+        
+          if (update_arg((void *)&(args_info->verbose_flag), 0, &(args_info->verbose_given),
+              &(local_args_info.verbose_given), optarg, 0, 0, ARG_FLAG,
+              check_ambiguity, override, 1, 0, "verbose", 'v',
+              additional_error))
+            goto failure;
+        
+          break;
         case 'D':	/* Enable debug messages.  */
         
         
@@ -538,6 +567,22 @@ userlist_cmdline_parser_internal (
             exit (EXIT_SUCCESS);
           }
 
+          /* List all clones of a given user.  */
+          if (strcmp (long_options[option_index].name, "clones") == 0)
+          {
+          
+          
+            if (update_arg( (void *)&(args_info->clones_arg), 
+                 &(args_info->clones_orig), &(args_info->clones_given),
+                &(local_args_info.clones_given), optarg, 0, 0, ARG_STRING,
+                check_ambiguity, override, 0, 0,
+                "clones", '-',
+                additional_error))
+              goto failure;
+          
+          }
+          
+          break;
         case '?':	/* Invalid option.  */
           /* `getopt_long' already printed an error message.  */
           goto failure;

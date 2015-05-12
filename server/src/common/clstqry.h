@@ -38,6 +38,7 @@ typedef struct cstatus clst_t;
 clst_t *clst_query(sxi_conns_t *conns, sxi_hostlist_t *hlist);
 unsigned int clst_ndists(clst_t *st);
 const sx_nodelist_t *clst_nodes(clst_t *st, unsigned int dist);
+const sx_nodelist_t *clst_faulty_nodes(clst_t *st);
 const sx_uuid_t *clst_distuuid(clst_t *st, unsigned int *version, uint64_t *checksum);
 const char *clst_auth(clst_t *st);
 
@@ -49,7 +50,8 @@ typedef enum _clst_state {
 
 clst_state clst_rebalance_state(clst_t *st, const char **desc);
 clst_state clst_replace_state(clst_t *st, const char **desc);
+clst_state clst_upgrade_state(clst_t *st, const char **desc);
 void clst_destroy(clst_t *st);
-
+int clst_readonly(clst_t *st);
 #endif
 

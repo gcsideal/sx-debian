@@ -504,6 +504,27 @@ void sxc_file_free(sxc_file_t *sxfile) {
     free(sxfile);
 }
 
+static int sxi_same_local_file(sxc_client_t *sx, const char *source, const char *dest, int srcfd, int dstfd)
+{
+    struct stat sb1, sb2;
+    /* make sure they are different files even in the presence of links */
+    if (fstat(srcfd, &sb1)) {
+	sxi_setsyserr(sx, SXE_EARG, "Copy failed: cannot stat source file");
+        return 1;
+    }
+    if (fstat(dstfd, &sb2)) {
+	sxi_setsyserr(sx, SXE_EARG, "Copy failed: cannot stat dest file");
+        return 1;
+    }
+    if (sb1.st_dev == sb2.st_dev &&
+        sb1.st_ino == sb2.st_ino &&
+        sb1.st_mode == sb2.st_mode) {
+	sxi_seterr(sx, SXE_EARG, "'%s' and '%s' are the same file", source, dest);
+        return 1;
+    }
+    return 0;
+}
+
 static int file_to_file(sxc_client_t *sx, const char *source, const char *dest, const sxc_exclude_t *exclude)
 {
     char buf[8192];
@@ -528,6 +549,12 @@ static int file_to_file(sxc_client_t *sx, const char *source, const char *dest, 
 	fclose(f);
 	return 1;
     }
+    if (sxi_same_local_file(sx, source, dest, fileno(f), fileno(d))) {
+	fclose(f);
+	fclose(d);
+        return 1;
+    }
+
     while(1) {
 	size_t l = fread(buf, 1, sizeof(buf), f);
 	if(!l)
@@ -622,8 +649,14 @@ static int load_hosts_for_hash(sxc_client_t *sx, FILE *f, const char *hash, sxi_
  * UPLOAD_THRESHOLD should be multiple of UPLOAD_CHUNK_SIZE */
 #define UPLOAD_PART_THRESHOLD (132 * 1024 * 1024)
 
+struct crc_offset {
+    off_t offset;
+    uint32_t crc;
+    uint32_t ref_crc;
+};
+
 struct need_hash {
-    off_t off;
+    struct crc_offset off;
     sxi_hostlist_t upload_hosts;
     unsigned replica;
 };
@@ -635,7 +668,7 @@ struct part_upload_ctx {
     yajl_handle yh;
     struct cb_error_ctx errctx;
     enum createfile_state { CF_ERROR, CF_BEGIN, CF_MAIN, CF_BS, CF_TOK, CF_DATA, CF_HASH, CF_HOSTS, CF_HOST, CF_COMPLETE } state;
-    off_t *offsets;
+    struct crc_offset *offsets;
     struct need_hash *needed;
     struct need_hash *current_need;
     sxi_ht *hashes;
@@ -652,10 +685,12 @@ struct file_upload_ctx {
     sxc_cluster_t *cluster;
     int64_t uploaded;
     char *name;
+    time_t mtime;
     off_t pos;
     off_t end;
     off_t size;
     off_t last_pos;
+    uint32_t ref_crc;
     int fd;
     int qret;
     unsigned blocksize;
@@ -670,6 +705,7 @@ struct file_upload_ctx {
     unsigned flush_ok;
     unsigned fail;
     unsigned all_fail;
+    int loop_count;
     sxc_file_t *dest;
     sxc_meta_t *fmeta;
     sxi_query_t *query;
@@ -774,7 +810,7 @@ static int yacb_createfile_map_key(void *ctx, const unsigned char *s, size_t l) 
     }
 
     if(yactx->current.state == CF_HASH) {
-        off_t *off;
+        struct crc_offset *off;
 	if(l != SXI_SHA1_TEXT_LEN) {
 	    CBDEBUG("unexpected hash length %u", (unsigned)l);
 	    return 0;
@@ -793,7 +829,7 @@ static int yacb_createfile_map_key(void *ctx, const unsigned char *s, size_t l) 
 	    sxi_cbdata_seterr(yactx->cbdata, SXE_ECOMM, "Copy failed: malformed reply");
             return 0;
         }
-        CBDEBUG("need %d off: %lld", yactx->current.needed_cnt, (long long)*off);
+        CBDEBUG("need %d off: %lld", yactx->current.needed_cnt, (long long)off->offset);
         yactx->current.current_need = &yactx->current.needed[yactx->current.needed_cnt++];
         yactx->current.current_need->off = *off;
         yactx->current.current_need->replica = 0;
@@ -1177,6 +1213,12 @@ static int send_up_batch(struct file_upload_ctx *yctx, const char *host, struct 
     u->in_use = 1;
     yctx->uploaded += u->buf_used;
     sxi_cbdata_set_operation(cbdata, "upload file contents", NULL, NULL, NULL);
+    if(sxi_cbdata_set_timeouts(cbdata, BLOCK_XFER_HARD_TIMEOUT, BLOCK_XFER_SOFT_TIMEOUT)) {
+        SXDEBUG("Failed to set timeouts");
+        free(url);
+        sxi_cbdata_unref(&cbdata);
+        return -1;
+    }
     if (sxi_cluster_query_ev(cbdata,
                              sxi_cluster_get_conns(yctx->cluster),
                              host, REQ_PUT, url,
@@ -1197,6 +1239,9 @@ static int send_up_batch(struct file_upload_ctx *yctx, const char *host, struct 
 static void file_finish(struct file_upload_ctx *yctx)
 {
     sxc_client_t *sx = sxi_cluster_get_client(yctx->cluster);
+    off_t size;
+    struct stat s;
+
     SXDEBUG("finished file");
     gettimeofday(&yctx->t2, NULL);
     if (!yctx->current.token) {
@@ -1204,6 +1249,15 @@ static void file_finish(struct file_upload_ctx *yctx)
         yctx->fail++;
         return;
     }
+    if(fstat(yctx->fd, &s)) {
+        SXDEBUG("fail incremented: cannot stat file");
+        yctx->fail++;
+        return;
+    }
+    size = lseek(yctx->fd, 0L, SEEK_END);
+    if(size != yctx->size || s.st_mtime != yctx->mtime)
+        sxi_notice(sx, "WARNING: Source file has changed during upload");
+
     /*  TODO: multiplex flush_file */
     yctx->job = flush_file_ev(yctx->cluster, yctx->host, yctx->current.token, yctx->name, yctx->dest->jobs);
     if (!yctx->job) {
@@ -1241,7 +1295,10 @@ static int batch_hashes_to_hosts(curlev_context_t *cbdata, struct file_upload_ct
         struct need_hash *need = &needed[i];
         const char *host = NULL;
         need->replica += next_replica;
-        host = sxi_hostlist_get_host(&need->upload_hosts, need->replica);
+        if(sxi_get_node_preference(sx) > 0.0)
+            host = sxi_hostlist_get_optimal_host(sxi_cbdata_get_conns(cbdata), &need->upload_hosts, SXC_XFER_DIRECTION_UPLOAD);
+        else
+            host = sxi_hostlist_get_host(&need->upload_hosts, need->replica);
         if (!host) {
             sxi_cbdata_seterr(cbdata, SXE_ECOMM, "All replicas have failed");
             SXDEBUG("All replicas have failed");
@@ -1305,6 +1362,16 @@ static void upload_blocks_to_hosts(curlev_context_t *cbdata, struct file_upload_
         uctx->in_use = 0;
     SXDEBUG("upload_blocks_to_hosts");
     if (status != 200) {
+        if(status == 0) { /* Query has not been sent yet, do not batch again to avoid infinite recursion loop */
+            SXDEBUG("Failed to send .data query: %s", sxc_geterrmsg(sx));
+            if (yctx->loop_count-- > 0) {
+                SXDEBUG("allow retry (loop count: %d)", yctx->loop_count);
+            } else {
+                SXDEBUG("forbidding retry to avoid infinite loop");
+                yctx->fail++;
+                return;
+            }
+        }
         SXDEBUG("query failed: %d", status);
         if (uctx) {
             unsigned n = uctx->n;
@@ -1314,6 +1381,7 @@ static void upload_blocks_to_hosts(curlev_context_t *cbdata, struct file_upload_
             if (batch_hashes_to_hosts(cbdata, yctx, uctx->needed, uctx->last_successful, n, 1)) {
                 SXDEBUG("fail incremented");
                 yctx->fail++;
+                return;
             }
         }
         else {
@@ -1330,24 +1398,36 @@ static void upload_blocks_to_hosts(curlev_context_t *cbdata, struct file_upload_
             /* Reset currently uploaded size */
             u->ul = 0;
             for (;u->i < u->n;) {
+                uint32_t crc;
                 struct need_hash *need = &u->needed[u->i++];
-                SXDEBUG("adding data %d from pos %lld", u->i, (long long)need->off);
-                ssize_t n = pread_hard(yctx->fd, u->buf + u->buf_used, yctx->blocksize, need->off);
+                SXDEBUG("adding data %d from pos %lld", u->i, (long long)need->off.offset);
+                ssize_t n = pread_hard(yctx->fd, u->buf + u->buf_used, yctx->blocksize, need->off.offset);
                 if (n < 0) {
                     SXDEBUG("fail incremented: error reading buffer");
+                    sxi_seterr(sx, SXE_EREAD, "Copy failed: Unable to read source file");
                     yctx->fail++;
                     return;
                 }
                 if (!n) {
                     SXDEBUG("fail incremented: early EOF?");
+                    sxi_seterr(sx, SXE_EREAD, "Copy failed: Source file changed while being read");
                     yctx->fail++;
                     return;
                 }
+
                 u->buf_used += n;
                 if (n < yctx->blocksize) {
                     unsigned remaining = yctx->blocksize - n;
                     memset(u->buf + u->buf_used, 0, remaining);
                     u->buf_used += remaining;
+                }
+                /* Check crc32 checksum for this block and bail out if its incorrect */
+                crc = sxi_crc32(need->off.ref_crc, u->buf + u->buf_used - yctx->blocksize, yctx->blocksize);
+                if(crc != need->off.crc) {
+                    SXDEBUG("fail incremented: CRC32 mismatch");
+                    sxi_seterr(sx, SXE_EREAD, "Copy failed: Source file changed while being read");
+                    yctx->fail++;
+                    return;
                 }
                 SXDEBUG("u: i:%d,n:%d", u->i, u->n);
                 if (u->buf_used == sizeof(u->buf)) {
@@ -1412,7 +1492,7 @@ static int cmp_hash(const void *a, const void *b)
 {
     const struct need_hash *h1 = a;
     const struct need_hash *h2 = b;
-    off_t diff = h1->off - h2->off;
+    off_t diff = h1->off.offset - h2->off.offset;
     if (!diff)
         return 0;
     return diff < 0 ? -1 : 1;
@@ -1495,6 +1575,7 @@ static int multi_part_compute_hash_ev(struct file_upload_ctx *yctx)
     if(yctx->pos == 0) {
 	fmeta = yctx->fmeta;
 	yctx->query = sxi_fileadd_proto_begin(sx, yctx->dest->volume, yctx->dest->path, NULL, yctx->pos, yctx->blocksize, yctx->size);
+        yctx->ref_crc = 0xffffffff;
     } else {
 	fmeta = NULL;
 	yctx->query = sxi_fileadd_proto_begin(sx, ".upload", yctx->cur_token, NULL, yctx->pos, yctx->blocksize, yctx->size);
@@ -1547,8 +1628,12 @@ static int multi_part_compute_hash_ev(struct file_upload_ctx *yctx)
 
             off_t pos = yctx->pos - n + i;
             block = (pos - start) / yctx->blocksize;
-            yctx->current.offsets[block] = pos;
-            SXDEBUG("%p, hash %s: block %ld, %lld", (const void*)yctx, hexhash, (long)block, (long long)yctx->current.offsets[block]);
+            yctx->current.offsets[block].offset = pos;
+            /* Calculate crc32 for each block and store it for comparison later */
+            yctx->current.offsets[block].crc = sxi_crc32(yctx->ref_crc, yctx->buf + i, yctx->blocksize);
+            yctx->current.offsets[block].ref_crc = yctx->ref_crc;
+            yctx->ref_crc = yctx->current.offsets[block].crc; /* Save reference crc for next block */
+            SXDEBUG("%p, hash %s: block %ld, %lld, crc32: %lu", (const void*)yctx, hexhash, (long)block, (long long)yctx->current.offsets[block].offset, (unsigned long)yctx->current.offsets[block].crc);
             if(sxi_ht_add(yctx->current.hashes, hexhash, SXI_SHA1_TEXT_LEN, &yctx->current.offsets[block])) {
                 SXDEBUG("failed to add hash offset");
                 return -1;
@@ -2080,6 +2165,7 @@ static int local_to_remote_begin(sxc_file_t *source, sxc_meta_t *fmeta, sxc_file
     state->fd = s;
     state->blocksize = blocksize;
     state->volhosts = &volhosts;
+    state->loop_count = sxi_hostlist_get_count(&volhosts);
     state->name = strdup(dest->path);
     if (!state->name) {
 	sxi_seterr(sx, SXE_EMEM, "Cannot allocate filename: Out of memory");
@@ -2088,6 +2174,7 @@ static int local_to_remote_begin(sxc_file_t *source, sxc_meta_t *fmeta, sxc_file
     state->fmeta = fmeta;
     state->dest = dest;
     state->size = st.st_size;
+    state->mtime = st.st_mtime;
 
     xfer_stat = sxi_cluster_get_xfer_stat(dest->cluster);
     if(xfer_stat) {
@@ -2826,8 +2913,6 @@ static int process_block(sxi_conns_t *conns, curlev_context_t *cctx)
             writesz = ctx->filesize - hashdata->offsets[j];
         else
             writesz = ctx->blocksize;
-/*            SXDEBUG("writing hash%d @%lld - %lld",i,
-                (long long)hashdata->offsets[j], (long long)hashdata->offsets[j] + writesz);*/
         if(pwrite_all(ctx->fd, ctx->buf, writesz, hashdata->offsets[j])) {
             sxi_cbdata_setsyserr(cctx, SXE_EWRITE, "write");
             SXDEBUG("Failed to write block at offset %llu", (long long unsigned)hashdata->offsets[j]);
@@ -3217,6 +3302,13 @@ static curlev_context_t *create_download(sxc_cluster_t *cluster, unsigned int bl
         return NULL;
     }
 
+    if(sxi_cbdata_set_timeouts(ret, BLOCK_XFER_HARD_TIMEOUT, BLOCK_XFER_SOFT_TIMEOUT)) {
+        SXDEBUG("Failed to set timeouts");
+        sxi_cbdata_unref(&ret);
+        dctx_free(dctx);
+        return NULL;
+    }
+
     dctx->buf = malloc(blocksize);
     if (!dctx->buf) {
         sxi_seterr(sx, SXE_EMEM, "Cannot allocate buffer");
@@ -3340,6 +3432,8 @@ static int single_download(struct batch_hashes *bh, const char *dstname,
 
     single_download_fail:
 
+    if(!ret)
+        sxc_clearerr(sx);
     if (sxi_retry_done(&retry))
         CFGDEBUG("retry_done failed");
 
@@ -3407,7 +3501,15 @@ static int multi_download(struct batch_hashes *bh, const char *dstname,
             CFGDEBUG("No hosts available for hash %.*s!", 40, hash);
             break;
         }
-        host = sxi_hostlist_get_host(&hashdata->hosts, 0);
+
+        if(sxi_get_node_preference(sx) > 0.0) {
+            /* Get optimal node for hash, learn from previous connection statistics */
+            host = sxi_hostlist_get_optimal_host(conns, &hashdata->hosts, SXC_XFER_DIRECTION_DOWNLOAD);
+        } else {
+            /* Default way to get a host for hash is to get first node proposed by server */
+            host = sxi_hostlist_get_host(&hashdata->hosts, 0);
+        }
+
         if (!host) {
             CFGDEBUG("Ran out of hosts for hash: (last HTTP code %ld)", hashdata->state);
             /* TODO: set err and break */
@@ -3788,9 +3890,10 @@ static int remote_to_local(sxc_file_t *source, sxc_file_t *dest, int recursive) 
 
         fail = multi_download(&bh, dstname, blocksize, source->cluster, d, filesize - shiftoff);
 
-        SXDEBUG("multi_download failed, trying single download");
-        if(fail)
+        if(fail) {
+            SXDEBUG("multi_download failed, trying single download");
             fail = single_download(&bh, dstname, blocksize, source->cluster, d, filesize - shiftoff);
+        }
 
         /* Update information about transfers, but not when aborting */
         if(xfer_stat && sxc_geterrnum(sx) != SXE_ABORT) {
@@ -4129,6 +4232,7 @@ static sxi_job_t* remote_to_remote_fast(sxc_file_t *source, sxc_meta_t *fmeta, s
     yacb->yajl_end_array = yacb_createfile_end_array;
     yacb->yajl_end_map = yacb_createfile_end_map;
 
+    yctx.max_part_blocks = sxi_ht_count(src_hashes);
     yctx.current.yh = NULL;
     yctx.blocksize = blocksize;
     yctx.name = strdup(dest->path);
@@ -4147,6 +4251,10 @@ static sxi_job_t* remote_to_remote_fast(sxc_file_t *source, sxc_meta_t *fmeta, s
     cbdata = sxi_cbdata_create_upload(sxi_cluster_get_conns(dest->cluster), NULL, &yctx);
     if (!cbdata)
         goto remote_to_remote_fast_err;
+    if(sxi_cbdata_set_timeouts(cbdata, BLOCK_XFER_HARD_TIMEOUT, BLOCK_XFER_SOFT_TIMEOUT)) {
+        SXDEBUG("Failed to set timeouts");
+        goto remote_to_remote_fast_err;
+    }
     if(sxi_cluster_query_ev_retry(cbdata, sxi_cluster_get_conns(dest->cluster), &volhosts, query->verb, query->path, query->content, query->content_len, createfile_setup_cb, createfile_cb, NULL)) {
 	SXDEBUG("file create query failed");
 	goto remote_to_remote_fast_err;
@@ -4200,9 +4308,9 @@ static sxi_job_t* remote_to_remote_fast(sxc_file_t *source, sxc_meta_t *fmeta, s
         struct need_hash *need = &yctx.current.needed[i];
         int sz;
 
-        fseek(hf, need->off - 40, SEEK_SET);
+        fseek(hf, need->off.offset - 40, SEEK_SET);
         if(!fread(ha, 40, 1, hf)) {
-            SXDEBUG("Could not read hash at offset %ld", need->off - 40);
+            SXDEBUG("Could not read hash at offset %ld", need->off.offset - 40);
             goto remote_to_remote_fast_err;
         }
 
@@ -4283,7 +4391,7 @@ remote_to_remote_fast_err:
     return job;
 }
 
-static sxi_job_t* remote_to_remote(sxc_file_t *source, sxc_file_t *dest) {
+static sxi_job_t* remote_to_remote(sxc_file_t *source, sxc_file_t *dest, int fail_same_file) {
     const char *suuid=sxc_cluster_get_uuid(source->cluster), *duuid=sxc_cluster_get_uuid(dest->cluster);
     sxc_client_t *sx = source->sx;
     sxc_file_t *cache;
@@ -4296,6 +4404,30 @@ static sxi_job_t* remote_to_remote(sxc_file_t *source, sxc_file_t *dest) {
     if(!suuid || !duuid) {
 	SXDEBUG("internal error / invalid config");
 	return NULL;
+    }
+    if(fail_same_file &&
+       !strcmp(suuid, duuid) && !strcmp(source->volume, dest->volume) &&
+       !strcmp(source->rev ? source->rev : "", dest->rev ? dest->rev : "")) {
+        const char *src = source->path;
+        const char *dst = dest->path;
+        do {
+            /* ignore leading slashes */
+            while (*src == '/') src++;
+            while (*dst == '/') dst++;
+            /* equal path component until next slash */
+            while (*src && *dst && *src != '/' && *src++ == *dst++) {}
+            /* ignore duplicate slashes, but a/b is not equal to ab */
+            if (*src == '/' && *dst == '/') {
+                while (*src == '/') src++;
+                while (*dst == '/') dst++;
+            }
+        } while (*src && *dst && *src == *dst);
+        if (!*src && !*dst) {
+            sxi_seterr(sx, SXE_SKIP, "'%s/%s' and '%s/%s' are the same remote file",
+                    source->volume, source->path,
+                    dest->volume, dest->path);
+            return NULL;
+        }
     }
 
     if(strcmp(source->volume, dest->volume)) {
@@ -4378,7 +4510,7 @@ remote_to_remote_err:
 }
 
 static int mkdir_parents(sxc_client_t *sx, const char *path);
-static sxi_job_t* remote_copy_ev(sxc_file_t *pattern, sxc_file_t *source, sxc_file_t *dest, int recursive, unsigned int *errors)
+static sxi_job_t* remote_copy_ev(sxc_file_t *pattern, sxc_file_t *source, sxc_file_t *dest, int recursive, unsigned int *errors, int fail_same_file)
 {
     sxi_job_t *job;
     free(source->origpath);
@@ -4417,7 +4549,7 @@ static sxi_job_t* remote_copy_ev(sxc_file_t *pattern, sxc_file_t *source, sxc_fi
         }
         job = &JOB_NONE;
     } else
-       job = remote_to_remote(source, dest);
+       job = remote_to_remote(source, dest, fail_same_file);
     if (restore_path(dest)) {
         sxi_job_free(job);
         return NULL;
@@ -4443,8 +4575,8 @@ static int mkdir_parents(sxc_client_t *sx, const char *path)
     return ret;
 }
 
-static int remote_iterate(sxc_file_t *source, int recursive, int onefs, int ignore_errors, sxc_file_t *dest, const sxc_exclude_t *exclude);
-int sxc_copy(sxc_file_t *source, sxc_file_t *dest, int recursive, int onefs, int ignore_errors, const sxc_exclude_t *exclude) {
+static int remote_iterate(sxc_file_t *source, int recursive, int onefs, int ignore_errors, sxc_file_t *dest, const sxc_exclude_t *exclude, int fail_same_file);
+int sxc_copy(sxc_file_t *source, sxc_file_t *dest, int recursive, int onefs, int ignore_errors, const sxc_exclude_t *exclude, int fail_same_file) {
     int ret;
     sxc_xfer_stat_t *xfer_stat = NULL;
     sxc_cluster_t *remote_cluster = NULL;
@@ -4474,7 +4606,7 @@ int sxc_copy(sxc_file_t *source, sxc_file_t *dest, int recursive, int onefs, int
                 ret = local_to_remote_iterate(source, recursive, 0, onefs, ignore_errors, dest, exclude);
         }
     } else {
-        ret = remote_iterate(source, recursive, onefs, ignore_errors, dest, exclude);
+        ret = remote_iterate(source, recursive, onefs, ignore_errors, dest, exclude, fail_same_file);
     }
     source->rev = rev;
 
@@ -4650,6 +4782,10 @@ static int cat_local_file(sxc_file_t *source, int dest) {
 	sxi_setsyserr(sx, SXE_EREAD, "Failed to open %s", source->path);
 	return 1;
     }
+    if (sxi_same_local_file(sx, source->path, "-", src, dest)) {
+	close(src);
+        return 1;
+    }
 
     while(1) {
 	ssize_t got = read(src, buf, sizeof(buf));
@@ -4686,7 +4822,7 @@ int sxc_cat(sxc_file_t *source, int dest) {
         sxi_seterr(source->sx, SXE_EARG, "Cannot write to stdin");
         rc = 1;
     } else
-        rc = sxc_copy(source, destfile, 0, 0, 0, NULL);
+        rc = sxc_copy(source, destfile, 0, 0, 0, NULL, 1);
     sxc_file_free(destfile);
     return rc;
 }
@@ -5318,6 +5454,7 @@ static sxi_job_t* sxi_rm_cb(sxc_file_list_t *target, sxc_file_t *pattern, sxc_cl
     query = sxi_filedel_proto(target->sx, vol, path, NULL);
     if (!query)
         return NULL;
+    sxi_hostlist_shuffle(hlist);
     sxi_set_operation(target->sx, "remove files", sxi_cluster_get_name(cluster), query->path, NULL);
     job = sxi_job_submit(sxi_cluster_get_conns(cluster), hlist, query->verb, query->path, path, NULL, 0, &http_code, &target->jobs);
     if(job && fh && fh->f->file_notify)
@@ -5328,17 +5465,18 @@ static sxi_job_t* sxi_rm_cb(sxc_file_list_t *target, sxc_file_t *pattern, sxc_cl
     return job;
 }
 
-int sxc_rm(sxc_file_list_t *target) {
+int sxc_rm(sxc_file_list_t *target, int ignore_errors) {
     if (!target)
         return -1;
     sxc_clearerr(target->sx);
-    return sxi_file_list_foreach(target, target->cluster, NULL, sxi_rm_cb, 1, 0, NULL, NULL);
+    return sxi_file_list_foreach(target, target->cluster, NULL, sxi_rm_cb, 1, ignore_errors, NULL, NULL);
 }
 
 struct remote_iter {
     sxc_file_t *dest;
     int recursive;
     unsigned int errors;
+    int fail_same_file;
 };
 
 static int different_file(const char *path1, const char *path2)
@@ -5361,7 +5499,7 @@ static sxi_job_t *remote_copy_cb(sxc_file_list_t *target, sxc_file_t *pattern, s
 
     /* we could support parallelization for remote_to_remote and
      * remote_to_remote_fast if they would just return a job ... */
-    ret = remote_copy_ev(pattern, source, it->dest, it->recursive && different_file(source->path, pattern->path), &it->errors);
+    ret = remote_copy_ev(pattern, source, it->dest, it->recursive && different_file(source->path, pattern->path), &it->errors, it->fail_same_file);
 
     sxc_file_free(source);
 
@@ -5424,7 +5562,7 @@ static int multi_cb(sxc_file_list_t *target, void *ctx)
     return sxc_file_require_dir(dest);
 }
 
-static int remote_iterate(sxc_file_t *source, int recursive, int onefs, int ignore_errors, sxc_file_t *dest, const sxc_exclude_t *exclude)
+static int remote_iterate(sxc_file_t *source, int recursive, int onefs, int ignore_errors, sxc_file_t *dest, const sxc_exclude_t *exclude, int fail_same_file)
 {
     sxc_file_list_t *lst;
     int ret;
@@ -5433,6 +5571,7 @@ static int remote_iterate(sxc_file_t *source, int recursive, int onefs, int igno
     it.dest = dest;
     it.recursive = recursive;
     it.errors = 0;
+    it.fail_same_file = fail_same_file;
 
     lst = sxc_file_list_new(source->sx, recursive);
     if (!lst)
@@ -5794,7 +5933,7 @@ int sxc_remove_sxfile(sxc_file_t *file) {
     return ret;
 }
 
-int sxc_copy_sxfile(sxc_file_t *source, sxc_file_t *dest) {
+int sxc_copy_sxfile(sxc_file_t *source, sxc_file_t *dest, int fail_same_file) {
     sxc_client_t *sx = dest->sx;
 
     if(!is_remote(source)) {
@@ -5803,7 +5942,7 @@ int sxc_copy_sxfile(sxc_file_t *source, sxc_file_t *dest) {
     }
 
     if(is_remote(dest)) {
-	sxi_job_t *job =  remote_to_remote(source, dest);
+	sxi_job_t *job =  remote_to_remote(source, dest, fail_same_file);
 	return sxi_jobs_wait_one(dest, job);
     } else
 	return remote_to_local(source, dest, 0);

@@ -165,8 +165,11 @@ static void print_hashfs(sxc_client_t *sx, const char *path)
 	return;
     }
     const sx_node_t *self= sx_hashfs_self(h);
-    INFO("Current node space usage: %lld (%.2f%%)", size,
-           100.0 * size / sx_node_capacity(self));
+    if (self)
+        INFO("Current node space usage: %lld (%.2f%%)", size,
+               100.0 * size / sx_node_capacity(self));
+    else
+        INFO("This is a bare node");
 
     INFO("HashFS Version: %s", sx_hashfs_version(h));
 
@@ -393,7 +396,7 @@ static void print_cluster(sxc_client_t *sx)
 
     const sx_node_t *self= sx_hashfs_self(h);
 
-    nodes = sx_hashfs_nodelist(h, NL_NEXT);
+    nodes = sx_hashfs_all_nodes(h, NL_NEXT);
     if(nodes && sx_nodelist_count(nodes)) {
 	unsigned int i, nnodes = sx_nodelist_count(nodes);
 	INFO("List of nodes:");

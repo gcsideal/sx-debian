@@ -126,7 +126,7 @@ am__uninstall_files_from_dir = { \
 am__installdirs = "$(DESTDIR)$(pkglibdir)"
 LTLIBRARIES = $(pkglib_LTLIBRARIES)
 @BUILD_ZCOMP_TRUE@libsxf_zcomp_la_DEPENDENCIES =  \
-@BUILD_ZCOMP_TRUE@	$(top_srcdir)/../libsx/src/libsx.la
+@BUILD_ZCOMP_TRUE@	../../../../libsx/src/libsx.la
 am__libsxf_zcomp_la_SOURCES_DIST = zcomp.c
 @BUILD_ZCOMP_TRUE@am_libsxf_zcomp_la_OBJECTS = zcomp.lo
 libsxf_zcomp_la_OBJECTS = $(am_libsxf_zcomp_la_OBJECTS)
@@ -201,7 +201,6 @@ ETAGS = etags
 CTAGS = ctags
 DISTFILES = $(DIST_COMMON) $(DIST_SOURCES) $(TEXINFOS) $(EXTRA_DIST)
 ACLOCAL = @ACLOCAL@
-AES256_LIBS = @AES256_LIBS@
 AMTAR = @AMTAR@
 AM_CFLAGS = @AM_CFLAGS@
 AM_DEFAULT_VERBOSITY = @AM_DEFAULT_VERBOSITY@
@@ -251,6 +250,8 @@ NM = @NM@
 NMEDIT = @NMEDIT@
 OBJDUMP = @OBJDUMP@
 OBJEXT = @OBJEXT@
+OPENSSL_CFLAGS = @OPENSSL_CFLAGS@
+OPENSSL_LIBS = @OPENSSL_LIBS@
 OTOOL = @OTOOL@
 OTOOL64 = @OTOOL64@
 PACKAGE = @PACKAGE@
@@ -261,12 +262,17 @@ PACKAGE_TARNAME = @PACKAGE_TARNAME@
 PACKAGE_URL = @PACKAGE_URL@
 PACKAGE_VERSION = @PACKAGE_VERSION@
 PATH_SEPARATOR = @PATH_SEPARATOR@
+PKG_CONFIG = @PKG_CONFIG@
+PKG_CONFIG_LIBDIR = @PKG_CONFIG_LIBDIR@
+PKG_CONFIG_PATH = @PKG_CONFIG_PATH@
 RANLIB = @RANLIB@
 SED = @SED@
 SET_MAKE = @SET_MAKE@
 SHELL = @SHELL@
 STRIP = @STRIP@
 SX_FILTER_DIR = @SX_FILTER_DIR@
+VCRYPTO_CFLAGS = @VCRYPTO_CFLAGS@
+VCRYPTO_LIBS = @VCRYPTO_LIBS@
 VERSION = @VERSION@
 ZCOMP_LIBS = @ZCOMP_LIBS@
 abs_builddir = @abs_builddir@
@@ -324,8 +330,8 @@ top_srcdir = @top_srcdir@
 @BUILD_ZCOMP_TRUE@AM_CPPFLAGS = -I $(top_srcdir)/../libsx/include
 @BUILD_ZCOMP_TRUE@pkglib_LTLIBRARIES = libsxf_zcomp.la
 @BUILD_ZCOMP_TRUE@libsxf_zcomp_la_SOURCES = zcomp.c
-@BUILD_ZCOMP_TRUE@libsxf_zcomp_la_LDFLAGS = -module -release 10
-@BUILD_ZCOMP_TRUE@libsxf_zcomp_la_LIBADD = @ZCOMP_LIBS@ $(top_srcdir)/../libsx/src/libsx.la
+@BUILD_ZCOMP_TRUE@libsxf_zcomp_la_LDFLAGS = -module -release 11
+@BUILD_ZCOMP_TRUE@libsxf_zcomp_la_LIBADD = @ZCOMP_LIBS@ ../../../../libsx/src/libsx.la
 all: all-am
 
 .SUFFIXES:

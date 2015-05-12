@@ -2,7 +2,7 @@
 # Process this file with autoconf to produce a configure script.
 
 AC_PREREQ([2.68])
-AC_INIT([sx], [1.0], [https://bugzilla.skylable.com])
+AC_INIT([sx], [1.1], [https://bugzilla.skylable.com])
 AC_CONFIG_AUX_DIR([build-aux])
 AC_CONFIG_MACRO_DIR([m4])
 dnl for cmdline.c
@@ -90,7 +90,7 @@ AC_CHECK_LIB([fcgi], [FCGX_Accept], [FCGI_LIBS=-lfcgi; has_sys_fcgi="yes"],
 LIBS=$ac_save_LIBS
 if test "$has_sys_fcgi" = "no"; then
     FCGI_LIBS=../3rdparty/fcgi/libfcgi/libfcgi.la
-    FCGI_CPPFLAGS="-I ../3rdparty/fcgi/include"
+    FCGI_CPPFLAGS="-I $srcdir/../3rdparty/fcgi/include -I ../3rdparty/fcgi/include"
 fi
 AC_SUBST([FCGI_LIBS])
 AC_SUBST([FCGI_CPPFLAGS])
@@ -102,7 +102,7 @@ AC_CHECK_LIB([yajl], [yajl_complete_parse], [YAJL_LIBS=-lyajl; has_sys_yajl="yes
 LIBS=$ac_save_LIBS
 if test "$has_sys_yajl" = "no"; then
     YAJL_LIBS="../3rdparty/yajl_build/build/libyajl.la"
-    YAJL_CPPFLAGS="-I ../3rdparty/yajl_build/build"
+    YAJL_CPPFLAGS="-I $srcdir/../3rdparty/yajl_build/build -I ../3rdparty/yajl_build/build"
 fi
 AC_SUBST([YAJL_CPPFLAGS])
 AC_SUBST([YAJL_LIBS])
@@ -127,7 +127,7 @@ else
 fi
 AC_MSG_CHECKING([for working resolver in lib$checkingin])
 AC_LINK_IFELSE([AC_LANG_PROGRAM([
-#include "../libsx/include/default.h"
+#include "$srcdir/../libsx/include/default.h"
 #include <sys/types.h>
 #include <netinet/in.h>
 #include <arpa/nameser.h>
@@ -176,7 +176,7 @@ if test "x$with_system_sqlite3" == "xyes"; then
                          AC_MSG_ERROR([System SQLite3 version not found or too old])
                        ])
 else
-    SQLITE3_CFLAGS="-I../3rdparty/libsqlite3/"
+    SQLITE3_CFLAGS="-I $srcdir/../3rdparty/libsqlite3/"
     SQLITE3_LIBS="../3rdparty/libsqlite3/libsqlite3.la"
 fi
 
@@ -187,16 +187,29 @@ build_sxhttpd=$enableval, build_sxhttpd="yes")
 
 
 if test "x$build_sxhttpd" = "xno"; then
-    AC_PATH_TOOL(SXHTTPD,nginx,
-                 [AC_MSG_ERROR([nginx is required when --disable-sxhttpd is used])],
+    AC_PATH_TOOL(SXHTTPD,nginx, [false],
                  [/usr/sbin:/usr/local/sbin:$PATH])
+    if test "$SXHTTPD" = "false"; then
+        AC_MSG_ERROR([nginx is required when --disable-sxhttpd is used])
+    fi
+    GZIP="off"
 else
     SXHTTPD="$sbindir/sxhttpd"
+    GZIP="on"
 fi
 
+AC_SUBST(GZIP)
 AC_SUBST(SXHTTPD)
 
+if test "x$prefix" = xNONE; then
+    sxfcgi_conf=$ac_default_prefix/etc/sxserver/sxfcgi.conf
+else
+    sxfcgi_conf=$prefix/etc/sxserver/sxfcgi.conf
+fi
+AC_SUBST([SXFCGI_CONF], [$sxfcgi_conf])
+
 AC_CONFIG_FILES([Makefile sxscripts/Makefile])
+AC_CONFIG_FILES([man/sxadm.8 man/sxadm-node.8 man/sxadm-cluster.8 man/sx.fcgi.8 man/sxfcgi.conf.5 man/sxsim.1 man/sxreport-server.8 man/sxsetup.8 man/sxsetup.conf.5 man/sxdump.8 man/sxserver.8])
 AC_OUTPUT
 
 AC_MSG_NOTICE([Summary])

@@ -49,12 +49,15 @@
 #include "../libsx/src/vcrypto.h"
 #include "../libsx/src/clustcfg.h"
 #include "../libsx/src/cluster.h"
+#include "../libsx/src/sxreport.h"
+#include "job_common.h"
 
 #define HASHDBS 16
-#define METADBS 16
 #define GCDBS 1
-/* NOTE: HASHFS_VERSION must be kept below 15 bytes */
-#define HASHFS_VERSION "SX-Storage 1.6"
+/* NOTE: HASHFS_VERSION must be exactly 14 bytes */
+#define HASHFS_VERSION_1_0 "SX-Storage 1.6"
+#define HASHFS_VERSION_1_1 "SX-Storage 1.7"
+#define HASHFS_VERSION HASHFS_VERSION_1_1
 #define SIZES 3
 const char sizedirs[SIZES] = "sml";
 const char *sizelongnames[SIZES] = { "small", "medium", "large" };
@@ -69,7 +72,7 @@ const unsigned int bsz[SIZES] = {SX_BS_SMALL, SX_BS_MEDIUM, SX_BS_LARGE};
 #define WARNHASH(MSG, X) do {				\
     char _warnhash[sizeof(sx_hash_t)*2+1];		\
     bin2hex((X)->b, sizeof(*X), _warnhash, sizeof(_warnhash));	\
-    WARN("(%s): %s #%s#", __FUNCTION__, MSG, _warnhash); \
+    WARN("(%s): %s #%s#", __func__, MSG, _warnhash); \
     } while(0)
 
 #define DEBUGHASH(MSG, X) do {				\
@@ -153,7 +156,7 @@ do { \
     /* Fill in the basic settings */ \
     if(qprep(db, &q, "INSERT INTO hashfs (key, value) VALUES (:k, :v)")) \
 	goto create_hashfs_fail; \
-    if(qbind_text(q, ":k", "version") || qbind_text(q, ":v", HASHFS_VERSION) || qstep_noret(q)) \
+    if(qbind_text(q, ":k", "version") || qbind_text(q, ":v", HASHFS_VERSION_1_0) || qstep_noret(q)) \
 	goto create_hashfs_fail; \
     sqlite3_reset(q); \
     if(qbind_text(q, ":k", "dbtype") || qbind_text(q, ":v", DBTYPE) || qstep_noret(q)) \
@@ -164,46 +167,10 @@ do { \
     sqlite3_reset(q); \
     DEBUG("creating %s", path);\
 } while(0)
-
-/* TODO: share more code */
-#define CREATE_DB2(DBTYPE) \
-do { \
-    sqlite3 *handle = NULL;\
-    /* Create the dbatabase */ \
-    if(sqlite3_open_v2(path, &handle, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL)) { \
-	CRIT("Failed to create %s database: %s", DBTYPE, sqlite3_errmsg(handle)); \
-	goto create_hashfs_fail; \
-    } \
-    if (!(db = qnew(handle))) \
-        goto create_hashfs_fail; \
-    if(qprep(db, &q, "PRAGMA synchronous=NORMAL") || qstep_noret(q)) \
-	goto create_hashfs_fail; \
-    qnullify(q); \
-    if(qprep(db, &q, "PRAGMA journal_mode = WAL") || qstep_ret(q)) \
-	goto create_hashfs_fail; \
-    qnullify(q); \
-    /* Set create the hashfs table which is a generic k/v store for config items */ \
-    if(qprep(db, &q, "CREATE TABLE hashfs (key TEXT NOT NULL PRIMARY KEY, value TEXT NOT NULL)") || qstep_noret(q)) \
-	goto create_hashfs_fail; \
-    qnullify(q); \
-    /* Fill in the basic settings */ \
-    if(qprep(db, &q, "INSERT INTO hashfs (key, value) VALUES (:k, :v)")) \
-	goto create_hashfs_fail; \
-    if(qbind_text(q, ":k", "version") || qbind_text(q, ":v", HASHFS_VERSION) || qstep_noret(q)) \
-	goto create_hashfs_fail; \
-    sqlite3_reset(q); \
-    if(qbind_text(q, ":k", "dbtype") || qbind_text(q, ":v", DBTYPE) || qstep_noret(q)) \
-	goto create_hashfs_fail; \
-    sqlite3_reset(q); \
-    if(qbind_text(q, ":k", "cluster") || qbind_blob(q, ":v", cluster->binary, sizeof(cluster->binary)) || qstep_noret(q)) \
-	goto create_hashfs_fail; \
-    sqlite3_reset(q); \
-    DEBUG("creating %s", path);\
-} while(0)
-
 
 static int qlog_set = 0;
-rc_ty sx_storage_create(const char *dir, sx_uuid_t *cluster, uint8_t *key, int key_size) {
+
+static rc_ty sx_storage_create_1_0(const char *dir, sx_uuid_t *cluster, uint8_t *key, int key_size) {
     unsigned int dirlen, i, j;
     sxi_db_t *db = NULL;
     sqlite3_stmt *q = NULL;
@@ -373,56 +340,14 @@ rc_ty sx_storage_create(const char *dir, sx_uuid_t *cluster, uint8_t *key, int k
 	    if(qprep(db, &q, "CREATE TABLE blocks (\
                 id INTEGER PRIMARY KEY NOT NULL,\
                 hash BLOB("STRIFY(SXI_SHA1_BIN_LEN)") NOT NULL,\
-                blockno INTEGER,\
-                created_at INTEGER,\
+                blockno INTEGER NOT NULL,\
+                created_at INTEGER NOT NULL,\
                 UNIQUE(hash))") || qstep_noret(q))
 		goto create_hashfs_fail;
 	    qnullify(q);
             /* if(qprep(db, &q, "CREATE INDEX blockno ON blocks(id, blockno)") || qstep_noret(q))
                 goto create_hashfs_fail;
             qnullify(q);*/
-
-            if(qprep(db, &q, "CREATE TABLE reservations (\
-                blockid INTEGER NOT NULL REFERENCES blocks(id) ON DELETE CASCADE ON UPDATE CASCADE,\
-                reserveid BLOB("STRIFY(SXI_SHA1_BIN_LEN)") NOT NULL,\
-                ttl INTEGER NOT NULL,\
-                PRIMARY KEY(blockid, reserveid))") || qstep_noret(q))
-                goto create_hashfs_fail;
-            qnullify(q);
-            if(qprep(db, &q, "CREATE INDEX idx_reserve ON reservations(reserveid, blockid)") || qstep_noret(q))
-                goto create_hashfs_fail;
-            qnullify(q);
-            if(qprep(db, &q, "CREATE INDEX idx_res_ttl ON reservations(ttl)") || qstep_noret(q))
-                goto create_hashfs_fail;
-            qnullify(q);
-
-            /* TODO: put this into GC_%x.db
-             * >0: inuse
-             * <0: delete
-             * */
-            if(qprep(db, &q, "CREATE TABLE operations (\
-                blockid INTEGER NOT NULL REFERENCES blocks(id) ON DELETE CASCADE ON UPDATE CASCADE,\
-                tokenid BLOB("STRIFY(SXI_SHA1_BIN_LEN)") NOT NULL,\
-                replica INTEGER NOT NULL,\
-                op INTEGER NOT NULL,\
-                ttl INTEGER NOT NULL,\
-                PRIMARY KEY(blockid, tokenid, replica, op))") || qstep_noret(q))
-                goto create_hashfs_fail;
-            qnullify(q);
-            if(qprep(db, &q, "CREATE INDEX idx_ttl ON operations(ttl)") || qstep_noret(q))
-                goto create_hashfs_fail;
-            qnullify(q);
-
-            /* age = rebalance/hdist version
-             * */
-            if(qprep(db, &q, "CREATE TABLE use (\
-                blockid INTEGER NOT NULL REFERENCES blocks(id) ON DELETE CASCADE ON UPDATE CASCADE,\
-                replica INTEGER NOT NULL,\
-                age INTEGER NOT NULL,\
-                used INTEGER NOT NULL,\
-                PRIMARY KEY(blockid, replica, age))") || qstep_noret(q))
-                goto create_hashfs_fail;
-            qnullify(q);
 
 	    /* Create freelist table */
 	    if(qprep(db, &q, "CREATE TABLE avail (blocknumber INTEGER NOT NULL PRIMARY KEY ASC)") || qstep_noret(q))
@@ -439,7 +364,7 @@ rc_ty sx_storage_create(const char *dir, sx_uuid_t *cluster, uint8_t *key, int k
 		goto create_hashfs_fail;
 	    }
 	    memset(path, 0, bsz[j]);
-	    sprintf(path, "%-16sdatafile_%c_%08x             %08x", HASHFS_VERSION, sizedirs[j], i, bsz[j]);
+	    sprintf(path, "%-16sdatafile_%c_%08x             %08x", HASHFS_VERSION_1_0, sizedirs[j], i, bsz[j]);
 	    memcpy(path+64, cluster->binary, sizeof(cluster->binary));
 	    if(write_block(fd, path, 0, bsz[j])) {
 		close(fd);
@@ -507,7 +432,8 @@ rc_ty sx_storage_create(const char *dir, sx_uuid_t *cluster, uint8_t *key, int k
     qnullify(q);
     qclose(&db);
 
-    sync();
+    /* do not modify the schema above (except for dropping tables),
+     * put all modifications in the sx_storage_upgrade function! */
     ret = OK;
 
 create_hashfs_fail:
@@ -522,11 +448,20 @@ create_hashfs_fail:
     return ret;
 }
 
-static int qopen(const char *path, sxi_db_t **dbp, const char *dbtype, sx_uuid_t *cluster) {
+rc_ty sx_storage_create(const char *dir, sx_uuid_t *cluster, uint8_t *key, int key_size) {
+    rc_ty ret = sx_storage_create_1_0(dir, cluster, key, key_size);
+    if (ret == OK)
+        ret = sx_storage_upgrade(dir);
+    if (ret == OK)
+        sync();
+    return ret;
+}
+
+static int qopen(const char *path, sxi_db_t **dbp, const char *dbtype, sx_uuid_t *cluster, const char *version) {
     sqlite3_stmt *q = NULL;
     const char *str;
     sqlite3 *handle = NULL;
-    char qstr[128];
+    char qstr[1024];
 
     if(sqlite3_open_v2(path, &handle, SQLITE_OPEN_READWRITE | SQLITE_OPEN_NOMUTEX, NULL)) {
 	CRIT("Failed to open database %s: %s", path, sqlite3_errmsg(handle));
@@ -555,8 +490,9 @@ static int qopen(const char *path, sxi_db_t **dbp, const char *dbtype, sx_uuid_t
     if(qbind_text(q, ":k", "version") || qstep_ret(q))
 	goto qopen_fail;
     str = (const char *)sqlite3_column_text(q, 0);
-    if(!str || strcmp(str, HASHFS_VERSION)) {
-	CRIT("Version mismatch on db %s: expected %s, found %s", path, HASHFS_VERSION, str ? str : "none");
+    if(version && (!str || strcmp(str, version))) {
+	msg_set_reason("Version mismatch on db %s: expected %s, found %s", path, HASHFS_VERSION, str ? str : "none");
+        CRIT("%s", msg_get_reason());
 	goto qopen_fail;
     }
 
@@ -609,21 +545,35 @@ struct rebalance_iter {
     sqlite3_stmt *q_count;
 };
 
+typedef struct {
+    int64_t file_size;
+    unsigned int block_size;
+    unsigned int nblocks;
+    unsigned int created_at;
+    char name[SXLIMIT_MAX_FILENAME_LEN+2];
+    char revision[REV_LEN+1];
+} list_entry_t;
+
 struct _sx_hashfs_t {
     uint8_t *blockbuf;
 
     sxi_db_t *db;
     sqlite3_stmt *q_getval;
+    sqlite3_stmt *q_setval;
+    sqlite3_stmt *q_delval;
     sqlite3_stmt *q_gethdrev;
     sqlite3_stmt *q_getuser;
     sqlite3_stmt *q_getuserbyid;
     sqlite3_stmt *q_getuserbyname;
     sqlite3_stmt *q_listusers;
+    sqlite3_stmt *q_listusersbycid;
     sqlite3_stmt *q_listacl;
     sqlite3_stmt *q_createuser;
+    sqlite3_stmt *q_createuser_meta;
     sqlite3_stmt *q_deleteuser;
     sqlite3_stmt *q_user_newkey;
     sqlite3_stmt *q_onoffuser;
+    sqlite3_stmt *q_onoffuserclones;
     sqlite3_stmt *q_grant;
     sqlite3_stmt *q_getuid;
     sqlite3_stmt *q_getuidname;
@@ -636,6 +586,7 @@ struct _sx_hashfs_t {
     sqlite3_stmt *q_addvol;
     sqlite3_stmt *q_addvolmeta;
     sqlite3_stmt *q_addvolprivs;
+    sqlite3_stmt *q_chprivs;
     sqlite3_stmt *q_dropvolprivs;
     sqlite3_stmt *q_onoffvol;
     sqlite3_stmt *q_getvolstate;
@@ -643,11 +594,14 @@ struct _sx_hashfs_t {
     sqlite3_stmt *q_chownvol;
     sqlite3_stmt *q_chownvolbyid;
     sqlite3_stmt *q_resizevol;
+    sqlite3_stmt *q_changerevs;
     sqlite3_stmt *q_minreqs;
     sqlite3_stmt *q_updatevolcursize;
     sqlite3_stmt *q_setvolcursize;
     sqlite3_stmt *q_getnodepushtime;
     sqlite3_stmt *q_setnodepushtime;
+    sqlite3_stmt *q_userisowner;
+    sqlite3_stmt *q_getprivholder;
 
     sxi_db_t *tempdb;
     sqlite3_stmt *qt_new;
@@ -660,22 +614,24 @@ struct _sx_hashfs_t {
     sqlite3_stmt *qt_getmeta;
     sqlite3_stmt *qt_countmeta;
     sqlite3_stmt *qt_gettoken;
-    sqlite3_stmt *qt_tokenstats;
-    sqlite3_stmt *qt_tmpbytoken;
+    sqlite3_stmt *qt_tokendata;
+    sqlite3_stmt *qt_tmpbyrev;
     sqlite3_stmt *qt_tmpdata;
     sqlite3_stmt *qt_delete;
     sqlite3_stmt *qt_flush;
-    sqlite3_stmt *qt_gc_tokens;
+    sqlite3_stmt *qt_gc_revisions;
 
     sxi_db_t *metadb[METADBS];
     sqlite3_stmt *qm_ins[METADBS];
     sqlite3_stmt *qm_list[METADBS];
+    sqlite3_stmt *qm_list_eq[METADBS];
     sqlite3_stmt *qm_listrevs[METADBS];
     sqlite3_stmt *qm_listrevs_rev[METADBS];
     unsigned char qm_list_done[METADBS];
     uint64_t qm_list_queries;
     sqlite3_stmt *qm_get[METADBS];
     sqlite3_stmt *qm_getrev[METADBS];
+    sqlite3_stmt *qm_findrev[METADBS];
     sqlite3_stmt *qm_oldrevs[METADBS];
     sqlite3_stmt *qm_metaget[METADBS];
     sqlite3_stmt *qm_metaset[METADBS];
@@ -691,35 +647,42 @@ struct _sx_hashfs_t {
     sqlite3_stmt *qm_count[METADBS];
     sqlite3_stmt *qm_list_rev_dec[METADBS];
     sqlite3_stmt *qm_list_file[METADBS];
+    sqlite3_stmt *qm_add_heal[METADBS];
+    sqlite3_stmt *qm_del_heal[METADBS];
+    sqlite3_stmt *qm_get_rb[METADBS];
+    sqlite3_stmt *qm_count_rb[METADBS];
+    sqlite3_stmt *qm_add_heal_volume[METADBS];
+    sqlite3_stmt *qm_sel_heal_volume[METADBS];
+    sqlite3_stmt *qm_upd_heal_volume[METADBS];
+    sqlite3_stmt *qm_del_heal_volume[METADBS];
+    sqlite3_stmt *qm_needs_upgrade[METADBS];
 
     sxi_db_t *datadb[SIZES][HASHDBS];
-    sqlite3_stmt *qb_get[SIZES][HASHDBS];
     sqlite3_stmt *qb_nextavail[SIZES][HASHDBS];
     sqlite3_stmt *qb_nextalloc[SIZES][HASHDBS];
     sqlite3_stmt *qb_add[SIZES][HASHDBS];
     sqlite3_stmt *qb_setfree[SIZES][HASHDBS];
     sqlite3_stmt *qb_gc1[SIZES][HASHDBS];
+    sqlite3_stmt *qb_get[SIZES][HASHDBS];
     sqlite3_stmt *qb_bumpavail[SIZES][HASHDBS];
     sqlite3_stmt *qb_bumpalloc[SIZES][HASHDBS];
+    sqlite3_stmt *qb_addtoken[SIZES][HASHDBS];
     sqlite3_stmt *qb_moduse[SIZES][HASHDBS];
-    sqlite3_stmt *qb_op[SIZES][HASHDBS];
     sqlite3_stmt *qb_reserve[SIZES][HASHDBS];
-    sqlite3_stmt *qb_del_reserve[SIZES][HASHDBS];
     sqlite3_stmt *qb_get_meta[SIZES][HASHDBS];
+    sqlite3_stmt *qb_del_reserve[SIZES][HASHDBS];
+    sqlite3_stmt *qb_find_unused_revision[SIZES][HASHDBS];
+    sqlite3_stmt *qb_find_unused_block[SIZES][HASHDBS];
     sqlite3_stmt *qb_deleteold[SIZES][HASHDBS];
-    sqlite3_stmt *qb_add_reserve[SIZES][HASHDBS];
-    sqlite3_stmt *qb_find_unused[SIZES][HASHDBS];
-    sqlite3_stmt *qb_find_bad[SIZES][HASHDBS];
     sqlite3_stmt *qb_find_expired_reservation[SIZES][HASHDBS];
     sqlite3_stmt *qb_find_expired_reservation2[SIZES][HASHDBS];
-    sqlite3_stmt *qb_find_expired_ops[SIZES][HASHDBS];
+    sqlite3_stmt *qb_gc_revision_blocks[SIZES][HASHDBS];
+    sqlite3_stmt *qb_gc_revision[SIZES][HASHDBS];
     sqlite3_stmt *qb_gc_reserve[SIZES][HASHDBS];
-    sqlite3_stmt *qb_gc_reserve2[SIZES][HASHDBS];
-    sqlite3_stmt *qb_gc_op[SIZES][HASHDBS];
 
     sxi_db_t *eventdb;
     sqlite3_stmt *qe_getjob;
-    sqlite3_stmt *qe_jobbydata;
+    sqlite3_stmt *qe_getfiledeljob;
     sqlite3_stmt *qe_addjob;
     sqlite3_stmt *qe_addact;
     sqlite3_stmt *qe_countjobs;
@@ -727,6 +690,8 @@ struct _sx_hashfs_t {
     sqlite3_stmt *qe_hasjobs;
     sqlite3_stmt *qe_lock;
     sqlite3_stmt *qe_unlock;
+    sqlite3_stmt *qe_gc;
+    sqlite3_stmt *qe_count_upgradejobs;
     int addjob_begun;
 
     sxi_db_t *xferdb;
@@ -744,22 +709,30 @@ struct _sx_hashfs_t {
     uint16_t http_port;
 
     sxi_hdist_t *hd;
-    sx_nodelist_t *prev_dist, *next_dist, *nextprev_dist, *prevnext_dist, *faulty_nodes;
+    sx_nodelist_t *prev_dist, *next_dist, *nextprev_dist, *prevnext_dist, *faulty_nodes, *ignored_nodes, *effprev_dist, *effnext_dist, *effnextprev_dist, *effprevnext_dist;
     int64_t hd_rev;
     unsigned int have_hd, is_rebalancing, is_orphan;
     time_t last_dist_change;
 
     sx_hashfs_volume_t curvol;
-    sx_uid_t curvoluid;
+    const uint8_t *curvoluser;
+
+    sx_hashfs_user_t curclone;
+    int listinactiveclones;
 
     sx_hashfs_file_t list_file;
     int list_recurse;
     int64_t list_volid;
-    /* 2*SXLIMIT because each char can be a wildcard that might need to be
-     * escaped for an exact match */
-    char list_pattern[SXLIMIT_MAX_FILENAME_LEN+1];
-    char list_pattern_esc[2*SXLIMIT_MAX_FILENAME_LEN+3];
-    unsigned int list_pattern_slashes;
+    char list_pattern[SXLIMIT_MAX_FILENAME_LEN+2]; /* +2 -> NUL byte plus possibly added glob if pattern ends with slash */
+    list_entry_t list_cache[METADBS];
+    unsigned int list_pattern_slashes; /* Number of slashes in pattern */
+    int list_pattern_end_with_slash; /* 1 if pattern ends with slash */
+
+    /* fields below are used during iteration */
+    /* No need to append byte for asterisk, because that limit is up to first NUL byte */
+    char list_lower_limit[SXLIMIT_MAX_FILENAME_LEN+1];
+    char list_upper_limit[SXLIMIT_MAX_FILENAME_LEN+1];
+    int list_limit_len; /* Both itername and itername_limit will have the same length */
 
     int64_t get_id;
     const sx_hash_t *get_content;
@@ -782,6 +755,7 @@ struct _sx_hashfs_t {
     unsigned int put_success;
     sx_hash_t *put_blocks;
     sx_hash_t put_reserve_id;
+    sx_hash_t put_revision_id;
     unsigned int *put_nidxs;
     unsigned int *put_hashnos;
     unsigned int put_nblocks;
@@ -814,6 +788,9 @@ struct _sx_hashfs_t {
     int gcver;
     int gc_wal_pages;
     struct rebalance_iter rit;
+
+    int readonly;
+    int lockfd;
 };
 
 static void close_all_dbs(sx_hashfs_t *h) {
@@ -828,7 +805,7 @@ static void close_all_dbs(sx_hashfs_t *h) {
     qclose(&h->xferdb);
 
     sqlite3_finalize(h->qe_getjob);
-    sqlite3_finalize(h->qe_jobbydata);
+    sqlite3_finalize(h->qe_getfiledeljob);
     sqlite3_finalize(h->qe_addjob);
     sqlite3_finalize(h->qe_addact);
     sqlite3_finalize(h->qe_countjobs);
@@ -836,6 +813,8 @@ static void close_all_dbs(sx_hashfs_t *h) {
     sqlite3_finalize(h->qe_hasjobs);
     sqlite3_finalize(h->qe_lock);
     sqlite3_finalize(h->qe_unlock);
+    sqlite3_finalize(h->qe_gc);
+    sqlite3_finalize(h->qe_count_upgradejobs);
 
     sqlite3_finalize(h->rit.q_add);
     sqlite3_finalize(h->rit.q_sel);
@@ -847,30 +826,28 @@ static void close_all_dbs(sx_hashfs_t *h) {
 
     for(j=0; j<SIZES; j++) {
 	for(i=0; i<HASHDBS; i++) {
-	    sqlite3_finalize(h->qb_get[j][i]);
 	    sqlite3_finalize(h->qb_nextavail[j][i]);
 	    sqlite3_finalize(h->qb_nextalloc[j][i]);
 	    sqlite3_finalize(h->qb_add[j][i]);
 	    sqlite3_finalize(h->qb_setfree[j][i]);
 	    sqlite3_finalize(h->qb_gc1[j][i]);
+	    sqlite3_finalize(h->qb_get[j][i]);
 	    sqlite3_finalize(h->qb_bumpavail[j][i]);
 	    sqlite3_finalize(h->qb_bumpalloc[j][i]);
+            sqlite3_finalize(h->qb_addtoken[j][i]);
             sqlite3_finalize(h->qb_moduse[j][i]);
-            sqlite3_finalize(h->qb_op[j][i]);
             sqlite3_finalize(h->qb_reserve[j][i]);
-            sqlite3_finalize(h->qb_del_reserve[j][i]);
             sqlite3_finalize(h->qb_get_meta[j][i]);
-            sqlite3_finalize(h->rit.q[j][i]);
+            sqlite3_finalize(h->qb_del_reserve[j][i]);
+            sqlite3_finalize(h->qb_find_unused_revision[j][i]);
+            sqlite3_finalize(h->qb_find_unused_block[j][i]);
             sqlite3_finalize(h->qb_deleteold[j][i]);
-            sqlite3_finalize(h->qb_add_reserve[j][i]);
-            sqlite3_finalize(h->qb_find_unused[j][i]);
-            sqlite3_finalize(h->qb_find_bad[j][i]);
+            sqlite3_finalize(h->rit.q[j][i]);
             sqlite3_finalize(h->qb_find_expired_reservation[j][i]);
             sqlite3_finalize(h->qb_find_expired_reservation2[j][i]);
-            sqlite3_finalize(h->qb_find_expired_ops[j][i]);
+            sqlite3_finalize(h->qb_gc_revision_blocks[j][i]);
+            sqlite3_finalize(h->qb_gc_revision[j][i]);
             sqlite3_finalize(h->qb_gc_reserve[j][i]);
-            sqlite3_finalize(h->qb_gc_reserve2[j][i]);
-            sqlite3_finalize(h->qb_gc_op[j][i]);
 	    qclose(&h->datadb[j][i]);
 
 	    if(h->datafd[j][i] >= 0)
@@ -880,10 +857,12 @@ static void close_all_dbs(sx_hashfs_t *h) {
     for(i=0; i<METADBS; i++) {
 	sqlite3_finalize(h->qm_ins[i]);
 	sqlite3_finalize(h->qm_list[i]);
+        sqlite3_finalize(h->qm_list_eq[i]);
 	sqlite3_finalize(h->qm_listrevs[i]);
         sqlite3_finalize(h->qm_listrevs_rev[i]);
 	sqlite3_finalize(h->qm_get[i]);
 	sqlite3_finalize(h->qm_getrev[i]);
+	sqlite3_finalize(h->qm_findrev[i]);
 	sqlite3_finalize(h->qm_oldrevs[i]);
 	sqlite3_finalize(h->qm_metaget[i]);
 	sqlite3_finalize(h->qm_metaset[i]);
@@ -899,6 +878,15 @@ static void close_all_dbs(sx_hashfs_t *h) {
         sqlite3_finalize(h->qm_count[i]);
         sqlite3_finalize(h->qm_list_rev_dec[i]);
         sqlite3_finalize(h->qm_list_file[i]);
+        sqlite3_finalize(h->qm_del_heal[i]);
+        sqlite3_finalize(h->qm_add_heal[i]);
+        sqlite3_finalize(h->qm_get_rb[i]);
+        sqlite3_finalize(h->qm_count_rb[i]);
+        sqlite3_finalize(h->qm_add_heal_volume[i]);
+        sqlite3_finalize(h->qm_sel_heal_volume[i]);
+        sqlite3_finalize(h->qm_upd_heal_volume[i]);
+        sqlite3_finalize(h->qm_del_heal_volume[i]);
+        sqlite3_finalize(h->qm_needs_upgrade[i]);
 	qclose(&h->metadb[i]);
     }
 
@@ -906,26 +894,31 @@ static void close_all_dbs(sx_hashfs_t *h) {
     sqlite3_finalize(h->q_addvolmeta);
     sqlite3_finalize(h->q_addvolprivs);
     sqlite3_finalize(h->q_dropvolprivs);
+    sqlite3_finalize(h->q_chprivs);
     sqlite3_finalize(h->q_onoffvol);
     sqlite3_finalize(h->q_getvolstate);
     sqlite3_finalize(h->q_delvol);
     sqlite3_finalize(h->q_chownvol);
     sqlite3_finalize(h->q_chownvolbyid);
     sqlite3_finalize(h->q_resizevol);
+    sqlite3_finalize(h->q_changerevs);
     sqlite3_finalize(h->q_minreqs);
     sqlite3_finalize(h->q_updatevolcursize);
     sqlite3_finalize(h->q_setvolcursize);
     sqlite3_finalize(h->q_getnodepushtime);
     sqlite3_finalize(h->q_setnodepushtime);
     sqlite3_finalize(h->q_onoffuser);
+    sqlite3_finalize(h->q_onoffuserclones);
     sqlite3_finalize(h->q_gethdrev);
     sqlite3_finalize(h->q_getuser);
     sqlite3_finalize(h->q_getuserbyid);
     sqlite3_finalize(h->q_getuserbyname);
     sqlite3_finalize(h->q_listusers);
+    sqlite3_finalize(h->q_listusersbycid);
     sqlite3_finalize(h->q_listacl);
     sqlite3_finalize(h->q_getaccess);
     sqlite3_finalize(h->q_createuser);
+    sqlite3_finalize(h->q_createuser_meta);
     sqlite3_finalize(h->q_deleteuser);
     sqlite3_finalize(h->q_user_newkey);
     sqlite3_finalize(h->q_grant);
@@ -933,6 +926,8 @@ static void close_all_dbs(sx_hashfs_t *h) {
     sqlite3_finalize(h->q_getuidname);
     sqlite3_finalize(h->q_revoke);
     sqlite3_finalize(h->q_nextvol);
+    sqlite3_finalize(h->q_userisowner);
+    sqlite3_finalize(h->q_getprivholder);
 
     sqlite3_finalize(h->qt_new);
     sqlite3_finalize(h->qt_new4del);
@@ -945,15 +940,17 @@ static void close_all_dbs(sx_hashfs_t *h) {
     sqlite3_finalize(h->qt_countmeta);
     sqlite3_finalize(h->qt_gettoken);
     sqlite3_finalize(h->qt_tmpdata);
-    sqlite3_finalize(h->qt_tokenstats);
-    sqlite3_finalize(h->qt_tmpbytoken);
+    sqlite3_finalize(h->qt_tokendata);
+    sqlite3_finalize(h->qt_tmpbyrev);
     sqlite3_finalize(h->qt_delete);
     sqlite3_finalize(h->qt_flush);
-    sqlite3_finalize(h->qt_gc_tokens);
+    sqlite3_finalize(h->qt_gc_revisions);
 
     sqlite3_finalize(h->q_volbyname);
     sqlite3_finalize(h->q_volbyid);
     sqlite3_finalize(h->q_metaget);
+    sqlite3_finalize(h->q_delval);
+    sqlite3_finalize(h->q_setval);
     sqlite3_finalize(h->q_getval);
     qclose(&h->tempdb);
     qclose(&h->db);
@@ -961,7 +958,7 @@ static void close_all_dbs(sx_hashfs_t *h) {
 
 /* TODO: shouldn't use hidden variables */
 #define OPEN_DB(DBNAME, DBHANDLE) \
-do { \
+do {\
     sqlite3_reset(h->q_getval); \
     if(qbind_text(h->q_getval, ":k", DBNAME) || qstep_ret(h->q_getval)) {\
 	WARN("Couldn't find DB '%s'", DBNAME);				\
@@ -980,7 +977,7 @@ do { \
 	memcpy(path + dirlen, str, subpathlen); \
 	str = path; \
     } \
-    if(qopen(str, DBHANDLE, DBNAME, &h->cluster_uuid)) \
+    if(qopen(str, DBHANDLE, DBNAME, &h->cluster_uuid, HASHFS_VERSION)) \
 	goto open_hashfs_fail; \
 } while(0)
 
@@ -1022,6 +1019,7 @@ void sx_hashfs_checkpoint_eventdb(sx_hashfs_t *h)
 static int load_config(sx_hashfs_t *h, sxc_client_t *sx) {
     const void *p;
     int r, load_faulty = 0, ret = -1;
+    unsigned int i;
 
     DEBUG("Reloading cluster configuration");
 
@@ -1041,8 +1039,18 @@ static int load_config(sx_hashfs_t *h, sxc_client_t *sx) {
     h->nextprev_dist = NULL;
     sx_nodelist_delete(h->prevnext_dist);
     h->prevnext_dist = NULL;
+    sx_nodelist_delete(h->effprev_dist);
+    h->effprev_dist = NULL;
+    sx_nodelist_delete(h->effnext_dist);
+    h->effnext_dist = NULL;
+    sx_nodelist_delete(h->effnextprev_dist);
+    h->effnextprev_dist = NULL;
+    sx_nodelist_delete(h->effprevnext_dist);
+    h->effprevnext_dist = NULL;
     sx_nodelist_delete(h->faulty_nodes);
     h->faulty_nodes = NULL;
+    sx_nodelist_delete(h->ignored_nodes);
+    h->ignored_nodes = NULL;
     h->is_rebalancing = 0;
     h->sx = sx;
     h->last_dist_change = time(NULL);
@@ -1230,6 +1238,77 @@ static int load_config(sx_hashfs_t *h, sxc_client_t *sx) {
 	}
 	sxi_conns_set_cafile(h->sx_clust, h->ssl_ca_file);
 	sxi_conns_disable_blacklisting(h->sx_clust);
+	if(sxi_conns_set_timeouts(h->sx_clust, SXI_CONNS_HARD_TIMEOUT, SXI_CONNS_SOFT_TIMEOUT))
+	    WARN("Failed to set connection timeouts");
+
+	h->ignored_nodes = sx_nodelist_new();
+	if(h->ignored_nodes) {
+	    sqlite3_stmt *qignnodes = NULL;
+	    if(qprep(h->db, &qignnodes, "SELECT node FROM ignorednodes WHERE dist = :dist") ||
+	       qbind_int64(qignnodes, ":dist", h->hd_rev)) {
+		CRIT("Failed to retrieve list of ignored nodes from database");
+		qnullify(qignnodes);
+		goto load_config_fail;
+	    }
+	    while((r = qstep(qignnodes)) == SQLITE_ROW) {
+		sx_uuid_t ignuuid;
+		sx_node_t *ignme;
+		p = sqlite3_column_blob(qignnodes, 0);
+		if(!p || sqlite3_column_bytes(qignnodes, 0) != sizeof(ignuuid.binary))
+		    break;
+		uuid_from_binary(&ignuuid, p);
+		ignme = sx_node_new(&ignuuid, "127.0.0.1", "127.0.0.1", 1);
+		INFO("Node %s is ignored", ignuuid.string);
+		if(!ignme || sx_nodelist_add(h->ignored_nodes, ignme))
+		    break;
+	    }
+	    qnullify(qignnodes);
+	    if(r != SQLITE_DONE) {
+		CRIT("Failed to retrieve list of ignored nodes from database");
+		goto load_config_fail;
+	    }
+	} else {
+	    CRIT("Failed to allocate list of ignored nodes from database");
+	    goto load_config_fail;
+	}
+
+	h->effprev_dist = sx_nodelist_new();
+	for(i=0; i<sx_nodelist_count(h->prev_dist); i++) {
+	    const sx_node_t *node = sx_nodelist_get(h->prev_dist, i);
+	    if(sx_nodelist_lookup(h->ignored_nodes, sx_node_uuid(node)) ||
+	       !sx_nodelist_add(h->effprev_dist, sx_node_dup(node)))
+		continue;
+	    CRIT("Failed to build list of effective nodes");
+	    goto load_config_fail;
+	}
+	h->effnext_dist = sx_nodelist_new();
+	for(i=0; i<sx_nodelist_count(h->next_dist); i++) {
+	    const sx_node_t *node = sx_nodelist_get(h->next_dist, i);
+	    if(sx_nodelist_lookup(h->ignored_nodes, sx_node_uuid(node)) ||
+	       !sx_nodelist_add(h->effnext_dist, sx_node_dup(node)))
+		continue;
+	    CRIT("Failed to build list of effective nodes");
+	    goto load_config_fail;
+	}
+	h->effprevnext_dist = sx_nodelist_new();
+	for(i=0; i<sx_nodelist_count(h->prevnext_dist); i++) {
+	    const sx_node_t *node = sx_nodelist_get(h->prevnext_dist, i);
+	    if(sx_nodelist_lookup(h->ignored_nodes, sx_node_uuid(node)) ||
+	       !sx_nodelist_add(h->effprevnext_dist, sx_node_dup(node)))
+		continue;
+	    CRIT("Failed to build list of effective nodes");
+	    goto load_config_fail;
+	}
+	h->effnextprev_dist = sx_nodelist_new();
+	for(i=0; i<sx_nodelist_count(h->nextprev_dist); i++) {
+	    const sx_node_t *node = sx_nodelist_get(h->nextprev_dist, i);
+	    if(sx_nodelist_lookup(h->ignored_nodes, sx_node_uuid(node)) ||
+	       !sx_nodelist_add(h->effnextprev_dist, sx_node_dup(node)))
+		continue;
+	    CRIT("Failed to build list of effective nodes");
+	    goto load_config_fail;
+	}
+
 
 	h->have_hd = 1;
 	break;
@@ -1250,14 +1329,13 @@ static int load_config(sx_hashfs_t *h, sxc_client_t *sx) {
     return ret;
 }
 
-
-
 sx_hashfs_t *sx_hashfs_open(const char *dir, sxc_client_t *sx) {
     unsigned int dirlen, pathlen, i, j;
     sqlite3_stmt *q = NULL;
-    char *path, dbitem[64], dynqry[128];
+    char *path, dbitem[64], qrybuff[128];
     const char *str;
     sx_hashfs_t *h;
+    struct flock fl;
 
     if(!dir || !(dirlen = strlen(dir))) {
 	CRIT("Bad path");
@@ -1269,6 +1347,7 @@ sx_hashfs_t *sx_hashfs_open(const char *dir, sxc_client_t *sx) {
     if(!(h = wrap_calloc(1, sizeof(*h))))
 	return NULL;
     memset(h->datafd, -1, sizeof(h->datafd));
+    h->lockfd = -1;
     h->sx = NULL;
     h->job_trigger = h->xfer_trigger = h->gc_trigger = h->gc_expire_trigger = -1;
     /* TODO: read from hashfs kv store */
@@ -1281,6 +1360,25 @@ sx_hashfs_t *sx_hashfs_open(const char *dir, sxc_client_t *sx) {
     h->dir = strdup(dir);
     if (!h->dir)
         goto open_hashfs_fail;
+
+    sprintf(path, "%s/hashfs.lock", dir);
+    h->lockfd = open(path, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
+    if(h->lockfd < 0) {
+        WARN("Failed to open %s lockfile: %s", path, strerror(errno));
+        goto open_hashfs_fail;
+    }
+
+    fl.l_start = 0;
+    fl.l_len = 0;
+    fl.l_type = F_RDLCK;
+    fl.l_whence = SEEK_SET;
+    if(fcntl(h->lockfd, F_SETLK, &fl) == -1) {
+        if(errno == EACCES || errno == EAGAIN)
+            INFO("Failed lock HashFS: Storage is locked for maintenance");
+        else
+            WARN("Failed to acquire read lock: %s", strerror(errno));
+        goto open_hashfs_fail;
+    }
 
     if (!qlog_set) {
 	sqlite3_config(SQLITE_CONFIG_LOG, qlog, NULL);
@@ -1297,13 +1395,17 @@ sx_hashfs_t *sx_hashfs_open(const char *dir, sxc_client_t *sx) {
     sxi_rand_cleanup();
 
     sprintf(path, "%s/hashfs.db", dir);
-    if(qopen(path, &h->db, "hashfs", NULL))
+    if(qopen(path, &h->db, "hashfs", NULL, HASHFS_VERSION))
 	goto open_hashfs_fail;
     if(qprep(h->db, &q, "PRAGMA foreign_keys = ON") || qstep_noret(q))
 	goto open_hashfs_fail;
     qnullify(q);
     if(qprep(h->db, &h->q_getval, "SELECT value FROM hashfs WHERE key = :k"))
 	goto open_hashfs_fail;
+    if(qprep(h->db, &h->q_setval, "INSERT OR REPLACE INTO hashfs (key,value) VALUES (:k, :v)"))
+        goto open_hashfs_fail;
+    if(qprep(h->db, &h->q_delval, "DELETE FROM hashfs WHERE key = :k"))
+        goto open_hashfs_fail;
     if(qbind_text(h->q_getval, ":k", "cluster") || qstep_ret(h->q_getval))
 	goto open_hashfs_fail;
     str = (const char *)sqlite3_column_blob(h->q_getval, 0);
@@ -1345,24 +1447,30 @@ sx_hashfs_t *sx_hashfs_open(const char *dir, sxc_client_t *sx) {
 
     if(qprep(h->db, &h->q_gethdrev, "SELECT MIN(value) FROM hashfs WHERE key IN ('current_dist_rev','dist_rev')"))
 	goto open_hashfs_fail;
-    if(qprep(h->db, &h->q_getuser, "SELECT uid, key, role FROM users WHERE user = :user AND enabled=1"))
+    if(qprep(h->db, &h->q_getuser, "SELECT uid, key, role, desc FROM users LEFT JOIN usermeta ON users.uid=usermeta.userid WHERE user = :user AND enabled=1"))
 	goto open_hashfs_fail;
-    if(qprep(h->db, &h->q_getuserbyid, "SELECT user FROM users WHERE uid = :uid AND enabled=1"))
+    if(qprep(h->db, &h->q_getuserbyid, "SELECT user FROM users WHERE uid = :uid AND (:inactivetoo OR enabled=1)"))
 	goto open_hashfs_fail;
-    if(qprep(h->db, &h->q_getuserbyname, "SELECT user FROM users WHERE name = :name AND enabled=1"))
+    if(qprep(h->db, &h->q_getuserbyname, "SELECT user FROM users WHERE name = :name AND (:inactivetoo OR enabled=1)"))
 	goto open_hashfs_fail;
-    if(qprep(h->db, &h->q_listusers, "SELECT uid, name, user, key, role FROM users WHERE uid > :lastuid AND enabled=1 ORDER BY uid ASC LIMIT 1"))
+    if(qprep(h->db, &h->q_listusers, "SELECT uid, name, user, key, role, desc FROM users LEFT JOIN usermeta ON users.uid=usermeta.userid WHERE uid > :lastuid AND enabled=1 ORDER BY uid ASC LIMIT 1"))
 	goto open_hashfs_fail;
+    if(qprep(h->db, &h->q_listusersbycid, "SELECT uid, name, user, key, role, desc FROM users LEFT JOIN usermeta ON users.uid=usermeta.userid WHERE uid > :lastuid AND (:inactivetoo OR enabled=1) AND SUBSTR(user, 0, "STRIFY(AUTH_CID_LEN)") = SUBSTR(:common_id, 0, "STRIFY(AUTH_CID_LEN)") ORDER BY uid ASC LIMIT 1"))
+        goto open_hashfs_fail;
     if(qprep(h->db, &h->q_listacl, "SELECT name, priv, uid, owner_id FROM privs, volumes INNER JOIN users ON user_id=uid WHERE volume_id=:volid AND vid=:volid AND volumes.enabled = 1 AND users.enabled = 1 AND (priv <> 0 OR owner_id=uid) AND user_id > :lastuid ORDER BY user_id ASC LIMIT 1"))
 	goto open_hashfs_fail;
-    if(qprep(h->db, &h->q_getaccess, "SELECT privs.priv, volumes.owner_id FROM privs, volumes, users WHERE privs.volume_id = :volume AND privs.user_id = :user AND volumes.vid = :volume AND volumes.enabled = 1 AND users.uid = :user AND users.enabled = 1"))
+    if(qprep(h->db, &h->q_getaccess, "SELECT privs.priv, volumes.owner_id FROM privs, volumes WHERE privs.volume_id = :volume AND privs.user_id IN (SELECT uid FROM users WHERE SUBSTR(user,0,"STRIFY(AUTH_CID_LEN)")=SUBSTR(:user,0,"STRIFY(AUTH_CID_LEN)") AND enabled=1) AND volumes.vid = :volume AND volumes.enabled = 1"))
 	goto open_hashfs_fail;
     if(qprep(h->db, &h->q_createuser, "INSERT INTO users(user, name, key, role) VALUES(:userhash,:name,:key,:role)"))
+	goto open_hashfs_fail;
+    if(qprep(h->db, &h->q_createuser_meta, "INSERT INTO usermeta(userid, desc) SELECT uid, :desc FROM users WHERE user=:userhash"))
 	goto open_hashfs_fail;
     if(qprep(h->db, &h->q_deleteuser, "DELETE FROM users WHERE uid = :uid"))
 	goto open_hashfs_fail;
     if(qprep(h->db, &h->q_onoffuser, "UPDATE users SET enabled = :enable WHERE name = :username"))
 	goto open_hashfs_fail;
+    if(qprep(h->db, &h->q_onoffuserclones, "UPDATE users SET enabled = :enable WHERE SUBSTR(user,0,"STRIFY(AUTH_CID_LEN)") = SUBSTR(:user,0,"STRIFY(AUTH_CID_LEN)") AND uid <> 0"))
+        goto open_hashfs_fail;
     if(qprep(h->db, &h->q_user_newkey, "UPDATE users SET key=:key WHERE name = :username AND uid <> 0"))
 	goto open_hashfs_fail;
     /* update if present otherwise insert:
@@ -1387,7 +1495,7 @@ sx_hashfs_t *sx_hashfs_open(const char *dir, sxc_client_t *sx) {
         goto open_hashfs_fail;
     /* To keep the next query simple we do not check if the user is enabled
      * This is preliminary enforced in auth_begin */
-    if(qprep(h->db, &h->q_nextvol, "SELECT volumes.vid, volumes.volume, volumes.replica, volumes.cursize, volumes.maxsize, volumes.owner_id, volumes.revs, volumes.changed FROM volumes LEFT JOIN privs ON privs.volume_id = volumes.vid WHERE volumes.volume > :previous AND volumes.enabled = 1 AND (:user = 0 OR (privs.priv > 0 AND privs.user_id=:user)) ORDER BY volumes.volume ASC LIMIT 1"))
+    if(qprep(h->db, &h->q_nextvol, "SELECT volumes.vid, volumes.volume, volumes.replica, volumes.cursize, volumes.maxsize, volumes.owner_id, volumes.revs, volumes.changed FROM volumes LEFT JOIN privs ON privs.volume_id = volumes.vid WHERE volumes.volume > :previous AND volumes.enabled = 1 AND (:user IS NULL OR (privs.priv > 0 AND privs.user_id IN (SELECT uid FROM users WHERE SUBSTR(user,0,"STRIFY(AUTH_CID_LEN)")=SUBSTR(:user,0,"STRIFY(AUTH_CID_LEN)")))) ORDER BY volumes.volume ASC LIMIT 1"))
 	goto open_hashfs_fail;
     if(qprep(h->db, &h->q_volbyname, "SELECT vid, volume, replica, cursize, maxsize, owner_id, revs, changed FROM volumes WHERE volume = :name AND enabled = 1"))
 	goto open_hashfs_fail;
@@ -1401,6 +1509,8 @@ sx_hashfs_t *sx_hashfs_open(const char *dir, sxc_client_t *sx) {
 	goto open_hashfs_fail;
     if(qprep(h->db, &h->q_addvolprivs, "INSERT INTO privs (volume_id, user_id, priv) VALUES (:volume, :user, :priv)"))
 	goto open_hashfs_fail;
+    if(qprep(h->db, &h->q_chprivs, "UPDATE privs SET user_id = :new WHERE user_id IN (SELECT uid FROM users WHERE SUBSTR(user,0,"STRIFY(AUTH_CID_LEN)")=SUBSTR(:user,0,"STRIFY(AUTH_CID_LEN)"))"))
+        goto open_hashfs_fail;
     if(qprep(h->db, &h->q_onoffvol, "UPDATE volumes SET enabled = :enable WHERE volume = :volume AND volume NOT LIKE '.BAD%'"))
 	goto open_hashfs_fail;
     if(qprep(h->db, &h->q_getvolstate, "SELECT enabled FROM volumes WHERE volume = :volume AND volume NOT LIKE '.BAD%'"))
@@ -1413,6 +1523,8 @@ sx_hashfs_t *sx_hashfs_open(const char *dir, sxc_client_t *sx) {
         goto open_hashfs_fail;
     if(qprep(h->db, &h->q_resizevol, "UPDATE volumes SET maxsize = :size WHERE vid = :volid AND enabled = 1"))
         goto open_hashfs_fail;
+    if(qprep(h->db, &h->q_changerevs, "UPDATE volumes SET revs = :revs WHERE vid = :volid AND enabled = 1"))
+        goto open_hashfs_fail;
     if(qprep(h->db, &h->q_minreqs, "SELECT COALESCE(MAX(replica), 1), COALESCE(SUM(maxsize*replica), 0) FROM volumes"))
         goto open_hashfs_fail;
     if(qprep(h->db, &h->q_updatevolcursize, "UPDATE volumes SET cursize = cursize + :size, changed = :now WHERE vid = :volume AND enabled = 1"))
@@ -1422,6 +1534,10 @@ sx_hashfs_t *sx_hashfs_open(const char *dir, sxc_client_t *sx) {
     if(qprep(h->db, &h->q_getnodepushtime, "SELECT last_push FROM node_volume_updates WHERE node = :node"))
         goto open_hashfs_fail;
     if(qprep(h->db, &h->q_setnodepushtime, "INSERT OR REPLACE INTO node_volume_updates VALUES (:node, :now)"))
+        goto open_hashfs_fail;
+    if(qprep(h->db, &h->q_userisowner, "SELECT 1 FROM users u1 JOIN users u2 ON SUBSTR(u1.user, 0, "STRIFY(AUTH_CID_LEN)") = SUBSTR(u2.user, 0, "STRIFY(AUTH_CID_LEN)") WHERE u1.uid = :owner_id AND u2.uid = :uid AND u1.enabled = 1 AND u2.enabled = 1"))
+        goto open_hashfs_fail;
+    if(qprep(h->db, &h->q_getprivholder, "SELECT uid FROM users JOIN privs ON user_id = uid WHERE SUBSTR(user, 0, "STRIFY(AUTH_CID_LEN)") = SUBSTR(:user, 0, "STRIFY(AUTH_CID_LEN)") AND enabled = 1"))
         goto open_hashfs_fail;
 
     OPEN_DB("tempdb", &h->tempdb);
@@ -1446,11 +1562,11 @@ sx_hashfs_t *sx_hashfs_open(const char *dir, sxc_client_t *sx) {
 	goto open_hashfs_fail;
     if(qprep(h->tempdb, &h->qt_countmeta, "SELECT COUNT(*) FROM tmpmeta WHERE tid = :id"))
 	goto open_hashfs_fail;
-    if(qprep(h->tempdb, &h->qt_gettoken, "SELECT token, ttl, volume_id, name FROM tmpfiles WHERE tid = :id AND flushed = 0"))
+    if(qprep(h->tempdb, &h->qt_gettoken, "SELECT token, ttl, volume_id, name, t || ':' || token AS revision FROM tmpfiles WHERE tid = :id AND flushed = 0"))
 	goto open_hashfs_fail;
-    if(qprep(h->tempdb, &h->qt_tokenstats, "SELECT tid, size, volume_id, length(content) FROM tmpfiles WHERE token = :token AND flushed = 0"))
+    if(qprep(h->tempdb, &h->qt_tokendata, "SELECT tid, size, volume_id, name, content FROM tmpfiles WHERE token = :token AND flushed = 0"))
 	goto open_hashfs_fail;
-    if(qprep(h->tempdb, &h->qt_tmpbytoken, "SELECT tid FROM tmpfiles WHERE volume_id = :volume AND name = :name AND token = :token AND flushed = 1"))
+    if(qprep(h->tempdb, &h->qt_tmpbyrev, "SELECT tid, name, size, volume_id, content, uniqidx, flushed, avail, token FROM tmpfiles WHERE t = :rev_time AND token = :rev_token AND flushed = 1"))
         goto open_hashfs_fail;
     if(qprep(h->tempdb, &h->qt_tmpdata, "SELECT t || ':' || token AS revision, name, size, volume_id, content, uniqidx, flushed, avail, token FROM tmpfiles WHERE tid = :id"))
 	goto open_hashfs_fail;
@@ -1460,7 +1576,7 @@ sx_hashfs_t *sx_hashfs_open(const char *dir, sxc_client_t *sx) {
 	goto open_hashfs_fail;
     if(qprep(h->tempdb, &h->qt_delete, "DELETE FROM tmpfiles WHERE tid = :id"))
 	goto open_hashfs_fail;
-    if(qprep(h->tempdb, &h->qt_gc_tokens, "DELETE FROM tmpfiles WHERE ttl < :now AND ttl > 0"))
+    if(qprep(h->tempdb, &h->qt_gc_revisions, "DELETE FROM tmpfiles WHERE ttl < :now AND ttl > 0"))
 	goto open_hashfs_fail;
 
     if(!(h->blockbuf = wrap_malloc(bsz[SIZES-1])))
@@ -1472,14 +1588,11 @@ sx_hashfs_t *sx_hashfs_open(const char *dir, sxc_client_t *sx) {
 	for(i=0; i<HASHDBS; i++) {
 	    sprintf(dbitem, "hashdb_%c_%08x", sizedirs[j], i);
 	    OPEN_DB(dbitem, &h->datadb[j][i]);
-            if(qprep(h->datadb[j][i], &q, "PRAGMA foreign_keys = ON") || qstep_noret(q))
-                goto open_hashfs_fail;
-            qnullify(q);
 	    if(qprep(h->datadb[j][i], &h->qb_nextavail[j][i], "SELECT blocknumber FROM avail ORDER BY blocknumber ASC LIMIT 1"))
 		goto open_hashfs_fail;
 	    if(qprep(h->datadb[j][i], &h->qb_nextalloc[j][i], "SELECT value FROM hashfs WHERE key = 'next_blockno'"))
 		goto open_hashfs_fail;
-	    if(qprep(h->datadb[j][i], &h->qb_add[j][i], "UPDATE blocks SET blockno=:next, created_at = :now WHERE hash=:hash"))
+	    if(qprep(h->datadb[j][i], &h->qb_add[j][i], "INSERT OR IGNORE INTO blocks(hash, blockno, created_at) VALUES(:hash, :next, :now)"))
 		goto open_hashfs_fail;
 	    if(qprep(h->datadb[j][i], &h->qb_setfree[j][i], "INSERT OR IGNORE INTO avail VALUES(:blockno)"))
 		goto open_hashfs_fail;
@@ -1491,46 +1604,39 @@ sx_hashfs_t *sx_hashfs_open(const char *dir, sxc_client_t *sx) {
 		goto open_hashfs_fail;
 	    if(qprep(h->datadb[j][i], &h->qb_bumpalloc[j][i], "UPDATE hashfs SET value = value + 1 WHERE key = 'next_blockno'"))
 		goto open_hashfs_fail;
-            if(qprep(h->datadb[j][i], &h->qb_moduse[j][i],
-                     "INSERT OR REPLACE INTO use(blockid, replica, age, used)\
-                     SELECT id, :replica, :age, \
-                        COALESCE((SELECT used + :used FROM use WHERE blockid=id AND replica=:replica AND age=:age), :used)\
-                    FROM blocks WHERE hash = :hash"))/* AND blockno IS NOT NULL */
+            if(qprep(h->datadb[j][i], &h->qb_addtoken[j][i], "INSERT OR IGNORE INTO revision_ops(revision_id, op, age) VALUES(:revision_id, :op, :age)"))
                 goto open_hashfs_fail;
-            if(qprep(h->datadb[j][i], &h->qb_op[j][i], "INSERT OR IGNORE INTO operations(blockid, tokenid, replica, op, ttl) SELECT id, :tokenid, :replica, :op, :ttl FROM blocks WHERE hash = :hash"))
+            /* OR IGNORE to avoid subjournal */
+            if(qprep(h->datadb[j][i], &h->qb_moduse[j][i], "INSERT OR IGNORE INTO revision_blocks(revision_id, blocks_hash, age, replica) VALUES(:revision_id, :hash, :age, :replica)"))
                 goto open_hashfs_fail;
-            if(qprep(h->datadb[j][i], &h->qb_reserve[j][i], "INSERT OR REPLACE INTO reservations(blockid, reserveid, ttl) SELECT id, :reserveid, :ttl FROM blocks WHERE hash = :hash"))
+            if(qprep(h->datadb[j][i], &h->qb_reserve[j][i], "INSERT OR IGNORE INTO reservations(reservations_id, revision_id, ttl) VALUES(:reserve_id, :revision_id, :ttl)"))
                 goto open_hashfs_fail;
-            if(qprep(h->datadb[j][i], &h->qb_del_reserve[j][i], "DELETE FROM reservations WHERE reserveid=:reserveid AND blockid=(SELECT id FROM blocks WHERE hash=:hash)"))
+            if(qprep(h->datadb[j][i], &h->qb_get_meta[j][i], "SELECT replica, op, revision_id FROM revision_blocks NATURAL INNER JOIN revision_ops NATURAL LEFT JOIN reservations WHERE blocks_hash=:hash AND age < :current_age AND reservations_id IS NULL"))
                 goto open_hashfs_fail;
-            if(qprep(h->datadb[j][i], &h->qb_get_meta[j][i], "SELECT replica, SUM(used) FROM use WHERE blockid=:blockid AND age < :current_age GROUP BY replica"))
+            if(qprep(h->datadb[j][i], &h->rit.q[j][i], "SELECT hash FROM blocks WHERE hash > :prevhash AND blockno IS NOT NULL"))
                 goto open_hashfs_fail;
-            if(qprep(h->datadb[j][i], &h->rit.q[j][i], "SELECT id, hash FROM blocks WHERE hash > :prevhash AND blockno IS NOT NULL"))
-                goto open_hashfs_fail;
-	    if(qprep(h->datadb[j][i], &h->qb_add_reserve[j][i], "INSERT OR IGNORE INTO blocks (hash) VALUES (:hash)"))
+	    if(qprep(h->datadb[j][i], &h->qb_del_reserve[j][i], "DELETE FROM reservations WHERE reservations_id=:reserve_id"))
 		goto open_hashfs_fail;
-	    if(qprep(h->datadb[j][i], &h->qb_find_unused[j][i], "SELECT id, blockno, hash FROM blocks LEFT JOIN use ON use.blockid=id AND used<>0 LEFT JOIN reservations ON reservations.blockid=id WHERE id > :last AND reservations.blockid IS NULL GROUP BY id HAVING SUM(used)=0 OR COUNT(use.blockid)=0 ORDER BY id;"))
+	    if(qprep(h->datadb[j][i], &h->qb_find_unused_revision[j][i], "SELECT revision_id FROM revision_ops WHERE revision_id IN (SELECT revision_id FROM revision_ops NATURAL LEFT JOIN reservations WHERE op <= 0 AND age <= :age AND revision_id > :last_revision_id AND reservations_id IS NULL) GROUP BY revision_id HAVING SUM(op)=0 ORDER BY revision_id"))
 		goto open_hashfs_fail;
-	    if(qprep(h->datadb[j][i], &h->qb_find_bad[j][i], "SELECT COUNT(blockid) FROM use GROUP BY blockid, replica HAVING SUM(used) < 0"))
+	    if(qprep(h->datadb[j][i], &h->qb_find_unused_block[j][i], "SELECT id, blockno, hash FROM blocks LEFT JOIN revision_blocks ON blocks.hash=blocks_hash WHERE id  > :last AND revision_id IS NULL ORDER BY id"))
 		goto open_hashfs_fail;
             /* hash moved,
              * hashes that are not moved don't have the old counters deleted,
              * and must be taken into account when GCing!
              * this is to avoid updating the entire table during rebalance
              * */
-            if(qprep(h->datadb[j][i], &h->qb_deleteold[j][i], "DELETE FROM use WHERE blockid=(SELECT id FROM blocks WHERE hash=:hash AND blockno IS NOT NULL) AND age < :current_age"))
+            if(qprep(h->datadb[j][i], &h->qb_deleteold[j][i], "DELETE FROM revision_blocks WHERE blocks_hash=:hash AND age < :current_age"))
                 goto open_hashfs_fail;
-            if(qprep(h->datadb[j][i], &h->qb_find_expired_reservation[j][i], "SELECT reserveid FROM reservations INNER JOIN blocks ON blockid=id AND created_at IS NOT NULL WHERE reserveid > :lastreserveid GROUP BY reserveid HAVING created_at < :expires OR created_at IS NULL ORDER BY reserveid LIMIT 1"))
+            if(qprep(h->datadb[j][i], &h->qb_find_expired_reservation[j][i], "SELECT reservations_id, revision_id FROM reservations NATURAL INNER JOIN revision_blocks INNER JOIN blocks ON blocks.hash = blocks_hash WHERE reservations_id > :lastreserve_id GROUP BY reservations_id HAVING created_at < :expires ORDER BY reservations_id LIMIT 1"))
                goto open_hashfs_fail;
-            if(qprep(h->datadb[j][i], &h->qb_find_expired_reservation2[j][i], "SELECT ROWID from reservations WHERE ttl < :now AND ROWID>:lastrowid LIMIT 1"))
+            if(qprep(h->datadb[j][i], &h->qb_find_expired_reservation2[j][i], "SELECT revision_id from reservations WHERE ttl < :now LIMIT 1"))
                goto open_hashfs_fail;
-            if(qprep(h->datadb[j][i], &h->qb_find_expired_ops[j][i],"SELECT ROWID FROM operations WHERE ttl < :now LIMIT 1"))
-               goto open_hashfs_fail;
-            if(qprep(h->datadb[j][i], &h->qb_gc_reserve[j][i], "DELETE FROM reservations WHERE reserveid=:reserveid"))
+            if(qprep(h->datadb[j][i], &h->qb_gc_revision_blocks[j][i], "DELETE FROM revision_blocks WHERE revision_id=:revision_id"))
                 goto open_hashfs_fail;
-            if(qprep(h->datadb[j][i], &h->qb_gc_reserve2[j][i], "DELETE FROM reservations WHERE ROWID=:rowid"))
+            if(qprep(h->datadb[j][i], &h->qb_gc_revision[j][i], "DELETE FROM revision_ops WHERE revision_id=:revision_id"))
                 goto open_hashfs_fail;
-            if(qprep(h->datadb[j][i], &h->qb_gc_op[j][i], "DELETE FROM operations WHERE ROWID=:rowid"))
+            if(qprep(h->datadb[j][i], &h->qb_gc_reserve[j][i], "DELETE FROM reservations WHERE revision_id=:revision_id"))
                 goto open_hashfs_fail;
 
 	    sprintf(dbitem, "datafile_%c_%08x", sizedirs[j], i);
@@ -1563,7 +1669,7 @@ sx_hashfs_t *sx_hashfs_open(const char *dir, sxc_client_t *sx) {
 	       memcmp(h->blockbuf + 16, dbitem, strlen(dbitem)) ||
 	       memcmp(h->blockbuf + 48, hexsz, strlen(hexsz)) ||
 	       memcmp(h->blockbuf + 64, h->cluster_uuid.binary, sizeof(h->cluster_uuid.binary))) {
-		CRIT("Bad header in datafile %s", str);
+		CRIT("Bad header in datafile %s (version %.*s)", str, (int)strlen(HASHFS_VERSION), h->blockbuf);
 		goto open_hashfs_fail;
 	    }
 	}
@@ -1575,10 +1681,14 @@ sx_hashfs_t *sx_hashfs_open(const char *dir, sxc_client_t *sx) {
 	if(qprep(h->metadb[i], &q, "PRAGMA foreign_keys = ON") || qstep_noret(q))
 	    goto open_hashfs_fail;
 	qnullify(q);
-	if(qprep(h->metadb[i], &h->qm_ins[i], "INSERT INTO files (volume_id, name, size, content, rev) VALUES (:volume, :name, :size, :hashes, :revision)"))
+        if(sqlite3_create_function(h->metadb[i]->handle, "pmatch", 4, SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL, pmatch, NULL, NULL))
+            goto open_hashfs_fail;
+	if(qprep(h->metadb[i], &h->qm_ins[i], "INSERT INTO files (volume_id, name, size, content, rev, revision_id, age) VALUES (:volume, :name, :size, :hashes, :revision, :revision_id, :age)"))
 	    goto open_hashfs_fail;
-	if(qprep(h->metadb[i], &h->qm_list[i], "SELECT name, size, rev FROM files WHERE volume_id = :volume AND name > :previous GROUP BY name HAVING rev = MAX(rev) ORDER BY name ASC LIMIT 1"))
-	    goto open_hashfs_fail;
+        if(qprep(h->metadb[i], &h->qm_list[i], "SELECT name, size, rev FROM files WHERE volume_id = :volume AND name > :previous AND (:limit is NULL OR name < :limit) AND pmatch(name, :pattern, :pattern_slashes, :slash_ending) > 0 GROUP BY name HAVING rev = MAX(rev) ORDER BY name ASC LIMIT 1"))
+            goto open_hashfs_fail;
+        if(qprep(h->metadb[i], &h->qm_list_eq[i], "SELECT name, size, rev FROM files WHERE volume_id = :volume AND name >= :previous AND (:limit is NULL OR name < :limit) AND pmatch(name, :pattern, :pattern_slashes, :slash_ending) > 0 GROUP BY name HAVING rev = MAX(rev) ORDER BY name ASC LIMIT 2"))
+            goto open_hashfs_fail;
 	if(qprep(h->metadb[i], &h->qm_listrevs[i], "SELECT size, rev FROM files WHERE volume_id = :volume AND name = :name AND rev > :previous ORDER BY rev ASC LIMIT 1"))
 	    goto open_hashfs_fail;
 	if(qprep(h->metadb[i], &h->qm_get[i], "SELECT fid, size, content, rev FROM files WHERE volume_id = :volume AND name = :name GROUP BY name HAVING rev = MAX(rev) LIMIT 1"))
@@ -1586,6 +1696,8 @@ sx_hashfs_t *sx_hashfs_open(const char *dir, sxc_client_t *sx) {
         if(qprep(h->metadb[i], &h->qm_listrevs_rev[i], "SELECT size, rev FROM files WHERE volume_id = :volume AND name = :name AND (:previous IS NULL OR rev < :previous) ORDER BY rev DESC LIMIT 1"))
 	    goto open_hashfs_fail;
 	if(qprep(h->metadb[i], &h->qm_getrev[i], "SELECT fid, size, content, rev FROM files WHERE volume_id = :volume AND name = :name AND rev = :revision LIMIT 1"))
+	    goto open_hashfs_fail;
+	if(qprep(h->metadb[i], &h->qm_findrev[i], "SELECT volume_id, name, size FROM files WHERE rev = :revision LIMIT 1"))
 	    goto open_hashfs_fail;
 	if(qprep(h->metadb[i], &h->qm_oldrevs[i], "SELECT rev, size, (SELECT COUNT(*) FROM files AS b WHERE b.volume_id = a.volume_id AND b.name = a.name), fid FROM files AS a WHERE a.volume_id = :volume AND a.name = :name ORDER BY rev ASC"))
 	    goto open_hashfs_fail;
@@ -1607,7 +1719,7 @@ sx_hashfs_t *sx_hashfs_open(const char *dir, sxc_client_t *sx) {
 	    goto open_hashfs_fail;
 	if(qprep(h->metadb[i], &h->qm_delbyvol[i], "DELETE FROM files WHERE volume_id = :volid"))
 	    goto open_hashfs_fail;
-        if(qprep(h->metadb[i], &h->qm_sumfilesizes[i], "SELECT SUM(x) FROM (SELECT files.size + LENGTH(files.name) + SUM(COALESCE(LENGTH(fmeta.key) + LENGTH(fmeta.value),0)) AS x FROM files LEFT JOIN fmeta ON files.fid = fmeta.file_id WHERE files.volume_id = :volid GROUP BY files.fid)"))
+        if(qprep(h->metadb[i], &h->qm_sumfilesizes[i], "SELECT SUM(x) FROM (SELECT files.size + LENGTH(CAST(files.name AS BLOB)) + SUM(COALESCE(LENGTH(CAST(fmeta.key AS BLOB)) + LENGTH(fmeta.value),0)) AS x FROM files LEFT JOIN fmeta ON files.fid = fmeta.file_id WHERE files.volume_id = :volid GROUP BY files.fid)"))
             goto open_hashfs_fail;
         if(qprep(h->metadb[i], &h->qm_newest[i], "SELECT MAX(rev) FROM files WHERE volume_id = :volid"))
             goto open_hashfs_fail;
@@ -1617,12 +1729,34 @@ sx_hashfs_t *sx_hashfs_open(const char *dir, sxc_client_t *sx) {
             goto open_hashfs_fail;
         if(qprep(h->metadb[i], &h->qm_list_file[i], "SELECT size, rev, content, name FROM files WHERE volume_id=:volid AND name > :previous AND rev < :maxrev ORDER BY name ASC, rev DESC LIMIT 1"))
             goto open_hashfs_fail;
+        if(qprep(h->metadb[i], &h->qm_del_heal[i], "DELETE FROM heal WHERE revision_id=:revision_id"))
+            goto open_hashfs_fail;
+        if(qprep(h->metadb[i], &h->qm_add_heal[i], "INSERT OR IGNORE INTO heal(revision_id, remote_volume, blocks, blocksize, replica_count) VALUES(:revision_id, :remote_volid, :blocks, :blocksize, :replica_count)"))
+            goto open_hashfs_fail;
+        if(qprep(h->metadb[i], &h->qm_get_rb[i], "SELECT size, revision_id, content, name FROM files WHERE volume_id=:volume_id AND age < :age_limit AND revision_id > :min_revision_id ORDER BY revision_id"))
+            goto open_hashfs_fail;
+        if(qprep(h->metadb[i], &h->qm_count_rb[i], "SELECT COUNT(revision_id) FROM files WHERE volume_id=:volume_id AND age < :age_limit AND revision_id > :min_revision_id ORDER BY revision_id"))
+            goto open_hashfs_fail;
+        if(qprep(h->metadb[i], &h->qm_add_heal_volume[i], "INSERT OR REPLACE INTO heal_volume(name, max_age, min_revision) VALUES(:name,:max_age,:min_revision_id)"))
+            goto open_hashfs_fail;
+        if(qprep(h->metadb[i], &h->qm_sel_heal_volume[i], "SELECT name, max_age, min_revision FROM heal_volume WHERE name > :prev"))
+            goto open_hashfs_fail;
+        if(qprep(h->metadb[i], &h->qm_upd_heal_volume[i], "UPDATE heal_volume SET min_revision=:min_revision_id WHERE name=:name"))
+            goto open_hashfs_fail;
+        if(qprep(h->metadb[i], &h->qm_del_heal_volume[i], "DELETE FROM heal_volume WHERE name=:name"))
+            goto open_hashfs_fail;
+        if(qprep(h->metadb[i], &h->qm_needs_upgrade[i], "SELECT fid, volume_id, name, rev, size FROM files WHERE revision_id IS NULL"))
+            goto open_hashfs_fail;
     }
 
     OPEN_DB("eventdb", &h->eventdb);
+    if(qprep(h->eventdb, &q, "PRAGMA foreign_keys = ON") || qstep_noret(q))
+	goto open_hashfs_fail;
+    qnullify(q);
     if(qprep(h->eventdb, &h->qe_getjob, "SELECT complete, result, reason FROM jobs WHERE job = :id AND :owner IN (user, 0)"))
 	goto open_hashfs_fail;
-    if(qprep(h->eventdb, &h->qe_jobbydata, "SELECT job FROM jobs WHERE data = :data"))
+    snprintf(qrybuff, sizeof(qrybuff), "SELECT job FROM jobs WHERE type = %d AND data = :data", JOBTYPE_DELETE_FILE);
+    if(qprep(h->eventdb, &h->qe_getfiledeljob, qrybuff))
         goto open_hashfs_fail;
     if(qprep(h->eventdb, &h->qe_addjob, "INSERT INTO jobs (parent, type, lock, expiry_time, data, user) SELECT :parent, :type, :lock, datetime(:expiry + strftime('%s', COALESCE((SELECT expiry_time FROM jobs WHERE job = :parent), 'now')), 'unixepoch'), :data, :uid"))
 	goto open_hashfs_fail;
@@ -1632,20 +1766,24 @@ sx_hashfs_t *sx_hashfs_open(const char *dir, sxc_client_t *sx) {
 	goto open_hashfs_fail;
     if(qprep(h->eventdb, &h->qe_islocked, "SELECT value from hashfs WHERE key = 'lockedby'"))
 	goto open_hashfs_fail;
-    snprintf(dynqry, sizeof(dynqry), "SELECT 1 FROM jobs WHERE complete = 0 AND type NOT IN (%d, %d, %d, %d, %d) LIMIT 1", JOBTYPE_DISTRIBUTION, JOBTYPE_JLOCK, JOBTYPE_STARTREBALANCE, JOBTYPE_FINISHREBALANCE, JOBTYPE_REPLACE);
-    if(qprep(h->eventdb, &h->qe_hasjobs, dynqry))
+    snprintf(qrybuff, sizeof(qrybuff), "SELECT 1 FROM jobs WHERE complete = 0 AND type NOT IN (%d, %d, %d, %d, %d) LIMIT 1", JOBTYPE_DISTRIBUTION, JOBTYPE_JLOCK, JOBTYPE_STARTREBALANCE, JOBTYPE_FINISHREBALANCE, JOBTYPE_REPLACE);
+    if(qprep(h->eventdb, &h->qe_hasjobs, qrybuff))
 	goto open_hashfs_fail;
     if(qprep(h->eventdb, &h->qe_lock, "INSERT INTO hashfs (key, value) VALUES ('lockedby', :node)"))
 	goto open_hashfs_fail;
     if(qprep(h->eventdb, &h->qe_unlock, "DELETE FROM hashfs WHERE key = 'lockedby'"))
 	goto open_hashfs_fail;
+    if(qprep(h->eventdb, &h->qe_gc, "DELETE FROM jobs WHERE complete=1 AND sched_time <= datetime('now','-1 month')"))
+        goto open_hashfs_fail;
+    if(qprep(h->eventdb, &h->qe_count_upgradejobs, "SELECT COUNT(*) FROM jobs WHERE complete=0 AND lock='$UPGRADE$UPGRADE'"))
+        goto open_hashfs_fail;
     if(qprep(h->eventdb, &q, "CREATE TEMP TABLE hash_retry(hash BLOB("STRIFY(SXI_SHA1_BIN_LEN)") PRIMARY KEY NOT NULL, blocksize INTEGER NOT NULL, id INTEGER NOT NULL)") ||
         qstep_noret(q))
         goto open_hashfs_fail;
     qnullify(q);
-    if(qprep(h->eventdb, &h->rit.q_add, "INSERT OR IGNORE INTO hash_retry(hash, blocksize, id) VALUES(:hash, :blocksize, :id)"))
+    if(qprep(h->eventdb, &h->rit.q_add, "INSERT OR IGNORE INTO hash_retry(hash, blocksize, id) VALUES(:hash, :blocksize, :hash)"))
         goto open_hashfs_fail;
-    if(qprep(h->eventdb, &h->rit.q_sel, "SELECT id, hash, blocksize FROM hash_retry WHERE hash > :prevhash"))
+    if(qprep(h->eventdb, &h->rit.q_sel, "SELECT hash, blocksize FROM hash_retry WHERE hash > :prevhash"))
         goto open_hashfs_fail;
     if(qprep(h->eventdb, &h->rit.q_remove, "DELETE FROM hash_retry WHERE hash=:hash"))
         goto open_hashfs_fail;
@@ -1681,7 +1819,10 @@ open_hashfs_fail:
 
     close_all_dbs(h);
     sqlite3_shutdown();
+    free(h->dir);
     free(h->blockbuf);
+    if(h->lockfd >= 0)
+        close(h->lockfd);
     free(h);
     return NULL;
 }
@@ -1751,7 +1892,12 @@ void sx_hashfs_close(sx_hashfs_t *h) {
     sx_nodelist_delete(h->next_dist);
     sx_nodelist_delete(h->prevnext_dist);
     sx_nodelist_delete(h->nextprev_dist);
+    sx_nodelist_delete(h->effprev_dist);
+    sx_nodelist_delete(h->effnext_dist);
+    sx_nodelist_delete(h->effprevnext_dist);
+    sx_nodelist_delete(h->effnextprev_dist);
     sx_nodelist_delete(h->faulty_nodes);
+    sx_nodelist_delete(h->ignored_nodes);
 
     close_all_dbs(h);
 
@@ -1767,6 +1913,9 @@ void sx_hashfs_close(sx_hashfs_t *h) {
     free(h->ssl_ca_file);
     free(h->cluster_name);
     free(h->dir);
+
+    if(h->lockfd >= 0)
+        close(h->lockfd);
     free(h);
 }
 
@@ -1779,6 +1928,7 @@ rc_ty sx_storage_activate(sx_hashfs_t *h, const char *name, const sx_uuid_t *nod
     sqlite3_stmt *q = NULL;
     const sx_node_t *self;
     unsigned int nodeidx;
+    sx_hash_t hash;
 
     if(!h || !name || !node_uuid || !admin_key) {
 	NULLARG();
@@ -1801,12 +1951,18 @@ rc_ty sx_storage_activate(sx_hashfs_t *h, const char *name, const sx_uuid_t *nod
     if(qprep(h->db, &q, "INSERT OR REPLACE INTO hashfs (key, value) VALUES (:k , :v)"))
 	goto storage_activate_fail;
 
-    r = sx_hashfs_create_user(h, "admin", admin_uid, uid_size, admin_key, key_size, ROLE_ADMIN);
+    admin_uid = hash.b;
+    if(sx_hashfs_hash_buf(NULL, 0, "admin", 5, &hash)) {
+        CRIT("Failed to initialize admin user ID hash");
+        goto storage_activate_fail;
+    }
+
+    r = sx_hashfs_create_user(h, "admin", admin_uid, uid_size, admin_key, key_size, ROLE_ADMIN, "");
     if(r != OK) {
 	ret = r;
 	goto storage_activate_fail;
     }
-    r = sx_hashfs_user_onoff(h, "admin", 1);
+    r = sx_hashfs_user_onoff(h, "admin", 1, 0);
     if(r != OK) {
 	ret = r;
 	goto storage_activate_fail;
@@ -1834,8 +1990,11 @@ rc_ty sx_storage_activate(sx_hashfs_t *h, const char *name, const sx_uuid_t *nod
 
     ret = OK;
  storage_activate_fail:
-    if(ret != OK)
+    if(ret != OK) {
 	qrollback(h->db);
+	sxc_clearerr(h->sx);
+	sxi_seterr(h->sx, SXE_EARG, "%s", msg_get_reason());
+    }
 
     sqlite3_finalize(q);
     return ret;
@@ -1876,29 +2035,41 @@ static int getmetadb(const char *filename) {
     return MurmurHash64(&hash, sizeof(hash), MURMUR_SEED) & (METADBS-1);
 }
 
-/* Returns 0 if the volume name is valid,
- * sets reason otherwise */
-rc_ty sx_hashfs_check_volume_name(const char *name) {
+static rc_ty check_path_element(const char *name, unsigned name_min, unsigned name_max, const char *what)
+{
     unsigned int namelen;
     if (!name) {
 	NULLARG();
 	return EFAULT;
     }
     if(*name=='.') {
-	msg_set_reason("Invalid volume name '%s': must not start with a '.'", name);
+	msg_set_reason("Invalid %s name '%s': must not start with a '.'", what, name);
 	return EINVAL;
     }
     namelen = strlen(name);
-    if(namelen < SXLIMIT_MIN_VOLNAME_LEN || namelen > SXLIMIT_MAX_VOLNAME_LEN) {
-	msg_set_reason("Invalid volume name '%s': must be between %d and %d bytes",
-		       name, SXLIMIT_MIN_VOLNAME_LEN, SXLIMIT_MAX_VOLNAME_LEN);
+    if(namelen < name_min || namelen > name_max) {
+	msg_set_reason("Invalid %s name '%s': must be between %d and %d bytes",
+                       what, name, name_min, name_max);
 	return EINVAL;
     }
     if(utf8_validate_len(name) < 0) {
-	msg_set_reason("Invalid volume name '%s': must be valid UTF8", name);
+	msg_set_reason("Invalid %s name '%s': must be valid UTF8", what, name);
 	return EINVAL;
     }
-    return 0;
+    unsigned i;
+    for (i=0;i<namelen;i++) {
+        if ((unsigned)name[i] < ' ' || name[i] == '/' || name[i] == '\\') {
+            msg_set_reason("Invalid %s name '%s': contains forbidden characters (\\n/\\)", what, name);
+            return EINVAL;
+        }
+    }
+    return OK;
+}
+
+/* Returns 0 if the volume name is valid,
+ * sets reason otherwise */
+rc_ty sx_hashfs_check_volume_name(const char *name) {
+    return check_path_element(name, SXLIMIT_MIN_VOLNAME_LEN, SXLIMIT_MAX_VOLNAME_LEN, "volume");
 }
 
 static int check_file_name(const char *name) {
@@ -1959,15 +2130,7 @@ rc_ty sx_hashfs_check_meta(const char *key, const void *value, unsigned int valu
 }
 
 int sx_hashfs_check_username(const char *name) {
-    unsigned int namelen;
-    if(!name)
-	return -1;
-    namelen = strlen(name);
-    if(namelen < SXLIMIT_MIN_USERNAME_LEN || namelen > SXLIMIT_MAX_USERNAME_LEN)
-	return -1;
-    if(utf8_validate_len(name) < 0)
-	return 1;
-    return 0;
+    return check_path_element(name, SXLIMIT_MIN_USERNAME_LEN, SXLIMIT_MAX_USERNAME_LEN, "username");
 }
 
 
@@ -2216,23 +2379,33 @@ static int analyze_db(sxi_db_t *db, int verbose)
         goto analyze_db_err;
     }
 
+    char last[1024];
+    last[0] = '\0';
     /* Check first row for "ok" string */
     if((r = qstep(qfk)) == SQLITE_ROW) {
         const char *line = (const char*)sqlite3_column_text(qfk, 0);
-        if(line && !strcmp(line, "ok")) {
-            if(verbose)
-                INFO("\tforeign_key_check: %s", line);
+        if(line) {
+            if (!strcmp(line, "ok")) {
+                if(verbose)
+                    INFO("\tforeign_key_check: %s", line);
+                strncpy(last, line, sizeof(last)-1);
+            }
         } else {
             WARN("\tforeign_key_check: %s", line);
             ret++;
         }
+        last[sizeof(last)-1] = '\0';
     }
 
     /* Get errors, if there was "ok" in the first row, we shouldn't receive more rows, but its ok to check all */
     while((r = qstep(qfk)) == SQLITE_ROW) {
         const char *line = (const char*)sqlite3_column_text(qfk,0);
-        WARN("\tforeign_key_check: %s", line);
         ret++;
+        if (strcmp(last, line)) {
+            WARN("\tforeign_key_check: %s", line);
+            strncpy(last, line, sizeof(last)-1);
+            last[sizeof(last)-1] = '\0';
+        }
     }
 
     if(r != SQLITE_DONE) {
@@ -2316,12 +2489,12 @@ static void check_print_pgrs(void) {
 
 #define CHECK_LOG_INTERNAL(lvl, msg, ...) do { \
                                             if((lvl) == SX_LOG_WARNING) { \
-                                                fprintf(stderr, "%s[%s]: ", (check_warn_printed || check_info_printed) ? "\b \n" : "\b", __FUNCTION__); \
+                                                fprintf(stderr, "%s[%s]: ", (check_warn_printed || check_info_printed) ? "\b \n" : "\b", __func__); \
                                                 fprintf(stderr, msg"%s", __VA_ARGS__); \
                                                 check_warn_printed = 1; \
                                             } else { \
                                                 fprintf(stderr, "\b%s", check_info_printed ? " " : ""); \
-                                                fprintf(stdout, "%s[%s]: "msg"%s", check_info_printed ? "\n" : "", __FUNCTION__, __VA_ARGS__); \
+                                                fprintf(stdout, "%s[%s]: "msg"%s", check_info_printed ? "\n" : "", __func__, __VA_ARGS__); \
                                                 fflush(stdout); \
                                                 check_info_printed = 1; \
                                             } \
@@ -2385,7 +2558,7 @@ static int check_file_hashes(sx_hashfs_t *h, int debug, const sx_hash_t *hashes,
         }
 
         /* Distribution doesn't matter, we skip blocks existence during rebalance */
-        hashnodes = sx_hashfs_hashnodes(h, NL_PREV, hash, replica_count);
+        hashnodes = sx_hashfs_all_hashnodes(h, NL_PREV, hash, replica_count);
         if(hashnodes) {
             int skip = 0;
             /* Skip hashes stored on remote nodes */
@@ -2691,7 +2864,7 @@ static int check_files(sx_hashfs_t *h, int debug) {
             /* Check if all hashes for given file are stored in database */
             if(debug)
                 CHECK_INFO("Checking existence of hashes for file %s: %u", name, blocks);
-            r = check_file_hashes(h, debug, hashes, listlen / SXI_SHA1_BIN_LEN, block_size, vol->replica_count);
+            r = check_file_hashes(h, debug, hashes, listlen / SXI_SHA1_BIN_LEN, block_size, vol->max_replica);
             if(r == -1) {
                 ret = -1;
                 goto check_files_itererr;
@@ -2799,40 +2972,6 @@ check_blocks_existence_err:
     return ret;
 }
 
-static int check_blocks_counters(sx_hashfs_t *h, int debug, unsigned int hs, unsigned int ndb) {
-    int ret = 0, r;
-    sqlite3_stmt *q = NULL;
-    int64_t counter = 0;
-
-    if(hs >= SIZES || ndb >= HASHDBS) {
-        CHECK_FATAL("Failed to check negative counters: invalid argument");
-        return -1;
-    }
-
-    if(debug) {
-        CHECK_INFO("Checking negative counters within %lld rows in %s hash database %u / %u...",
-            (long long int)get_count(h->datadb[hs][ndb], "use"), sizelongnames[hs], ndb+1, HASHDBS);
-    }
-
-    q = h->qb_find_bad[hs][ndb];
-    sqlite3_reset(q);
-    while((r = qstep(q)) == SQLITE_ROW)
-        counter += sqlite3_column_int64(q, 0);
-
-    if (counter > 0 && !sx_hashfs_is_rebalancing(h)) {
-        CHECK_ERROR("Found %lld negative counters in %s hash database %u / %u", (long long)counter, sizelongnames[hs], ndb+1, HASHDBS);
-        ret = 1;
-    }
-
-    if(r != SQLITE_DONE) {
-        CHECK_FATAL("Failed to check negative counters: database error");
-        ret = -1;
-    }
-
-    sqlite3_reset(q);
-    return ret;
-}
-
 /* Check if there exist any duplicated hashes in block databases */
 static int check_blocks_dups(sx_hashfs_t *h, int debug, unsigned int hs, unsigned int ndb) {
     int ret = 0, r;
@@ -2919,14 +3058,6 @@ static int check_blocks(sx_hashfs_t *h, int debug) {
 
             /* Look for duplicated hashes */
             r = check_blocks_dups(h, debug, j, i);
-            if(r == -1) {
-                ret = -1;
-                goto check_blocks_itererr;
-            }
-            ret += r;
-
-            /* Look for bad counters */
-            r = check_blocks_counters(h, debug, j, i);
             if(r == -1) {
                 ret = -1;
                 goto check_blocks_itererr;
@@ -3052,7 +3183,7 @@ static int check_jobs(sx_hashfs_t *h, int debug) {
         int64_t job = sqlite3_column_int64(q, 0);
         int64_t userid = sqlite3_column_int64(q, 2);
         uint8_t useruid[AUTH_UID_LEN];
-        if(sx_hashfs_get_user_by_uid(h, (sx_uid_t)userid, useruid) != OK)
+        if(sx_hashfs_get_user_by_uid(h, (sx_uid_t)userid, useruid, 0) != OK)
             CHECK_ERROR("User with ID %lld is job %lld owner but does not exist or is disabled", (long long)userid, (long long)job);
 
         if(sqlite3_column_type(q, 1) == SQLITE_NULL) {
@@ -3094,22 +3225,20 @@ lock_db_err:
 }
 
 #define RUN_CHECK(func) do { r = func(h, debug); if(r == -1) { ret = -1; goto sx_hashfs_check_err; } ret += r; } while(0)
-
 int sx_hashfs_check(sx_hashfs_t *h, int debug) {
-    int ret = -1, r, i, j;
+    int ret = -1, r = 0, i, j;
     sqlite3_stmt *locks[METADBS + SIZES * HASHDBS + 4], *unlocks[METADBS + SIZES * HASHDBS + 4];
+    int readonly = 0, hashfs_locked = 0;
+    struct flock fl;
+
+    fl.l_start = 0;
+    fl.l_len = 0;
+    fl.l_type = F_WRLCK;
+    fl.l_whence = SEEK_SET;
 
     memset(locks, 0, sizeof(locks));
     memset(unlocks, 0, sizeof(unlocks));
 
-    r = 0;
-    if(lock_db(h->db, locks, unlocks) || lock_db(h->tempdb, locks + 1, unlocks + 1)
-       || lock_db(h->xferdb, locks + 2, unlocks + 2) || lock_db(h->eventdb, locks + 3, unlocks + 3)) {
-        CHECK_FATAL("Failed to lock database");
-        goto sx_hashfs_check_err;
-    }
-
-    r = 4;
     for(i = 0; i < METADBS; i++, r++) {
         if(lock_db(h->metadb[i], locks + r, unlocks + r)) {
             CHECK_FATAL("Failed to lock database meta database");
@@ -3118,12 +3247,36 @@ int sx_hashfs_check(sx_hashfs_t *h, int debug) {
     }
 
     for(i = 0; i < SIZES; i++) {
-        for(j = 0; j < HASHDBS; j++, r++)
-        if(lock_db(h->datadb[i][j], locks + r, unlocks + r)) {
-            CHECK_FATAL("Failed to lock database hash database");
-            goto sx_hashfs_check_err;
+        for(j = 0; j < HASHDBS; j++, r++) {
+            if(lock_db(h->datadb[i][j], locks + r, unlocks + r)) {
+                CHECK_FATAL("Failed to lock database hash database");
+                goto sx_hashfs_check_err;
+            }
         }
     }
+
+    if(lock_db(h->db, locks + r, unlocks + r) || lock_db(h->tempdb, locks + r + 1, unlocks + r + 1)
+       || lock_db(h->xferdb, locks + r + 2, unlocks + r + 2) || lock_db(h->eventdb, locks + r + 3, unlocks + r + 3)) {
+        CHECK_FATAL("Failed to lock database");
+        goto sx_hashfs_check_err;
+    }
+
+    if(sx_hashfs_cluster_get_mode(h, &readonly)) {
+        CHECK_FATAL("Failed to check cluster operating mode");
+        goto sx_hashfs_check_err;
+    }
+
+    if(!readonly) {
+        if(fcntl(h->lockfd, F_SETLK, &fl) == -1) {
+            if(errno == EAGAIN || errno == EACCES)
+                CHECK_FATAL("Cluster needs to be in read-only mode or this node should be stopped in order to perform storage check");
+            else
+                CHECK_FATAL("Failed to lock HashFS storage: %s", strerror(errno));
+            goto sx_hashfs_check_err;
+        }
+        hashfs_locked = 1;
+    }
+    /* Cluster is in read-only mode or node is stopped, we can perform HashFS check */
 
     ret = 0;
     CHECK_START;
@@ -3153,7 +3306,1040 @@ sx_hashfs_check_err:
         sqlite3_finalize(unlocks[i]);
     }
 
+    if(hashfs_locked) {
+        fl.l_type = F_RDLCK; /* Downgrade to read lock */
+        if(fcntl(h->lockfd, F_SETLK, &fl) == -1)
+            CHECK_FATAL("Failed to release HashFS lock: %s", strerror(errno));
+    }
+
     return ret;
+}
+
+typedef struct {
+    sxi_db_t *hashfs;
+    sxi_db_t *meta[METADBS];
+    sxi_db_t *data[SIZES][HASHDBS];
+    sxi_db_t *temp;
+    sxi_db_t *event;
+    sxi_db_t *xfer;
+} sxi_all_db_t;
+
+typedef rc_ty (*sx_db_upgrade_fn)(sxi_db_t *db);
+typedef struct {
+    const char *from;
+    const char *to;
+    sx_db_upgrade_fn upgrade_hashfsdb;
+    sx_db_upgrade_fn upgrade_metadb;
+    sx_db_upgrade_fn upgrade_datadb;
+    sx_db_upgrade_fn upgrade_tempdb;
+    sx_db_upgrade_fn upgrade_eventsdb;
+    sx_db_upgrade_fn upgrade_xfersdb;
+    rc_ty (*upgrade_alldb)(sxi_all_db_t *alldb);
+} sx_upgrade_t;
+
+static rc_ty upgrade_db_prepare(const char *path, const char *dbitem, sxi_db_t **dbp)
+{
+    sqlite3_stmt *qlock = NULL, *qunlock = NULL, *q = NULL;
+
+    DEBUG("Opening %s", path);
+    if (!path || !dbitem || !dbp) {
+        NULLARG();
+        return EFAULT;
+    }
+    if (qopen(path, dbp, dbitem, NULL, NULL))
+        return FAIL_EINTERNAL;
+    if (qprep(*dbp, &q, "PRAGMA foreign_keys=ON") || qstep_noret(q))
+        return FAIL_EINTERNAL;
+    qnullify(q);
+    if (lock_db(*dbp, &qlock, &qunlock) ||
+        analyze_db(*dbp, 0)) {
+        CRIT("Integrity check failed for %s", path);
+        if (qunlock)
+            qstep_noret(qunlock);
+        qnullify(qunlock);
+        qnullify(qlock);
+        qclose(dbp);
+        return FAIL_EINTERNAL;
+    }
+    qnullify(qunlock);
+    qnullify(qlock);
+    return OK;
+}
+
+static int ensure_not_running(int lockfd, const char *path)
+{
+    struct flock fl;
+    fl.l_start = 0;
+    fl.l_len = 0;
+    fl.l_type = F_WRLCK;
+    fl.l_whence = SEEK_SET;
+    if(fcntl(lockfd, F_SETLK, &fl) == -1) {
+        if(errno == EAGAIN || errno == EACCES)
+            WARN("Cannot acquire write lock on storage %s: node still running?", path);
+        else
+            PWARN("Failed to lock HashFS storage: %s", path);
+        return -1;
+    }
+    unsigned n = strlen(path) + sizeof("/hashfs.db");
+    char *dbpath = wrap_malloc(n);
+    if (!dbpath)
+        return -1;
+    snprintf(dbpath, n, "%s/hashfs.db", path);
+    int ret = 0;
+    int dbf = open(dbpath, O_RDWR, 0);
+    if (dbf < 0) {
+        PWARN("Cannot open database %s", dbpath);
+        ret = -1;
+    }
+    free(dbpath);
+    if(!ret) {
+        if (fcntl(dbf, F_SETLK, &fl) == -1) {
+            if(errno == EAGAIN || errno == EACCES)
+                WARN("Cannot acquire write lock on storage db %s: node still running?", path);
+            else
+                PWARN("Failed to lock HashFS storage db: %s", path);
+            ret = -1;
+        }
+        close(dbf);
+    }
+    return ret;
+}
+
+
+static rc_ty upgrade_db(int lockfd, const char *path, sxi_db_t *db, const char *from_version, const char *to_version, sx_db_upgrade_fn fn)
+{
+    sqlite3_stmt *q = NULL;
+    rc_ty ret = FAIL_EINTERNAL;
+
+    do {
+        if(qprep(db, &q, "SELECT value FROM hashfs WHERE key = :k") ||
+           qbind_text(q, ":k", "version") || qstep_ret(q))
+            break;
+        const unsigned char *str = sqlite3_column_text(q, 0);
+        if (!str) {
+            CRIT("Unable to determine database version at %s", path);
+            break;
+        }
+        int cmp = strcmp((const char*)str, from_version);
+        if (cmp < 0) {
+            WARN("Database schema too old: %s, expected >= %s", str, from_version);
+            ret = EINVAL;
+        }
+        if (cmp > 0) {
+            ret = OK;
+            DEBUG("Upgrade not needed on %s", path);
+        }
+        if (cmp)
+            break;
+        if (ensure_not_running(lockfd, path)) {
+            ret = FAIL_LOCKED;
+            break;
+        }
+        /* old version matches, update it */
+        qnullify(q);
+        DEBUG("Upgrading DB %s: %s -> %s", path, from_version, to_version);
+
+        if (fn && fn(db)) {
+            CRIT("Upgrade callback failed for %s (%s -> %s)", path, from_version, to_version);
+            break;
+        }
+
+        if(qprep(db, &q, "UPDATE hashfs SET value=:v WHERE key=:k") ||
+           qbind_text(q, ":k", "version") ||
+           qbind_text(q, ":v", to_version) ||
+           qstep_noret(q))
+            break;
+        INFO("Upgraded DB %s from %s to %s", path, from_version, to_version);
+        ret = OK;
+    } while(0);
+    if (ret)
+        WARN("Failed to upgrade %s", path);
+    qnullify(q);
+    return ret;
+}
+
+static rc_ty hashfs_1_0_to_1_1(sxi_db_t *db)
+{
+    rc_ty ret = FAIL_EINTERNAL;
+    sqlite3_stmt *q = NULL;
+    do {
+        if(qprep(db, &q, "CREATE TABLE IF NOT EXISTS usermeta (userid INTEGER PRIMARY KEY NOT NULL REFERENCES users(uid) ON DELETE CASCADE ON UPDATE CASCADE, desc TEXT("STRIFY(SXLIMIT_META_MAX_VALUE_LEN)"))") || qstep_noret(q))
+            break;
+	qnullify(q);
+
+	if(qprep(db, &q, "CREATE TABLE ignorednodes (dist INTEGER NOT NULL, node BLOB ("STRIFY(UUID_BINARY_SIZE)") NOT NULL, PRIMARY KEY (dist, node))") || qstep_noret(q))
+	    break;
+	qnullify(q);
+
+        ret = OK;
+    } while(0);
+    qnullify(q);
+    return ret;
+}
+
+static rc_ty metadb_1_0_to_1_1(sxi_db_t *db)
+{
+    rc_ty ret = FAIL_EINTERNAL;
+    sqlite3_stmt *q = NULL;
+    do {
+        /* add column age ... */
+        if(qprep(db, &q, "ALTER TABLE files ADD COLUMN revision_id BLOB("STRIFY(SXI_SHA1_BIN_LEN)")") || qstep_noret(q))
+            break;
+        qnullify(q);
+        if(qprep(db, &q, "ALTER TABLE files ADD COLUMN age NULL DEFAULT 0") ||
+           qstep_noret(q))
+        /* TODO: for new files insert correct one already */
+        if(qprep(db, &q, "CREATE UNIQUE INDEX IF NOT EXISTS file_rev_id ON files(revision_id)") || qstep_noret(q))
+            break;
+        qnullify(q);
+        if(qprep(db, &q, "CREATE INDEX IF NOT EXISTS file_vol_revs ON files(volume_id, revision_id, age)") || qstep_noret(q))
+            break;
+        qnullify(q);
+        if(qprep(db, &q, "CREATE TABLE IF NOT EXISTS heal(\
+            revision_id BLOB("STRIFY(SXI_SHA1_BIN_LEN)") PRIMARY KEY NOT NULL,\
+            remote_volume INT,\
+            blocks INT,\
+            blocksize INT,\
+            replica_count INT)") || qstep_noret(q))
+            break;
+        qnullify(q);
+        if(qprep(db, &q, "CREATE INDEX IF NOT EXISTS heal_vol ON heal(blocks, remote_volume)") || qstep_noret(q))
+            break;
+        qnullify(q);
+        if(qprep(db, &q, "CREATE TABLE IF NOT EXISTS heal_volume(\
+            name TEXT NOT NULL,\
+            max_age INTEGER NOT NULL,\
+            min_revision BLOB NOT NULL)") || qstep_noret(q))
+            break;
+        qnullify(q);
+        ret = OK;
+    } while(0);
+    qnullify(q);
+    return ret;
+}
+
+static rc_ty datadb_1_0_to_1_1(sxi_db_t *db)
+{
+    /* TODO: disable GC until upgrade job is run */
+    rc_ty ret = FAIL_EINTERNAL;
+    sqlite3_stmt *q = NULL;
+    do {
+        if(qprep(db, &q, "DELETE FROM blocks WHERE blockno IS NULL OR created_at IS NULL") || qstep_noret(q))
+            break;
+        qnullify(q);
+        if(qprep(db, &q, "DROP TABLE IF EXISTS operations") || qstep_noret(q))
+            break;
+        qnullify(q);
+        if(qprep(db, &q, "DROP TABLE IF EXISTS use") || qstep_noret(q))
+            break;
+        qnullify(q);
+        if(qprep(db, &q, "DROP TABLE IF EXISTS reservations") || qstep_noret(q))
+            break;
+        qnullify(q);
+        if(qprep(db, &q, "CREATE TABLE IF NOT EXISTS reservations (\
+            reservations_id BLOB("STRIFY(SXI_SHA1_BIN_LEN)") NOT NULL,\
+                    revision_id BLOB("STRIFY(SXI_SHA1_BIN_LEN)") NOT NULL,\
+                    ttl INTEGER NOT NULL,\
+                    PRIMARY KEY(reservations_id, revision_id))") || qstep_noret(q))
+            break;
+        qnullify(q);
+        if(qprep(db, &q, "CREATE INDEX IF NOT EXISTS idx_res ON reservations(revision_id, reservations_id)") || qstep_noret(q))
+            break;
+        qnullify(q);
+        if(qprep(db, &q, "CREATE INDEX IF NOT EXISTS idx_res_ttl ON reservations(ttl, revision_id)") || qstep_noret(q))
+            break;
+        qnullify(q);
+        /* age = rebalance/hdist version
+         * */
+        if(qprep(db, &q, "CREATE TABLE IF NOT EXISTS revision_blocks (\
+            revision_id BLOB("STRIFY(SXI_SHA1_BIN_LEN)") NOT NULL,\
+                    blocks_hash BLOB("STRIFY(SXI_SHA1_BIN_LEN)") NOT NULL,\
+                    age INTEGER NOT NULL,\
+                    replica INTEGER NOT NULL,\
+                    PRIMARY KEY(revision_id, blocks_hash, age))") || qstep_noret(q))
+            break;
+        qnullify(q);
+        if(qprep(db, &q, "CREATE INDEX IF NOT EXISTS idx_revmap ON revision_blocks(blocks_hash, revision_id)") || qstep_noret(q))
+            break;
+        qnullify(q);
+
+        /* op:
+         * +1: inuse
+         *  0: reserved
+         * -1: delete */
+        if(qprep(db, &q, "CREATE TABLE IF NOT EXISTS revision_ops(\
+            revision_id BLOB("STRIFY(SXI_SHA1_BIN_LEN)") NOT NULL,\
+                    op INTEGER NOT NULL,\
+                    age INTEGER NOT NULL,\
+                    PRIMARY KEY(revision_id, op))") || qstep_noret(q))
+            break;
+        qnullify(q);
+        if(qprep(db, &q, "CREATE INDEX IF NOT EXISTS idx_op_revision ON revision_ops(op, revision_id, age)") || qstep_noret(q))
+            break;
+        qnullify(q);
+        /* TODO: how to add NOT NULL constraint to 1.0 blocks schema without
+         * reimporting table? */
+        ret = OK;
+    } while(0);
+    qnullify(q);
+    return ret;
+}
+
+static rc_ty eventsdb_1_0_to_1_1(sxi_db_t *db)
+{
+    char qrybuff[128];
+    rc_ty ret = FAIL_EINTERNAL;
+    sqlite3_stmt *q = NULL;
+    do {
+        /* delete duplicate delete jobs so we can add unique constraint */
+        snprintf(qrybuff, sizeof(qrybuff), "DELETE FROM jobs WHERE type=%d AND rowid NOT IN (SELECT MAX(rowid) FROM jobs WHERE type=%d GROUP BY data)", JOBTYPE_DELETE_FILE, JOBTYPE_DELETE_FILE);
+        if (qprep(db, &q, qrybuff) || qstep_noret(q))
+            break;
+        qnullify(q);
+        snprintf(qrybuff, sizeof(qrybuff), "CREATE UNIQUE INDEX IF NOT EXISTS jobs_data ON jobs(data) WHERE type = %d", JOBTYPE_DELETE_FILE);
+        if (qprep(db, &q, qrybuff) || qstep_noret(q))
+            break;
+        qnullify(q);
+        /* TODO: upgrade jobs */
+        ret = OK;
+    } while(0);
+    qnullify(q);
+    return ret;
+}
+
+static rc_ty tempdb_1_0_to_1_1(sxi_db_t *db)
+{
+    rc_ty ret = FAIL_EINTERNAL;
+    sqlite3_stmt *q = NULL;
+    do {
+        qnullify(q);
+        ret = OK;
+    } while(0);
+    qnullify(q);
+    return ret;
+}
+
+static rc_ty xfersdb_1_0_to_1_1(sxi_db_t *db)
+{
+    rc_ty ret = FAIL_EINTERNAL;
+    sqlite3_stmt *q = NULL;
+    do {
+        qnullify(q);
+        ret = OK;
+    } while(0);
+    qnullify(q);
+    return ret;
+}
+
+static rc_ty alldb_1_0_to_1_1(sxi_all_db_t *alldb)
+{
+    /* running this function again must succeed and be a noop */
+    rc_ty ret = FAIL_EINTERNAL;
+    char qrybuff[128];
+    sqlite3_stmt *q = NULL, *tq = NULL, *jdq = NULL;
+    do {
+        int64_t tmpid;
+        int r;
+
+        /* Update file delete jobs having tempfile ID as job data to store file revision instead */
+        snprintf(qrybuff, sizeof(qrybuff), "SELECT job, data FROM jobs WHERE type = %d AND LENGTH(data) == %ld AND complete = 0 LIMIT 1", JOBTYPE_DELETE_FILE, sizeof(tmpid));
+        if (qprep(alldb->event, &q, qrybuff))
+            break;
+        if (qprep(alldb->temp, &tq, "SELECT t || ':' || token FROM tmpfiles WHERE tid = :id"))
+            break;
+        if (qprep(alldb->event, &jdq, "UPDATE jobs SET data = :data WHERE job = :id"))
+            break;
+
+        r = qstep(q);
+        while(r == SQLITE_ROW) {
+            int64_t id = sqlite3_column_int64(q, 0);
+            const void *data = sqlite3_column_blob(q, 1);
+            const char *rev;
+            int rt;
+
+            /* Set tempfile ID from current job data */
+            memcpy(&tmpid, data, sizeof(tmpid));
+            sqlite3_reset(q);
+            sqlite3_reset(tq);
+            sqlite3_reset(jdq);
+
+            /* Get tempfile entry */
+            if(qbind_int64(tq, ":id", tmpid)) {
+                WARN("Failed to prepare tempfile picking query for ID %lld", (long long)tmpid);
+                break;
+            }
+
+            rt = qstep(tq);
+            if(rt == SQLITE_DONE) {
+                DEBUG("Tempfile %lld does not exist for job %lld", (long long)tmpid, (long long)id);
+                r = qstep(q);
+                continue;
+            } else if(rt != SQLITE_ROW) {
+                WARN("Failed to get tempfile %lld", (long long)tmpid);
+                break;
+            }
+
+            /* Get tempfile revision */
+            rev = (const char *)sqlite3_column_text(tq, 0);
+            if(!rev || strlen(rev) != REV_LEN) {
+                WARN("Invalid tempfile revision");
+                break;
+            }
+
+            /* Update existing job data */
+            if(qbind_blob(jdq, ":data", rev, REV_LEN) || qbind_int64(jdq, ":id", id) || qstep_noret(jdq)) {
+                WARN("Failed to perform job data update query");
+                break;
+            }
+            DEBUG("Upgraded job %lld data from tempfile ID %lld to revision %s", (long long)id, (long long)tmpid, rev);
+
+            sqlite3_reset(tq);
+            sqlite3_reset(jdq);
+            r = qstep(q);
+        }
+
+        if(r != SQLITE_DONE) {
+            WARN("Failed to finish filedelete jobs upgrade");
+            break;
+        }
+        ret = OK;
+    } while(0);
+    qnullify(jdq);
+    qnullify(tq);
+    qnullify(q);
+    return ret;
+}
+
+static const sx_upgrade_t upgrade_sequence[] = {
+    {
+        HASHFS_VERSION_1_0,
+        HASHFS_VERSION_1_1,
+        .upgrade_hashfsdb = hashfs_1_0_to_1_1,
+        .upgrade_metadb = metadb_1_0_to_1_1,
+        .upgrade_datadb = datadb_1_0_to_1_1,
+        .upgrade_tempdb = tempdb_1_0_to_1_1,
+        .upgrade_eventsdb = eventsdb_1_0_to_1_1,
+        .upgrade_xfersdb = xfersdb_1_0_to_1_1,
+        .upgrade_alldb = alldb_1_0_to_1_1
+    }
+};
+
+static rc_ty upgrade_bin(int lockfd, const char *dir, const char *path, const char *from, const char *to, unsigned j, unsigned i)
+{
+    rc_ty ret = FAIL_EINTERNAL;
+    char old_header[128];
+    uint8_t *blockbuf = NULL;
+
+    int fd = open(path, O_RDWR);
+    if (fd < 0) {
+        perror("open");
+        return ret;
+    }
+    do {
+        blockbuf = wrap_malloc(bsz[j]);
+        if (!blockbuf)
+            break;
+        snprintf(old_header, sizeof(old_header), "%-16sdatafile_%c_%08x             %08x", from, sizedirs[j], i, bsz[j]);
+        if(read_block(fd, blockbuf, 0, bsz[j]))
+            break;
+        if(!memcmp(blockbuf, old_header, strlen(old_header))) {
+            /* old version matches, update it */
+            if (ensure_not_running(lockfd, dir)) {
+                ret = FAIL_LOCKED;
+                break;
+            }
+            snprintf((char*)blockbuf, bsz[j], "%-16sdatafile_%c_%08x             %08x", to, sizedirs[j], i, bsz[j]);
+            if(write_block(fd, blockbuf, 0, bsz[j]))
+                break;
+        }
+        ret = OK;
+    } while(0);
+    free(blockbuf);
+    if (close(fd) < 0) {
+        perror("close");
+        return FAIL_EINTERNAL;
+    }
+
+    return ret;
+}
+
+static int qcommit_alldb(sxi_all_db_t *alldb) {
+    unsigned i,j;
+    if(qcommit(alldb->hashfs))
+	return -1;
+    for(i=0;i<METADBS;i++)
+        if(qcommit(alldb->meta[i]))
+            return -1;
+    for(j=0; j<SIZES; j++)
+        for(i=0; i<HASHDBS; i++)
+            if(qcommit(alldb->data[j][i]))
+                return -1;
+    if(qcommit(alldb->temp))
+	return -1;
+    if(qcommit(alldb->event))
+	return -1;
+    if(qcommit(alldb->xfer))
+	return -1;
+    return 0;
+}
+
+static void qrollback_alldb(sxi_all_db_t *alldb)
+{
+    unsigned i, j;
+    qrollback(alldb->hashfs);
+    for(i=0;i<METADBS;i++)
+        qrollback(alldb->meta[i]);
+    for(j=0; j<SIZES; j++)
+        for(i=0; i<HASHDBS; i++)
+            qrollback(alldb->data[j][i]);
+    qrollback(alldb->temp);
+    qrollback(alldb->event);
+    qrollback(alldb->xfer);
+}
+
+static void qclose_alldb(sxi_all_db_t *alldb)
+{
+    unsigned i, j;
+    qclose(&alldb->hashfs);
+    for(i=0;i<METADBS;i++)
+        qclose(&alldb->meta[i]);
+    for(j=0; j<SIZES; j++)
+        for(i=0; i<HASHDBS; i++)
+            qclose(&alldb->data[j][i]);
+    qclose(&alldb->temp);
+    qclose(&alldb->event);
+    qclose(&alldb->xfer);
+}
+
+rc_ty sx_storage_upgrade(const char *dir) {
+    sxi_all_db_t alldb;
+    unsigned i,j,pathlen;
+    char *path;
+    char dbitem[64];
+    struct timeval tv_start, tv_integrity_done, tv_upgrade_done, tv_close;
+    int lockfd = -1;
+
+    pathlen = strlen(dir) + 1024;
+    rc_ty ret = FAIL_EINTERNAL;
+    memset(&alldb, 0, sizeof(alldb));
+
+    if(!(path = wrap_malloc(pathlen)))
+        return FAIL_EINTERNAL;
+    if (!qlog_set) {
+        sqlite3_config(SQLITE_CONFIG_LOG, qlog, NULL);
+        qlog_set = 1;
+    }
+
+    INFO("Performing integrity check on %s", dir);
+    gettimeofday(&tv_start, NULL);
+    {
+        snprintf(path, pathlen, "%s/hashfs.db", dir);
+        if ((ret = upgrade_db_prepare(path, "hashfs", &alldb.hashfs)))
+            goto upgrade_fail;
+
+        for(i=0; i<METADBS; i++) {
+            snprintf(path, pathlen, "%s/f%08x.db", dir, i);
+            snprintf(dbitem, sizeof(dbitem), "metadb_%08x", i);
+            if ((ret = upgrade_db_prepare(path, dbitem, &alldb.meta[i])))
+                goto upgrade_fail;
+        }
+
+        for(j=0; j<SIZES; j++) {
+            for(i=0; i<HASHDBS; i++) {
+                snprintf(path, pathlen, "%s/h%c%08x.db", dir, sizedirs[j], i);
+                snprintf(dbitem, sizeof(dbitem), "hashdb_%c_%08x", sizedirs[j], i);
+                if ((ret = upgrade_db_prepare(path, dbitem, &alldb.data[j][i])))
+                    goto upgrade_fail;
+            }
+        }
+
+        snprintf(path, pathlen, "%s/temp.db", dir);
+        if((ret = upgrade_db_prepare(path, "tempdb", &alldb.temp)))
+            goto upgrade_fail;
+
+        snprintf(path, pathlen, "%s/events.db", dir);
+        if((ret = upgrade_db_prepare(path, "eventdb", &alldb.event)))
+            goto upgrade_fail;
+
+        snprintf(path, pathlen, "%s/xfers.db", dir);
+        if((ret = upgrade_db_prepare(path, "xferdb", &alldb.xfer)))
+            goto upgrade_fail;
+
+        snprintf(path, pathlen, "%s/hashfs.lock", dir);
+        lockfd = open(path, O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
+        if (lockfd < 0) {
+            PWARN("Failed to open %s lockfile", path);
+            goto upgrade_fail;
+        }
+        struct flock fl;
+        fl.l_start = 0;
+        fl.l_len = 0;
+        fl.l_type = F_RDLCK;
+        fl.l_whence = SEEK_SET;
+        if(fcntl(lockfd, F_SETLK, &fl) == -1) {
+            if(errno == EACCES || errno == EAGAIN)
+                INFO("Failed lock HashFS: Storage is locked for maintenance");
+            else
+                PWARN("Failed to acquire read lock");
+            goto upgrade_fail;
+        }
+        snprintf(path, pathlen, "%s", dir);
+    }
+    gettimeofday(&tv_integrity_done, NULL);
+    INFO("Integrity check completed in %.fs", timediff(&tv_start, &tv_integrity_done));
+
+    for(i=0;i<sizeof(upgrade_sequence)/sizeof(upgrade_sequence[0]);i++) {
+        sx_upgrade_t desc = upgrade_sequence[i];
+        if ((ret = upgrade_db(lockfd, path, alldb.hashfs, desc.from, desc.to, desc.upgrade_hashfsdb)))
+            goto upgrade_fail;
+        for(i=0; i<METADBS; i++) {
+            if ((ret = upgrade_db(lockfd, path, alldb.meta[i], desc.from, desc.to, desc.upgrade_metadb)))
+                goto upgrade_fail;
+        }
+
+        for(j=0; j<SIZES; j++) {
+            for(i=0; i<HASHDBS; i++) {
+                snprintf(path, pathlen, "%s", dir);
+                if ((ret = upgrade_db(lockfd, path, alldb.data[j][i], desc.from, desc.to, desc.upgrade_datadb)))
+                    goto upgrade_fail;
+                snprintf(path, pathlen, "%s/h%c%08x.bin", dir, sizedirs[j], i);
+                if (upgrade_bin(lockfd, dir, path, desc.from, desc.to, j, i))
+                    goto upgrade_fail;
+            }
+        }
+        snprintf(path, pathlen, "%s", dir);
+
+        if((ret = upgrade_db(lockfd, path, alldb.temp, desc.from, desc.to, desc.upgrade_tempdb)))
+            goto upgrade_fail;
+
+        if((ret = upgrade_db(lockfd, path, alldb.event, desc.from, desc.to, desc.upgrade_eventsdb)))
+            goto upgrade_fail;
+
+        if((ret = upgrade_db(lockfd, path, alldb.xfer, desc.from, desc.to, desc.upgrade_xfersdb)))
+            goto upgrade_fail;
+
+        if (desc.upgrade_alldb(&alldb) || desc.upgrade_alldb(&alldb))
+            goto upgrade_fail;
+        INFO("Successfully upgraded all DBs");
+    }
+    INFO("Committing changes");
+    if (qcommit_alldb(&alldb))
+        goto upgrade_fail;
+    gettimeofday(&tv_upgrade_done, NULL);
+    INFO("Schema upgrade completed in %.fs", timediff(&tv_integrity_done, &tv_upgrade_done));
+    ret = OK;
+
+upgrade_fail:
+    free(path);
+    if (ret)
+        qrollback_alldb(&alldb);
+    qclose_alldb(&alldb);
+    gettimeofday(&tv_close, NULL);
+    if (ret == OK)
+        INFO("Storage closed in %.fs", timediff(&tv_upgrade_done, &tv_close));
+    if (lockfd != -1)
+        close(lockfd);
+    return ret;
+}
+
+static rc_ty datadb_begin(sx_hashfs_t *h, unsigned int hs);
+static rc_ty datadb_commit(sx_hashfs_t *h, unsigned int hs);
+static void datadb_rollback(sx_hashfs_t *h, unsigned int hs);
+static rc_ty datadb_beginall(sx_hashfs_t *h);
+static rc_ty datadb_commitall(sx_hashfs_t *h);
+static void datadb_rollbackall(sx_hashfs_t *h);
+static rc_ty sx_hashfs_revision_op_internal(sx_hashfs_t *h, unsigned int hs, const sx_hash_t *revision_id, int op, int age);
+
+struct bulk_save {
+    int db_min_passive_wal_pages;
+    int db_max_passive_wal_pages;
+    int db_max_restart_wal_pages;
+    int gc_max_batch;
+};
+
+static void bulk_start(struct bulk_save *save)
+{
+    save->db_min_passive_wal_pages = db_min_passive_wal_pages;
+    save->db_max_passive_wal_pages = db_max_passive_wal_pages;
+    save->db_max_restart_wal_pages = db_max_restart_wal_pages;
+    save->gc_max_batch = gc_max_batch;
+    db_min_passive_wal_pages = db_max_passive_wal_pages = db_max_restart_wal_pages = 50000;
+    gc_max_batch = 1000;
+}
+
+static void bulk_done(const struct bulk_save *save)
+{
+    db_min_passive_wal_pages = save->db_min_passive_wal_pages;
+    db_max_passive_wal_pages = save->db_max_passive_wal_pages;
+    db_max_restart_wal_pages = save->db_max_restart_wal_pages;
+    gc_max_batch = save->gc_max_batch;
+}
+
+rc_ty sx_hashfs_upgrade_1_0_prepare(sx_hashfs_t *h)
+{
+    sxi_db_t *db = NULL;
+    sqlite3_stmt *q = NULL;
+    rc_ty rc = FAIL_EINTERNAL;
+    unsigned i;
+    int64_t heal_required =  0;
+    int64_t heal_done = 0;
+    int64_t total = 0;
+    struct timeval tv0, tv1;
+    struct bulk_save bulk;
+
+    bulk_start(&bulk);
+    gettimeofday(&tv0, NULL);
+    sx_hashfs_set_progress_info(h, INPRG_UPGRADE_RUNNING, "Upgrade: preparing");
+    for(i=0;i<METADBS;i++) {
+        db = h->metadb[i];
+        if(qprep(db, &q, "SELECT COUNT(*) FROM files WHERE revision_id IS NULL") ||
+           qstep_ret(q))
+            break;
+        heal_required += sqlite3_column_int64(q, 0);
+        qnullify(q);
+        if(qprep(db, &q, "SELECT COUNT(*) FROM files") ||
+           qstep_ret(q))
+            break;
+        total += sqlite3_column_int64(q, 0);
+        qnullify(q);
+    }
+    qnullify(q);
+    if (i < METADBS)
+        return FAIL_EINTERNAL;
+
+    int age = sxi_hdist_version(h->hd);
+    for(i=0;i<METADBS;i++) {
+        sqlite3_stmt *qsel = h->qm_needs_upgrade[i], *qupd = NULL;
+        int ret;
+        db = h->metadb[i];
+        rc = FAIL_EINTERNAL;
+        /* OR FAIL - avoid creation of temp file, it can only affect one row,
+         * since fid is a primary key */
+        if(qprep(db, &qupd, "UPDATE OR FAIL files SET revision_id=:revision_id WHERE fid=:fid")) {
+            qnullify(qupd);
+            break;
+        }
+        do {
+            unsigned int k = 0;
+            rc = FAIL_EINTERNAL;
+            if (qbegin(db) || datadb_beginall(h))
+                break;
+            sqlite3_reset(qsel);
+            while ((ret = qstep(qsel)) == SQLITE_ROW && (k < gc_max_batch)) {
+                sx_hash_t revision_id;
+                const sx_hashfs_volume_t *volume;
+                unsigned int bsize;
+
+                int64_t fid = sqlite3_column_int64(qsel, 0);
+                int64_t volid = sqlite3_column_int64(qsel, 1);
+                const unsigned char *name = sqlite3_column_text(qsel, 2);
+                const unsigned char *rev = sqlite3_column_text(qsel, 3);
+                int64_t size = sqlite3_column_int64(qsel, 4);
+                unsigned blocks = size_to_blocks(size, NULL, &bsize);
+                ret = -1;
+                if ((rc = sx_hashfs_volume_by_id(h, volid, &volume))) {
+                    WARN("volume_by_id failed");
+                    break;
+                }
+                if (sx_unique_fileid(sx_hashfs_client(h), volume, (const char*)name, (const char*)rev, &revision_id)) {
+                    WARN("unique_fileid failed");
+                    break;
+                }
+                sqlite3_reset(qupd);
+                sqlite3_reset(h->qm_add_heal[i]);
+                DEBUGHASH("preparing for upgrade", &revision_id);
+                unsigned int hs;
+                for(hs = 0; hs < SIZES; hs++)
+                    if(bsz[hs] == bsize)
+                        break;
+                if (hs == SIZES) {
+                    WARN("bad blocksize: %d", bsize);
+                    break;
+                }
+                if (qbind_blob(h->qm_add_heal[i], ":revision_id", revision_id.b, sizeof(revision_id.b)) ||
+                    qbind_null(h->qm_add_heal[i], ":remote_volid") ||
+                    qbind_int(h->qm_add_heal[i], ":blocks", blocks) ||
+                    qbind_int(h->qm_add_heal[i], ":blocksize", bsize) ||
+                    qbind_int(h->qm_add_heal[i], ":replica_count", volume->max_replica) ||
+                    qstep_noret(h->qm_add_heal[i]) ||
+                    sx_hashfs_revision_op_internal(h, hs, &revision_id, 1, age) ||
+                    qbind_int64(qupd, ":fid", fid) ||
+                    qbind_blob(qupd, ":revision_id", revision_id.b, sizeof(revision_id.b)) ||
+                    qstep_noret(qupd)) {
+                    WARN("rev upgrade failed");
+                    break;
+                }
+                k++;
+            }
+            sqlite3_reset(qsel);
+            sqlite3_reset(qupd);
+            sqlite3_reset(h->qm_add_heal[i]);
+            if (ret != SQLITE_ROW && ret != SQLITE_DONE) {
+                rc = FAIL_EINTERNAL;
+                datadb_rollbackall(h);
+                break;
+            }
+            if (ret == SQLITE_DONE) {
+              if(qprep(db, &q, "SELECT * FROM files"))
+                  break;
+              int has_dummy = 0;
+              for (unsigned i=0;i<sqlite3_column_count(q);i++)
+                  if (!strcmp(sqlite3_column_name(q, i), "dummy")) {
+                      has_dummy = 1;
+                      break;
+                  }
+              qnullify(q);
+              if (!has_dummy) {
+                  if (qprep(db, &q, "ALTER TABLE files ADD dummy CHECK(revision_id IS NOT NULL)") ||
+                      qstep_noret(q))
+                      break;
+                  qnullify(q);
+              }
+            }
+            if (datadb_commitall(h) || qcommit(db))
+                break;
+            if (k) {
+                char msg[128];
+                heal_done += k;
+                snprintf(msg, sizeof(msg), "Upgrade - preparing local files: %lld/%lld remaining",
+                        (long long)heal_required - heal_done, (long long)total);
+                sx_hashfs_set_progress_info(h, INPRG_UPGRADE_RUNNING, msg);
+            }
+            rc = OK;
+        } while(ret == SQLITE_ROW);
+        sqlite3_reset(qsel);
+        qnullify(qupd);
+        if (rc) {
+            qrollback(db);
+            datadb_rollbackall(h);
+            break;
+        }
+    }
+    if (rc == OK)
+        sx_hashfs_set_progress_info(h, INPRG_UPGRADE_RUNNING, "Upgrade - local files prepared");
+
+    gettimeofday(&tv1, NULL);
+    INFO("Local upgrade prepared in %.fs: %s", timediff(&tv0, &tv1), rc2str(rc));
+    bulk_done(&bulk);
+    qnullify(q);
+
+    return rc;
+}
+
+static rc_ty sx_hashfs_hashop_moduse(sx_hashfs_t *h, const sx_hash_t *reserve_id, const sx_hash_t *revision_id, unsigned int hs, const sx_hash_t *hash, unsigned replica, int64_t op, uint64_t op_expires_at);
+static rc_ty sx_hashfs_hashop_moduse_internal(sx_hashfs_t *h, const sx_hash_t *revision_id, unsigned int hs, unsigned int ndb, const sx_hash_t *hash, unsigned replica, unsigned age);
+static rc_ty hash_of_blob_result(sx_hash_t *hash, sqlite3_stmt *stmt, int col);
+
+static rc_ty datadb_begin(sx_hashfs_t *h, unsigned int hs)
+{
+    for(int ndb=0;ndb<HASHDBS;ndb++)
+        if (qbegin(h->datadb[hs][ndb])) {
+            while (ndb-->0)
+                qrollback(h->datadb[hs][ndb]);
+            return FAIL_EINTERNAL;
+        }
+    return OK;
+}
+
+static void datadb_rollback(sx_hashfs_t *h, unsigned int hs)
+{
+    for(int ndb=0;ndb<HASHDBS;ndb++)
+        qrollback(h->datadb[hs][ndb]);
+}
+
+static rc_ty datadb_commit(sx_hashfs_t *h, unsigned int hs)
+{
+    for(int ndb=0;ndb<HASHDBS;ndb++)
+        if (qcommit(h->datadb[hs][ndb])) {
+            datadb_rollback(h, hs);
+            return FAIL_EINTERNAL;
+        }
+    return OK;
+}
+
+static rc_ty datadb_beginall(sx_hashfs_t *h)
+{
+    for (int i=0;i<SIZES;i++)
+        if (datadb_begin(h, i)) {
+            while(i-- > 0)
+                datadb_rollback(h, i);
+            return FAIL_EINTERNAL;
+        }
+    return OK;
+}
+
+static rc_ty datadb_commitall(sx_hashfs_t *h)
+{
+    for (int i=0;i<SIZES;i++)
+        if (datadb_commit(h, i)) {
+            while(i-- > 0)
+                datadb_rollback(h, i);
+            return FAIL_EINTERNAL;
+        }
+    return OK;
+}
+
+static void datadb_rollbackall(sx_hashfs_t *h)
+{
+    for (int i=0;i<SIZES;i++)
+        datadb_rollback(h, i);
+}
+
+static rc_ty gc_eventdb(sx_hashfs_t *h)
+{
+    int64_t n;
+    sqlite3_reset(h->qe_gc);
+    if (qstep_noret(h->qe_gc))
+        return FAIL_EINTERNAL;
+    n = sqlite3_changes(h->eventdb->handle);
+    if (n > 0)
+        INFO("GCed jobs: %lld", (long long)n);
+    return OK;
+}
+
+rc_ty sx_hashfs_upgrade_1_0_local(sx_hashfs_t *h)
+{
+    struct timeval tv0, tv1, tv2, tv3;
+    sqlite3_stmt *q = NULL;
+    rc_ty rc = FAIL_EINTERNAL;
+    sxi_db_t *db = NULL;
+    unsigned i;
+    int64_t heal_required = 0;
+    char msg[128];
+    struct bulk_save bulk;
+
+    bulk_start(&bulk);
+    gettimeofday(&tv0, NULL);
+
+    sx_hashfs_set_progress_info(h, INPRG_UPGRADE_RUNNING, "Upgrade - local file blocks");
+    for(i=0;i<METADBS;i++) {
+        db = h->metadb[i];
+        if(qprep(db, &q, "SELECT SUM(blocks) FROM heal WHERE remote_volume IS NULL") ||
+           qstep_ret(q))
+            break;
+        heal_required += sqlite3_column_int64(q, 0);
+        db = h->metadb[i];
+        qnullify(q);
+    }
+    qnullify(q);
+    for(i=0;i<METADBS;i++) {
+        sqlite3_stmt *qsel = NULL;
+        int ret;
+        db = h->metadb[i];
+        if(qprep(db, &qsel, "SELECT heal.revision_id, blocks, blocksize, content, replica_count, name, rev FROM heal INNER JOIN files ON heal.revision_id=files.revision_id WHERE remote_volume IS NULL"))
+            break;
+        do {
+            int64_t heal_done = 0;
+            unsigned k=0;
+            rc = FAIL_EINTERNAL;
+            snprintf(msg, sizeof(msg), "Upgrade - local file blocks: %lld remaining", (long long)heal_required);
+            sx_hashfs_set_progress_info(h, INPRG_UPGRADE_RUNNING, msg);
+            if (qbegin(db) || datadb_beginall(h))
+                break;
+            sqlite3_reset(qsel);
+            while ((ret = qstep(qsel)) == SQLITE_ROW && (k++ < gc_max_batch)) {
+                unsigned int hs;
+                sx_hash_t revision_id;
+                int64_t blocks = sqlite3_column_int64(qsel, 1);
+                unsigned blocksize = sqlite3_column_int64(qsel, 2);
+                const sx_hash_t *content = sqlite3_column_blob(qsel, 3);
+                unsigned int replica = sqlite3_column_int64(qsel, 4);
+                ret = -1;
+                int64_t j;
+
+                if (hash_of_blob_result(&revision_id, qsel, 0))
+                    break;
+                if (sqlite3_column_bytes(qsel, 3) != blocks*sizeof(*content)) {
+                    CRIT("corrupt file blob: %s (%s)", sqlite3_column_text(qsel,5), sqlite3_column_text(qsel, 6));
+                    continue;
+                }
+                for(hs = 0; hs < SIZES; hs++)
+            	    if(bsz[hs] == blocksize)
+        	        break;
+                if (hs == SIZES) {
+                    CRIT("corrupt file blocksize: %d", blocksize);
+                    continue;
+                }
+                unsigned int age = sxi_hdist_version(h->hd);
+                for (j=0;j<blocks;j++) {
+                    const sx_hash_t *hash = &content[j];
+                    if (sx_hashfs_hashop_moduse_internal(h, &revision_id, hs, gethashdb(hash), hash, replica, age))
+                        break;
+                }
+                if (j != blocks)
+                    break;
+                DEBUG("rebuilt revmap for %lld blocks", (long long)blocks);
+                if (qbind_blob(h->qm_del_heal[i],":revision_id", revision_id.b, sizeof(revision_id.b)) ||
+                    qstep_noret(h->qm_del_heal[i]))
+                    break;
+                heal_done += blocks;
+            }
+            sqlite3_reset(qsel);
+            if (ret != SQLITE_ROW && ret != SQLITE_DONE) {
+                datadb_rollbackall(h);
+                break;
+            }
+            if (datadb_commitall(h) || qcommit(db))
+                break;
+            rc = OK;
+            heal_required -= heal_done;
+        } while(ret == SQLITE_ROW);
+        qnullify(qsel);
+        if (rc)
+            qrollback(db);
+    }
+    bulk_done(&bulk);
+    if (rc == OK) {
+        sx_hashfs_set_progress_info(h, INPRG_UPGRADE_RUNNING, "Upgrade - local file blocks checkpointing");
+        gettimeofday(&tv1, NULL);
+        for(i=0;i<METADBS;i++)
+            qcheckpoint_idle(h->metadb[i]);
+        for(unsigned j=0;j<SIZES;j++)
+            for(i=0;i<HASHDBS;i++)
+                qcheckpoint_idle(h->datadb[j][i]);
+        sx_hashfs_set_progress_info(h, INPRG_UPGRADE_RUNNING, "Upgrade - local file blocks done");
+        gettimeofday(&tv2, NULL);
+        INFO("Checkpoint finished in %.fs", timediff(&tv1, &tv2));
+        const sx_hashfs_volume_t *volume;
+        int max_age = sxi_hdist_version(h->hd);
+        unsigned n = 0;
+        for(rc = sx_hashfs_volume_first(h, &volume, 0);rc == OK;rc = sx_hashfs_volume_next(h)) {
+            if (sx_hashfs_is_or_was_my_volume(h, volume))
+                continue;/* we've already imported this data from the local volnode */
+            for(i=0;i<METADBS;i++) {
+                sqlite3_stmt *q = h->qm_add_heal_volume[i];
+                sqlite3_reset(q);
+                if(qbind_text(q,":name", volume->name) ||
+                   qbind_int(q,":max_age", max_age) ||
+                   qbind_blob(q,":min_revision_id","",0) ||
+                   qstep_noret(q)) {
+                    rc = FAIL_EINTERNAL;
+                    break;
+                }
+            }
+            if (i != METADBS) {
+                rc = FAIL_EINTERNAL;
+                break;
+            }
+            n++;
+        }
+        if (rc == ITER_NO_MORE) {
+            snprintf(msg, sizeof(msg), "Local upgrade completed - %d remote volume names listed", n);
+            sx_hashfs_set_progress_info(h, INPRG_UPGRADE_COMPLETE, msg);
+            rc = OK;
+
+            INFO("Cleaning events.db");
+            if (gc_eventdb(h) ||
+                qprep(h->eventdb, &q, "VACUUM") || qstep_noret(q))
+                WARN("Clean failed on events.db");/* not critical */
+            qnullify(q);
+        }
+    }
+    if (rc)
+        return rc;
+    gettimeofday(&tv3, NULL);
+    INFO("Local upgrade finished in %.fs: %s", timediff(&tv0, &tv3) - timediff(&tv1, &tv2), rc2str(rc));
+    return OK;
 }
 
 /* Create temporary file inside given path.
@@ -3421,10 +4607,12 @@ extract_volume_files_err:
     return ret;
 }
 
+static rc_ty volume_next_common(sx_hashfs_t *h);
+
 int sx_hashfs_extract(sx_hashfs_t *h, const char *destpath) {
     int ret = -1, s, r, i;
     sqlite3_stmt *locks[METADBS+1], *unlocks[METADBS+1];
-    const sx_hashfs_volume_t *vol = NULL;
+    const sx_hashfs_volume_t *vol = &h->curvol;
 
     if(!destpath || !*destpath) {
         WARN("Failed to extract files: Bad output path");
@@ -3448,8 +4636,11 @@ int sx_hashfs_extract(sx_hashfs_t *h, const char *destpath) {
         goto sx_hashfs_extract_err;
     }
 
+    h->curvol.name[0] = '\0';
+    h->curvoluser = 0;
+
     /* Iterate over all volumes */
-    for(s = sx_hashfs_volume_first(h, &vol, 0); s == OK; s = sx_hashfs_volume_next(h)) {
+    for(s = volume_next_common(h); s == OK; s = volume_next_common(h)) {
         int64_t restored = 0, nfiles = 0;
         unsigned int len;
         char *partdir = NULL;
@@ -3570,6 +4761,11 @@ rc_ty sx_hashfs_modhdist(sx_hashfs_t *h, const sx_nodelist_t *list) {
 
     for(i=0; i<nnodes; i++) {
 	const sx_node_t *n = sx_nodelist_get(list, i);
+	if(sx_node_capacity(n) < SXLIMIT_MIN_NODE_SIZE) {
+	    sxi_hdist_free(newmod);
+	    msg_set_reason("Invalid capacity: Node %s cannot be smaller than %u bytes", sx_node_uuid_str(n), SXLIMIT_MIN_NODE_SIZE);
+	    return EINVAL;
+	}
 	ret = sxi_hdist_addnode(newmod, sx_node_uuid(n), sx_node_addr(n), sx_node_internal_addr(n), sx_node_capacity(n), NULL);
 	if(ret == OK)
 	    continue;
@@ -3619,7 +4815,7 @@ rc_ty sx_hashfs_modhdist(sx_hashfs_t *h, const sx_nodelist_t *list) {
 }
 
 
-const sx_nodelist_t *sx_hashfs_nodelist(sx_hashfs_t *h, sx_hashfs_nl_t which) {
+const sx_nodelist_t *sx_hashfs_all_nodes(sx_hashfs_t *h, sx_hashfs_nl_t which) {
     if(!h)
 	return NULL;
     switch(which) {
@@ -3636,48 +4832,94 @@ const sx_nodelist_t *sx_hashfs_nodelist(sx_hashfs_t *h, sx_hashfs_nl_t which) {
     }
 }
 
-static int hash_nidx_tobuf(sx_hashfs_t *h, const sx_hash_t *hash, unsigned int replica_count, unsigned int *nidx) {
+const sx_nodelist_t *sx_hashfs_effective_nodes(sx_hashfs_t *h, sx_hashfs_nl_t which) {
+    if(!h)
+	return NULL;
+    switch(which) {
+    case NL_PREV:
+	return h->effprev_dist;
+    case NL_NEXT:
+	return h->effnext_dist;
+    case NL_PREVNEXT:
+	return h->effprevnext_dist;
+    case NL_NEXTPREV:
+	return h->effnextprev_dist;
+    default:
+	return NULL;
+    }
+}
+
+
+/* always builds the table with required_replica nodes
+ * ignored nodes are placed at the end of the array
+ * returns the number of non ignored nodes in the array */
+static int hash_nidx_tobuf(sx_hashfs_t *h, const sx_hash_t *hash, unsigned int required_replica, unsigned int max_volume_replica, unsigned int *nidx) {
     const sx_nodelist_t *nodes;
     sx_nodelist_t *belongsto;
-    unsigned int i, nnodes;
+    unsigned int i, start, nnodes;
+    int ret;
 
     if(!h || !hash) {
 	NULLARG();
-	return 1;
+	return -1;
     }
 
     if(!h->have_hd) {
 	BADSTATE("Called before initialization");
-	return 1;
+	return -1;
     }
 
-    nodes = sx_hashfs_nodelist(h, NL_NEXT);
+    nodes = sx_hashfs_all_nodes(h, NL_NEXT);
     nnodes = sx_nodelist_count(nodes);
 
-    if(replica_count < 1 || replica_count > nnodes) {
-	msg_set_reason("Bad replica count: %d must be between %d and %d", replica_count, 1, nnodes);
-	return 1;
+    if(max_volume_replica < 1 || max_volume_replica > nnodes ||
+       required_replica < 1 || required_replica > max_volume_replica ) {
+	msg_set_reason("Bad replica count: %d must be between %d and %d", max_volume_replica, 1, nnodes);
+	return -1;
     }
 
     /* MODHDIST: using _next set - see rant under are_blocks_available() */
-    belongsto = sxi_hdist_locate(h->hd, MurmurHash64(hash, sizeof(*hash), HDIST_SEED), replica_count, 0);
+    belongsto = sxi_hdist_locate(h->hd, MurmurHash64(hash, sizeof(*hash), HDIST_SEED), max_volume_replica, 0);
     if(!belongsto) {
 	WARN("Cannot get nodes for volume");
-	return 1;
+	return -1;
     }
 
-    for(i=0; i<replica_count; i++) {
+    start = 0;
+    for(i=0; i<max_volume_replica && start < required_replica; i++) {
 	const sx_node_t *node = sx_nodelist_get(belongsto, i);
 	const sx_uuid_t *uuid = sx_node_uuid(node);
-	if(!sx_nodelist_lookup_index(nodes, uuid, &nidx[i])) {
+	unsigned int nodeidx;
+
+	if(!sx_nodelist_lookup_index(nodes, uuid, &nodeidx)) {
 	    CRIT("node id %s from hdist is unknown to us", uuid->string);
 	    sx_nodelist_delete(belongsto);
-	    return 1;
+	    return -1;
 	}
+
+	if(!sx_nodelist_lookup(h->ignored_nodes, uuid))
+	    nidx[start++] = nodeidx;
+    }
+    ret = start;
+
+    for(i=0; i<max_volume_replica && start < required_replica; i++) {
+	const sx_node_t *node = sx_nodelist_get(belongsto, i);
+	const sx_uuid_t *uuid = sx_node_uuid(node);
+	unsigned int nodeidx;
+
+	if(!sx_nodelist_lookup_index(nodes, uuid, &nodeidx)) {
+	    CRIT("node id %s from hdist is unknown to us", uuid->string);
+	    sx_nodelist_delete(belongsto);
+	    return -1;
+	}
+
+	if(sx_nodelist_lookup(h->ignored_nodes, uuid))
+	    nidx[start++] = nodeidx;
     }
 
     sx_nodelist_delete(belongsto);
-    return 0;
+
+    return ret;
 }
 
 int sx_hashfs_is_node_volume_owner(sx_hashfs_t *h, sx_hashfs_nl_t which, const sx_node_t *n, const sx_hashfs_volume_t *vol) {
@@ -3693,7 +4935,7 @@ int sx_hashfs_is_node_volume_owner(sx_hashfs_t *h, sx_hashfs_nl_t which, const s
         return 0;
     }
 
-    volnodes = sx_hashfs_hashnodes(h, which, &hash, vol->replica_count);
+    volnodes = sx_hashfs_all_hashnodes(h, which, &hash, vol->max_replica);
     if(volnodes) {
         if(sx_nodelist_lookup(volnodes, sx_node_uuid(n)))
             ret = 1;
@@ -3727,27 +4969,8 @@ int sx_hashfs_is_node_faulty(sx_hashfs_t *h, const sx_uuid_t *node_uuid) {
     return sx_nodelist_lookup(h->faulty_nodes, node_uuid) != NULL;
 }
 
-static unsigned int slashes_in(const char *s) {
-    unsigned int l = strlen(s), found = 0;
-    const char *sl;
-    while(l && (sl = memchr(s, '/', l))) {
-	found++;
-	sl++;
-	l -= sl -s;
-	s = sl;
-    }
-    return found;
-}
-
-static char *ith_slash(char *s, unsigned int i) {
-    unsigned found = 0;
-    while ((s = strchr(s, '/'))) {
-        found++;
-        if (found == i)
-            return s;
-        s++;
-    }
-    return NULL;
+int sx_hashfs_is_node_ignored(sx_hashfs_t *h, const sx_uuid_t *node_uuid) {
+    return sx_nodelist_lookup(h->ignored_nodes, node_uuid) != NULL;
 }
 
 rc_ty sx_hashfs_revision_first(sx_hashfs_t *h, const sx_hashfs_volume_t *volume, const char *name, const sx_hashfs_file_t **file, int reversed) {
@@ -3780,6 +5003,7 @@ rc_ty sx_hashfs_revision_first(sx_hashfs_t *h, const sx_hashfs_volume_t *volume,
 
     sxi_strlcpy(h->list_file.name, name, sizeof(h->list_file.name));
     h->list_file.revision[0] = '\0';
+    h->list_volid = volume->id;
     *file = &h->list_file;
 
     return sx_hashfs_revision_next(h, reversed);
@@ -3792,6 +5016,10 @@ rc_ty sx_hashfs_revision_next(sx_hashfs_t *h, int reversed) {
     int r;
 
     sqlite3_reset(q);
+    if(qbind_int64(q, ":volume", h->list_volid) ||
+       qbind_text(q, ":name", h->list_file.name))
+        return FAIL_EINTERNAL;
+
     if(reversed && h->list_file.revision[0] == '\0') {
         if(qbind_null(q, ":previous"))
 	    return FAIL_EINTERNAL;
@@ -3821,11 +5049,6 @@ rc_ty sx_hashfs_revision_next(sx_hashfs_t *h, int reversed) {
     sqlite3_reset(q);
 
     return OK;
-}
-
-static inline int has_wildcard(const char *str)
-{
-    return strcspn(str, "*?[") < strlen(str);
 }
 
 rc_ty sx_hashfs_list_etag(sx_hashfs_t *h, const sx_hashfs_volume_t *volume, const char *pattern, int8_t recurse, sx_hash_t *etag)
@@ -3889,230 +5112,361 @@ rc_ty sx_hashfs_list_etag(sx_hashfs_t *h, const sx_hashfs_volume_t *volume, cons
     return rc;
 }
 
-rc_ty sx_hashfs_list_first(sx_hashfs_t *h, const sx_hashfs_volume_t *volume, const char *pattern, const sx_hashfs_file_t **file, int recurse, const char *after) {
-    int l = 0, r = 0, plen, glob = -1;
-    DEBUG("pattern: %s, recurse: %d, after: %s", pattern ? pattern : "", recurse, after ? after : "");
+static unsigned int slashes_in(const char *s) {
+    unsigned int l = strlen(s), found = 0;
+    const char *sl;
+    while(l && (sl = memchr(s, '/', l))) {
+        found++;
+        sl++;
+        l -= sl -s;
+        s = sl;
+    }
+    return found;
+}
 
+static const char *ith_slash(const char *s, unsigned int i) {
+    unsigned found = 0;
+    while ((s = strchr(s, '/'))) {
+        found++;
+        if (found == i)
+            return s;
+        s++;
+    }
+    return NULL;
+}
+
+/* Compare paths */
+static int pcmp(sx_hashfs_t *h, const char *p1, const char *p2, unsigned int maxlen) {
+    int r = 0;
+
+    if(!p1 || !p2) {
+        WARN("Null argument");
+        return 0;
+    }
+
+    if(!h->list_recurse) {
+        const char *s1 = ith_slash(p1, h->list_pattern_slashes + 1);
+        const char *s2 = ith_slash(p2, h->list_pattern_slashes + 1);
+        if(!s1 || !s2 || s1 - p1 != s2 - p2)
+            r = strncmp(p1, p2, maxlen);
+        else
+            r = strncmp(p1, p2, MIN(s1 - p1, maxlen)); /* Slash in the same place*/
+    } else
+        r = strncmp(p1, p2, maxlen);
+
+    return r;
+}
+
+static rc_ty lookup_file_name(sx_hashfs_t *h, int db_idx, int update_cache) {
+    int r;
+    rc_ty ret = FAIL_EINTERNAL;
+    const char *n, *revision;
+    sqlite3_stmt *stmt;
+    list_entry_t *e = &h->list_cache[db_idx];
+    const char *q = NULL;
+
+    if(!h->list_recurse && (q = ith_slash(e->name, h->list_pattern_slashes + 1))) {
+        /* We are not searching recursively and next slash was found in pervious name,
+         * we can skip all files that are prefixed by that dir. To achieve that we can simply move
+         * starting name to the next one, but we will have to also be careful and use >= for name matching
+         */
+        e->name[q - e->name]++;
+        e->name[q - e->name + 1] = '\0';
+    }
+
+    /* Use statement with > or >= regarding to previous q assignment (or if using h->list_lower_limit) */
+    if(q || !update_cache)
+        stmt = h->qm_list_eq[db_idx];
+    else
+        stmt = h->qm_list[db_idx];
+    sqlite3_reset(stmt);
+    if(qbind_int64(stmt, ":volume", h->list_volid) ||
+       qbind_text(stmt, ":previous", update_cache ? e->name : h->list_lower_limit) ||
+       qbind_text(stmt, ":pattern", h->list_pattern) ||
+       qbind_int(stmt, ":pattern_slashes", h->list_pattern_slashes) ||
+       qbind_int(stmt, ":slash_ending", h->list_pattern_end_with_slash)) {
+        WARN("Failed to bind list query values");
+        goto lookup_file_name_err;
+    }
+
+    if(h->list_limit_len) {
+        if(qbind_text(stmt, ":limit", h->list_upper_limit)) {
+            WARN("Failed to bind upper limit");
+            goto lookup_file_name_err;
+        }
+    } else {
+        if(qbind_null(stmt, ":limit")) {
+            WARN("Failed to bind upper limit (null)");
+            goto lookup_file_name_err;
+        }
+    }
+
+    r = qstep(stmt);
+    h->qm_list_queries++;
+    if(r == SQLITE_DONE) {
+        e->name[0] = '\0';
+        /* Done for this db, no more reading needed */
+        ret = OK;
+        goto lookup_file_name_err;
+    }
+
+    if(r != SQLITE_ROW)
+        goto lookup_file_name_err;
+
+    n = (const char *)sqlite3_column_text(stmt, 0);
+    if(!n) {
+        WARN("Cannot list NULL filename on meta database %u", db_idx);
+        goto lookup_file_name_err;
+    }
+
+    e->file_size = sqlite3_column_int64(stmt, 1);
+    e->nblocks = size_to_blocks(e->file_size, NULL, &e->block_size);
+
+    revision = (const char *)sqlite3_column_text(stmt, 2);
+    if(!revision || parse_revision(revision, &e->created_at)) {
+        WARN("Bad revision found on file %s, volid %lld", h->list_file.name, (long long)h->list_volid);
+        goto lookup_file_name_err;
+    } else {
+        strncpy(e->revision, revision, sizeof(e->revision));
+        e->revision[sizeof(e->revision)-1] = '\0';
+    }
+
+    strncpy(e->name, n, sizeof(e->name));
+    e->name[sizeof(e->name)-1] = '\0';
+
+    ret = OK;
+    lookup_file_name_err:
+    /* Always reset statement to avoid locking server */
+    sqlite3_reset(stmt);
+
+    return ret;
+}
+
+static int parse_pattern(sx_hashfs_t *h, const char *pattern) {
+    int plen;
+    unsigned int l, r;
+
+    /* If pattern is empty, make it a single slash */
     if(!pattern)
-	pattern = "/";
+        pattern = "/";
 
     while(pattern[0] == '/')
-	pattern++;
+        pattern++;
 
     if (!*pattern)
-	pattern = "/";
+        pattern = "/";
 
+    /* Pattern length is at least 1, so this call is OK */
     plen = check_file_name(pattern);
-    if(!h || !volume || plen < 0) {
-	NULLARG();
-	return EINVAL;
+    if(plen < 0) {
+        WARN("Could not get pattern length");
+        return 1;
+    }
+
+    /* Reset globbing character position */
+    h->list_limit_len = -1;
+
+    /* Clone pattern, plen is up to SXLIMIT_MAX_FILE_NAME_LEN */
+    memcpy(h->list_pattern, pattern, plen);
+    h->list_pattern[plen] = '\0';
+
+    /* Check if first character is a globbing one. */
+    if(strchr("*?[\\", h->list_pattern[0]))
+        h->list_limit_len = 0;
+
+    /*
+     * Iterate over pattern and remove multiplied slashes from that
+     * l points to chars in new pattern and r points to char in old one
+     */
+    for(l = 0, r = 1; r < (unsigned int)plen; r++) {
+        if(h->list_pattern[l] != '/' || h->list_pattern[r] != '/') {
+            l++;
+            if(l!=r)
+                h->list_pattern[l] = h->list_pattern[r];
+        }
+        /* Check if character is a globbing one and then set first globbing char position if not set yet */
+        if(h->list_limit_len == -1 && strchr("*?[\\", h->list_pattern[l]))
+            h->list_limit_len = l;
+    }
+
+    /* Update pattern length */
+    plen = l + 1;
+    h->list_pattern[plen] = '\0';
+
+    /* Check if pattern ends with slash, then we want to list fake dir contents, append asterisk at the end */
+    if (h->list_pattern[plen-1] == '/') {
+        h->list_pattern_end_with_slash = 1;
+        if (plen > 1) {
+            memcpy(&h->list_pattern[plen], "*", 2);
+            /* Set position of first globbin character */
+            if(h->list_limit_len == -1)
+                h->list_limit_len = plen;
+        } else {
+            /* Pattern is only one character, so it is a slash, it should become just asterisk */
+            memcpy(h->list_pattern, "*", 2);
+            /* Set position of first globbing character */
+            if(h->list_limit_len == -1)
+                h->list_limit_len = 0;
+        }
+    } else {
+        h->list_pattern_end_with_slash = 0;
+        if(h->list_limit_len == -1) /* Exact file name match */
+            h->list_limit_len = plen;
+    }
+
+    /* Check number of slashes stored in pattern */
+    h->list_pattern_slashes = slashes_in(h->list_pattern);
+
+    return 0;
+}
+
+rc_ty sx_hashfs_list_first(sx_hashfs_t *h, const sx_hashfs_volume_t *volume, const char *pattern, const sx_hashfs_file_t **file, int recurse, const char *after) {
+    unsigned int l = 0;
+
+    if(!h || !volume) {
+        NULLARG();
+        return EINVAL;
     }
 
     if(!sx_hashfs_is_or_was_my_volume(h, volume)) {
-	/* TODO: got, expected: */
-	msg_set_reason("Wrong node for volume '%s': ...", volume->name);
-	return ENOENT;
+        /* TODO: got, expected: */
+        msg_set_reason("Wrong node for volume '%s': ...", volume->name);
+        return ENOENT;
     }
 
-    memcpy(h->list_pattern, pattern, plen + 1);
-    if(h->list_pattern[l] == '*' || h->list_pattern[l] == '?' || h->list_pattern[l] == '[')
-        glob = 0;
-    for(l = 0, r = 1; r<plen; r++) {
-	if(h->list_pattern[l] != '/' || h->list_pattern[r] != '/') {
-	    l++;
-	    if(l!=r)
-		h->list_pattern[l] = h->list_pattern[r];
-	}
-        if(glob == -1 && (h->list_pattern[l] == '*' || h->list_pattern[l] == '?' || h->list_pattern[l] == '[')) {
-            glob = l;
-        }
-    }
-    plen = l+1;
-    h->list_pattern[plen] = '\0';
-    for (l=0, r=0; r<plen;) {
-        if (strchr("*?[]\\", h->list_pattern[r]))
-            h->list_pattern_esc[l++] = '\\';
-        h->list_pattern_esc[l++] = h->list_pattern[r++];
-    }
-    h->list_pattern_esc[l] = '\0';
-    if (h->list_pattern[plen-1] == '/') {
-        plen--;
-        l--;
-        if (plen > 0) {
-            memcpy(&h->list_pattern[plen], "/*", 3);
-            memcpy(&h->list_pattern_esc[l], "/*", 3);
-            if(glob == -1)
-                glob = plen + 1;
-        } else {
-            memcpy(&h->list_pattern[plen], "*", 2);
-            memcpy(&h->list_pattern_esc[l], "*", 2);
-            if(glob == -1)
-                glob = plen;
-        }
-    } else {
-        if(glob == -1) /* Exact file name match */
-            glob = plen;
+    /* Check given search pattern for globbing characters */
+    if(parse_pattern(h, pattern)) {
+        WARN("Failed to parse listing pattern");
+        return EINVAL;
     }
 
-    if(glob > 0) {
-        /* [glob] set to \0 below */
-        sxi_strlcpy(h->list_file.itername, h->list_pattern, sizeof(h->list_file.itername));
-        sxi_strlcpy(h->list_file.itername_limit, h->list_pattern, sizeof(h->list_file.itername_limit));
-    }
+    /* If 'after' parameter is bigger than pattern prefix, then there is no need to query database */
+    if(after && strncmp(h->list_pattern, after, h->list_limit_len) < 0)
+        return ITER_NO_MORE;
 
-    h->list_pattern_slashes = slashes_in(h->list_pattern);
-    h->list_file.name[0] = '\0';
-    if(glob != -1) {
-        h->list_file.itername[glob] = '\0';
-        h->list_file.itername_limit[glob] = '\0';
-        h->list_file.itername_limit_len = glob;
-        /* Do not skip exact match (e.g. pattern = /foo* -> result would not contain /foo */
-        if(glob > 0) {
-           h->list_file.itername[glob-1]--;
-           h->list_file.itername_limit[glob-1]++;
-        }
-    } else {
-        h->list_file.itername[0] = '\0';
-        h->list_file.itername_limit[0] = '\0';
-        h->list_file.itername_limit_len = 0;
-    }
-    if (after) {
-        sxi_strlcpy(h->list_file.itername, after, sizeof(h->list_file.itername));
-        sxi_strlcpy(h->list_file.lastname, after, sizeof(h->list_file.lastname));
-    }
-
-    h->list_file.lastname[0] = '\0';
+    /* Store number of slashes in listing pattern, used for comparing file names modulo fake directory name */
     h->list_recurse = recurse;
     h->list_volid = volume->id;
     if(file)
-	*file = &h->list_file;
+        *file = &h->list_file;
 
-    memset(h->qm_list_done, 0, METADBS);
+    /* If after given, try to start from later position if after is greater or equal to truncated search pattern */
+    if (after && strncmp(h->list_pattern, after, h->list_limit_len) >= 0)
+        sxi_strlcpy(h->list_lower_limit, after, strlen(after)+1);
+    else /* Copy pattern to list_itername and list_itername_limit variables to limit search boundaries */
+        sxi_strlcpy(h->list_lower_limit, h->list_pattern, h->list_limit_len+1);
+
+    sxi_strlcpy(h->list_upper_limit, h->list_pattern, h->list_limit_len+1);
+
+    /* Increment upper limit that file names */
+    if(h->list_limit_len > 0)
+        h->list_upper_limit[h->list_limit_len-1]++;
 
     /* For debugging */
     h->qm_list_queries = 0;
+
+    /* Store first file names in cache */
+    for(l = 0; l < METADBS; l++) {
+        h->list_cache[l].name[0] = '\0';
+        if(lookup_file_name(h, l, 0) != OK) {
+            WARN("Failed fetching file name from db %d", l);
+            return FAIL_EINTERNAL;
+        }
+    }
 
     return sx_hashfs_list_next(h);
 }
 
 rc_ty sx_hashfs_list_next(sx_hashfs_t *h) {
-    int found, list_ndb, match_failed;
-    int ret = OK;
+    int i, min_idx = -1;
+    const char *q = NULL;
+
     if(!h || !*h->list_pattern)
-	return EINVAL;
+        return EINVAL;
 
-    do {
-	found = 0;
-	for(list_ndb=0; list_ndb < METADBS; list_ndb++) {
-            if(h->qm_list_done[list_ndb])
-                continue;
+    for(i=0; i < METADBS; i++) {
+        int comp;
+        if(h->list_cache[i].name[0] == '\0')
+            continue; /* No more file names found in that db */
 
-	    sqlite3_reset(h->qm_list[list_ndb]);
-	    if(qbind_int64(h->qm_list[list_ndb], ":volume", h->list_volid) ||
-	       qbind_text(h->qm_list[list_ndb], ":previous", h->list_file.itername)) {
-                ret = FAIL_EINTERNAL;
-                break;
+        if(min_idx == -1)
+            min_idx = i;
+        else {
+            /* In case this db has stored file name that is equal (modulo directory name) to current name, lookup next one */
+            if(!(comp = pcmp(h, h->list_cache[i].name, h->list_cache[min_idx].name, sizeof(h->list_cache[i].name)))) {
+                if(lookup_file_name(h, i, 1)) {
+                    WARN("Could not lookup file name");
+                    return FAIL_EINTERNAL;
+                }
+                /* No more in that db */
+                if(h->list_cache[i].name[0] == '\0')
+                    continue;
+
+                comp = pcmp(h, h->list_cache[i].name, h->list_cache[min_idx].name, sizeof(h->list_cache[i].name));
             }
 
-	    int r = qstep(h->qm_list[list_ndb]);
-
-            /* For debugging, can be removed */
-            h->qm_list_queries++;
-
-	    if(r == SQLITE_DONE)
-		continue;
-
-	    if(r != SQLITE_ROW) {
-                ret = FAIL_EINTERNAL;
-                break;
-            }
-
-	    const char *n = (char *)sqlite3_column_text(h->qm_list[list_ndb], 0);
-	    if(!n) {
-		WARN("Cannot list NULL filename on meta database %u", list_ndb);
-                ret = FAIL_EINTERNAL;
-                break;
-	    }
-
-            if(h->list_file.itername_limit[0] != '\0' && strncmp(n, h->list_file.itername_limit, h->list_file.itername_limit_len) >= 0) {
-                h->qm_list_done[list_ndb] = 1; /* This db won't be queried again */
-                continue;
-            }
-
-	    if(!found || strcmp(n, h->list_file.name+1) < 0) {
-		found = 1;
-		h->list_file.name[0] = '/';
-		sxi_strlcpy(h->list_file.name+1, n, sizeof(h->list_file.name)-1);
-
-		h->list_file.file_size = sqlite3_column_int64(h->qm_list[list_ndb], 1);
-		h->list_file.nblocks = size_to_blocks(h->list_file.file_size, NULL, &h->list_file.block_size);
-
-		const char *revision = (const char *)sqlite3_column_text(h->qm_list[list_ndb], 2);
-		if(!revision || parse_revision(revision, &h->list_file.created_at)) {
-		    WARN("Bad revision found on file %s, volid %lld", h->list_file.name, (long long)h->list_volid);
-		    ret = FAIL_EINTERNAL;
-		    break;
-		} else {
-		    sxi_strlcpy(h->list_file.revision, revision, sizeof(h->list_file.revision));
-		}
-	    }
-	    sqlite3_reset(h->qm_list[list_ndb]);
-	}
-        if (ret)
-            break;
-
-	if(!found) {
-            DEBUG("List queries performed: %llu", (unsigned long long)h->qm_list_queries);
-	    ret = ITER_NO_MORE;
-            break;
+            if(comp < 0) /* Found smaller file name */
+                min_idx = i;
         }
-
-	sxi_strlcpy(h->list_file.itername, h->list_file.name+1, sizeof(h->list_file.itername));
-
-	char *q = ith_slash(h->list_file.name+1, h->list_pattern_slashes + 1);
-	if (q)
-	    *q = '\0';/* match just dir part */
-
-        match_failed = fnmatch(h->list_pattern, h->list_file.name+1, FNM_PATHNAME | FNM_NOESCAPE);
-        if(match_failed) /* If matching with globbing enabled failed, try to match with globbing escaped */
-            match_failed = fnmatch(h->list_pattern_esc, h->list_file.name+1, FNM_PATHNAME);
-
-        DEBUG("itername: %s, pattern: %s, path: %s -> %d", h->list_file.itername,
-              h->list_pattern, h->list_file.name+1, match_failed);
-
-	if (q)
-	    *q = '/';/* full path again */
-	if (!h->list_recurse && q) {
-	    q[1] = '\0';
-
-	    /* This is a fake dir, all unrelated items are zeroed */
-	    h->list_file.file_size = 0;
-	    h->list_file.block_size = 0;
-	    h->list_file.nblocks = 0;
-	    h->list_file.revision[0] = '\0';
-	    /*
-	      h->list_file.created_at = 0;
-
-	      The created_at value here is not the fakedir mtime, but rather the mtime of
-	      some random file inside it.
-	      This value is not reported back to the client because it is incorrect
-	      (the correct dir mtime would be the max(mtime) of all the files inside the fakedir and all its children).
-	      This value is only used internally to adjust the Last-Modified header.
-	    */
-        }
-        /* only continue if pattern matched, and it is a new file / directory */
-    } while (match_failed || !strcmp(h->list_file.lastname, h->list_file.name));
-
-    for(list_ndb=0; list_ndb < METADBS; list_ndb++) {
-        sqlite3_reset(h->qm_list[list_ndb]);
     }
-    if (ret)
-        return ret;
-    sxi_strlcpy(h->list_file.lastname, h->list_file.name, sizeof(h->list_file.lastname));
+
+    if(min_idx < 0) {
+        DEBUG("Queried %lld times", (long long)h->qm_list_queries);
+        return ITER_NO_MORE;
+    }
+
+    h->list_file.file_size = h->list_cache[min_idx].file_size;
+    h->list_file.nblocks = h->list_cache[min_idx].nblocks;
+    h->list_file.block_size = h->list_cache[min_idx].block_size;
+
+    strncpy(h->list_file.revision, h->list_cache[min_idx].revision, sizeof(h->list_file.revision));
+    h->list_file.revision[sizeof(h->list_file.revision)-1] = '\0';
+    h->list_file.created_at = h->list_cache[min_idx].created_at;
+
+    h->list_file.name[0] = '/';
+    /* Truncate dir file name */
+    if(!h->list_recurse && (q = ith_slash(h->list_cache[min_idx].name, h->list_pattern_slashes + 1))) {
+        /* Truncate file name */
+        strncpy(h->list_file.name + 1, h->list_cache[min_idx].name, q - h->list_cache[min_idx].name + 1);
+        h->list_file.name[q - h->list_cache[min_idx].name + 2] = '\0';
+        /* This is a fake dir, all unrelated items are zeroed */
+        h->list_file.file_size = 0;
+        h->list_file.block_size = 0;
+        h->list_file.nblocks = 0;
+        h->list_file.revision[0] = '\0';
+        /*
+          h->list_file.created_at = 0;
+
+          The created_at value here is not the fakedir mtime, but rather the mtime of
+          some random file inside it.
+          This value is not reported back to the client because it is incorrect
+          (the correct dir mtime would be the max(mtime) of all the files inside the fakedir and all its children).
+          This value is only used internally to adjust the Last-Modified header.
+        */
+    } else {
+        strncpy(h->list_file.name + 1, h->list_cache[min_idx].name, sizeof(h->list_file.name)-1);
+        h->list_file.name[sizeof(h->list_file.name)-1] = '\0';
+    }
+
+    /* Lookup next file name for this database */
+    if(lookup_file_name(h, min_idx, 1) != OK) {
+        WARN("Could not lookup next file name");
+        return FAIL_EINTERNAL;
+    }
+
+    /* If path comparison returned same string, query again, applicable only when not listing recursively */
+    if(h->list_cache[min_idx].name[0] != '\0' && !h->list_recurse &&
+       !pcmp(h, h->list_cache[min_idx].name, h->list_file.name + 1, sizeof(h->list_cache[min_idx].name))) {
+        if(lookup_file_name(h, min_idx, 1)) {
+            WARN("Could not lookup file name");
+            return FAIL_EINTERNAL;
+        }
+    }
+
     return OK;
 }
 
-sx_nodelist_t *sx_hashfs_hashnodes(sx_hashfs_t *h, sx_hashfs_nl_t which, const sx_hash_t *hash, unsigned int replica_count) {
+sx_nodelist_t *sx_hashfs_all_hashnodes(sx_hashfs_t *h, sx_hashfs_nl_t which, const sx_hash_t *hash, unsigned int replica_count) {
     sx_nodelist_t *prev = NULL, *next = NULL;
     unsigned int nnodes;
     int64_t mh;
@@ -4186,11 +5540,46 @@ sx_nodelist_t *sx_hashfs_hashnodes(sx_hashfs_t *h, sx_hashfs_nl_t which, const s
     return next;
 }
 
-sx_nodelist_t *sx_hashfs_putfile_hashnodes(sx_hashfs_t *h, const sx_hash_t *hash) {
-    return sx_hashfs_hashnodes(h, NL_NEXT, hash, h->put_replica);
+sx_nodelist_t *sx_hashfs_effective_hashnodes(sx_hashfs_t *h, sx_hashfs_nl_t which, const sx_hash_t *hash, unsigned int replica_count) {
+    sx_nodelist_t *effnodes, *allnodes;
+    unsigned int nnodes, i;
+
+    nnodes = sx_nodelist_count(h->ignored_nodes);
+    if(replica_count <= nnodes)
+	return NULL;
+
+    allnodes = sx_hashfs_all_hashnodes(h, which, hash, replica_count);
+    if(!nnodes)
+	return allnodes;
+
+    effnodes = sx_nodelist_new();
+    if(!effnodes) {
+	sx_nodelist_delete(allnodes);
+	return NULL;
+    }
+
+    nnodes = sx_nodelist_count(allnodes);
+    for(i=0; i<nnodes; i++) {
+	const sx_node_t *node = sx_nodelist_get(allnodes, i);
+	if(sx_nodelist_lookup(h->ignored_nodes, sx_node_uuid(node)))
+	    continue;
+	if(sx_nodelist_add(effnodes, sx_node_dup(node)))
+	    break;
+    }
+
+    sx_nodelist_delete(allnodes);
+    if(i<nnodes) {
+	sx_nodelist_delete(effnodes);
+	return NULL;
+    }
+    return effnodes;
 }
 
-rc_ty sx_hashfs_volnodes(sx_hashfs_t *h, sx_hashfs_nl_t which, const sx_hashfs_volume_t *volume, int64_t size, sx_nodelist_t **nodes, unsigned int *block_size) {
+sx_nodelist_t *sx_hashfs_putfile_hashnodes(sx_hashfs_t *h, const sx_hash_t *hash) {
+    return sx_hashfs_effective_hashnodes(h, NL_NEXT, hash, h->put_replica);
+}
+
+static rc_ty get_volnodes_common(sx_hashfs_t *h, sx_hashfs_nl_t which, const sx_hashfs_volume_t *volume, int64_t size, sx_nodelist_t **nodes, unsigned int *block_size, int effective_only) {
     sx_hash_t hash;
 
     if(!h || !volume || !nodes) {
@@ -4207,13 +5596,23 @@ rc_ty sx_hashfs_volnodes(sx_hashfs_t *h, sx_hashfs_nl_t which, const sx_hashfs_v
     if(hash_buf(h->cluster_uuid.string, strlen(h->cluster_uuid.string), volume->name, strlen(volume->name), &hash))
 	return FAIL_EINTERNAL;
 
-    if(!(*nodes = sx_hashfs_hashnodes(h, which, &hash, volume->replica_count)))
+    *nodes = effective_only ?
+	sx_hashfs_effective_hashnodes(h, which, &hash, volume->max_replica) :
+	sx_hashfs_all_hashnodes(h, which, &hash, volume->max_replica);
+    if(!*nodes)
 	return FAIL_EINTERNAL;
 
     size_to_blocks(size, NULL, block_size);
     return OK;
 }
 
+rc_ty sx_hashfs_effective_volnodes(sx_hashfs_t *h, sx_hashfs_nl_t which, const sx_hashfs_volume_t *volume, int64_t size, sx_nodelist_t **nodes, unsigned int *block_size) {
+    return get_volnodes_common(h, which, volume, size, nodes, block_size, 1);
+}
+
+rc_ty sx_hashfs_all_volnodes(sx_hashfs_t *h, sx_hashfs_nl_t which, const sx_hashfs_volume_t *volume, int64_t size, sx_nodelist_t **nodes, unsigned int *block_size) {
+    return get_volnodes_common(h, which, volume, size, nodes, block_size, 0);
+}
 
 /* MODHDIST: there might now be 0, 1 or 2 selves. which do we return? */
 const sx_node_t *sx_hashfs_self(sx_hashfs_t *h) {
@@ -4262,7 +5661,7 @@ char *sxi_hashfs_admintoken(sx_hashfs_t *h) {
 	return NULL;
     }
 
-    if(sx_hashfs_get_user_info(h, ADMIN_USER, NULL, key, NULL))
+    if(sx_hashfs_get_user_info(h, ADMIN_USER, NULL, key, NULL, NULL))
 	return NULL;
 
     if(encode_auth_bin(ADMIN_USER, (const unsigned char *) key, AUTH_KEY_LEN, auth, sizeof(auth))) {
@@ -4283,10 +5682,10 @@ rc_ty sx_hashfs_derive_key(sx_hashfs_t *h, unsigned char *key, int len, const ch
     return OK;
 }
 
-rc_ty sx_hashfs_create_user(sx_hashfs_t *h, const char *user, const uint8_t *uid, unsigned uid_size, const uint8_t *key, unsigned key_size, int role)
+rc_ty sx_hashfs_create_user(sx_hashfs_t *h, const char *user, const uint8_t *uid, unsigned uid_size, const uint8_t *key, unsigned key_size, int role, const char *desc)
 {
     rc_ty rc = FAIL_EINTERNAL;
-    if (!h || !user || !key) {
+    if (!h || !user || !uid || !key) {
 	NULLARG();
 	return EFAULT;
     }
@@ -4301,11 +5700,6 @@ rc_ty sx_hashfs_create_user(sx_hashfs_t *h, const char *user, const uint8_t *uid
 	return EINVAL;
     }
 
-    if(uid && uid_size != AUTH_UID_LEN) {
-	msg_set_reason("Invalid uid");
-	return EINVAL;
-    }
-
     if(role != ROLE_ADMIN && role != ROLE_USER) {
 	msg_set_reason("Invalid role");
 	return EINVAL;
@@ -4314,12 +5708,6 @@ rc_ty sx_hashfs_create_user(sx_hashfs_t *h, const char *user, const uint8_t *uid
     sqlite3_stmt *q = h->q_createuser;
     sqlite3_reset(q);
     do {
-	sx_hash_t uh;
-	if(!uid) {
-	    if (hash_buf(NULL, 0, user, strlen(user), &uh))
-		break;
-	    uid = uh.b;
-	}
 	if(qbind_blob(q, ":userhash", uid, AUTH_UID_LEN))
 	    break;
 	if (qbind_text(q, ":name", user))
@@ -4339,6 +5727,17 @@ rc_ty sx_hashfs_create_user(sx_hashfs_t *h, const char *user, const uint8_t *uid
 	rc = OK;
     } while(0);
     sqlite3_reset(q);
+    INFO("desc: %s", desc);
+    if (desc && *desc) {
+        sqlite3_stmt *q = h->q_createuser_meta;
+        if (qbind_blob(q, ":userhash", uid, AUTH_UID_LEN) ||
+            qbind_text(q, ":desc", desc) ||
+            qstep_noret(q)) {
+            WARN("failed to set user desc");
+            rc = FAIL_EINTERNAL;
+        }
+        sqlite3_reset(q);
+    }
     return rc;
 }
 
@@ -4436,39 +5835,55 @@ int encode_auth_bin(const uint8_t *userhash, const unsigned char *key, unsigned 
     return 0;
 }
 
-rc_ty sx_hashfs_list_users(sx_hashfs_t *h, user_list_cb_t cb, void *ctx) {
+rc_ty sx_hashfs_list_users(sx_hashfs_t *h, const uint8_t *list_clones, user_list_cb_t cb, int desc, void *ctx) {
     rc_ty rc = FAIL_EINTERNAL;
-    int ret;
     uint64_t lastuid = 0;
+    sqlite3_stmt *q;
 
     if (!h || !cb) {
 	NULLARG();
 	return EFAULT;
     }
 
-    sqlite3_stmt *q = h->q_listusers;
+    if(!list_clones)
+        q = h->q_listusers;
+    else
+        q = h->q_listusersbycid;
     while(1) {
+        int ret;
+        sx_uid_t uid;
+        const char *name;
+        const uint8_t *user;
+        const uint8_t *key;
+        int is_admin = 0;
+
         sqlite3_reset(q);
-        if(qbind_int64(q, ":lastuid", lastuid))
+        if(qbind_int64(q, ":lastuid", lastuid)) {
+            WARN("Failed to bind uid to users listing query");
             break;
+        }
+
+        if(list_clones && (qbind_blob(q, ":common_id", list_clones, AUTH_CID_LEN) || qbind_int(q, ":inactivetoo", 0))) {
+            WARN("Failed to bind common id to q_listusersbycid query");
+            break;
+        }
         ret = qstep(q);
 	if(ret == SQLITE_DONE)
 	    rc = OK;
 	if(ret != SQLITE_ROW)
             break;
-	sx_uid_t uid = sqlite3_column_int64(q, 0);
-	const char *name = (const char *)sqlite3_column_text(q, 1);
-	const uint8_t *user = sqlite3_column_blob(q, 2);
-	const uint8_t *key = sqlite3_column_blob(q, 3);
-	int is_admin = sqlite3_column_int64(q, 4) == ROLE_ADMIN;
+	uid = sqlite3_column_int64(q, 0);
+	name = (const char *)sqlite3_column_text(q, 1);
+	user = sqlite3_column_blob(q, 2);
+	key = sqlite3_column_blob(q, 3);
+	is_admin = sqlite3_column_int64(q, 4) == ROLE_ADMIN;
         lastuid = uid;
 
 	if(sqlite3_column_bytes(q, 2) != SXI_SHA1_BIN_LEN || sqlite3_column_bytes(q, 3) != AUTH_KEY_LEN) {
 	    WARN("User %s (%lld) is invalid", name, (long long)uid);
 	    continue;
 	}
-
-	if(cb(uid, name, user, key, is_admin, ctx)) {
+	if(cb(uid, name, user, key, is_admin, desc ? (const char*)sqlite3_column_text(q, 5) : NULL, ctx)) {
 	    rc = EINTR;
 	    break;
 	}
@@ -4477,10 +5892,118 @@ rc_ty sx_hashfs_list_users(sx_hashfs_t *h, user_list_cb_t cb, void *ctx) {
     return rc;
 }
 
+/* Check if user with given uid is a volume owner */
+static int uid_is_volume_owner(sx_hashfs_t *h, const sx_hashfs_volume_t *vol, sx_uid_t id) {
+    sqlite3_stmt *q = h->q_userisowner;
+    int r, ret = -1;
+
+    if(!vol || !id) {
+        WARN("NULL argument");
+        return EINVAL;
+    }
+    sqlite3_reset(q);
+
+    if(qbind_int64(q, ":owner_id", vol->owner) || qbind_int64(q, ":uid", id)) {
+        WARN("Failed to bind IDs to volume ownership check query");
+        goto uid_is_volume_owner_err;
+    }
+
+    r = qstep(q);
+    if(r == SQLITE_DONE)
+        ret = 0;
+    else if(r == SQLITE_ROW)
+        ret = 1;
+    else
+        WARN("Failed to check volume %s ownership for ID %lld", vol->name, (long long)id);
+
+uid_is_volume_owner_err:
+    sqlite3_reset(q);
+    return ret;
+}
+
+rc_ty sx_hashfs_list_clones_first(sx_hashfs_t *h, sx_uid_t id, const sx_hashfs_user_t **user, int inactivetoo) {
+    rc_ty s;
+
+    if(!user) {
+        NULLARG();
+        return EINVAL;
+    }
+
+    memset(&h->curclone, 0, sizeof(h->curclone));
+    h->listinactiveclones = inactivetoo;
+
+    /* Get user UID */
+    if((s = sx_hashfs_get_user_by_uid(h, id, h->curclone.uid, inactivetoo)) != OK) {
+        WARN("Failed to get user by UID: %d", s);
+        if(s == ENOENT)
+            return ITER_NO_MORE;
+        else
+            return s;
+    }
+
+    *user = &h->curclone;
+    return sx_hashfs_list_clones_next(h);
+}
+
+rc_ty sx_hashfs_list_clones_next(sx_hashfs_t *h) {
+    rc_ty ret = FAIL_EINTERNAL;
+    sqlite3_stmt *q = h->q_listusersbycid;
+    int r;
+    const char *name;
+    const uint8_t *uid, *key;
+    sx_hashfs_user_t *u = &h->curclone;
+
+    sqlite3_reset(q);
+    if(qbind_int64(q, ":lastuid", h->curclone.id) || qbind_blob(q, ":common_id", h->curclone.uid, AUTH_CID_LEN) ||
+       qbind_int(q, ":inactivetoo", h->listinactiveclones)) {
+        WARN("Failed to bind user IDs");
+        goto sx_hashfs_list_volume_owners_next_err;
+    }
+
+    r = qstep(q);
+    if(r == SQLITE_DONE) {
+        ret = ITER_NO_MORE;
+        goto sx_hashfs_list_volume_owners_next_err;
+    } else if(r != SQLITE_ROW) {
+        WARN("Failed to iterate user clones");
+        goto sx_hashfs_list_volume_owners_next_err;
+    }
+
+    u->id = sqlite3_column_int64(q, 0);
+    name = (const char *)sqlite3_column_text(q, 1);
+    if(!name || sx_hashfs_check_username(name)) {
+        WARN("Invalid user name");
+        goto sx_hashfs_list_volume_owners_next_err;
+    }
+    sxi_strlcpy(u->name, name, sizeof(u->name));
+
+    uid = sqlite3_column_blob(q, 2);
+    if(!uid || sqlite3_column_bytes(q, 2) != AUTH_UID_LEN) {
+        WARN("Invalid user ID");
+        goto sx_hashfs_list_volume_owners_next_err;
+    }
+    memcpy(u->uid, uid, AUTH_UID_LEN);
+
+    key = sqlite3_column_blob(q, 3);
+    if(!uid || sqlite3_column_bytes(q, 3) != AUTH_KEY_LEN) {
+        WARN("Invalid user key");
+        goto sx_hashfs_list_volume_owners_next_err;
+    }
+    memcpy(u->key, key, AUTH_KEY_LEN);
+
+    u->role = sqlite3_column_int(q, 4);
+
+    ret = OK;
+sx_hashfs_list_volume_owners_next_err:
+    sqlite3_reset(q);
+    return ret;
+}
+
 rc_ty sx_hashfs_list_acl(sx_hashfs_t *h, const sx_hashfs_volume_t *vol, sx_uid_t uid, int uid_priv, acl_list_cb_t cb, void *ctx)
 {
     char user[SXLIMIT_MAX_USERNAME_LEN+1];
     int64_t lastuid = 0;
+    int is_owner;
     sx_priv_t priv = PRIV_NONE;
     rc_ty rc = FAIL_EINTERNAL;
     if (!h || !cb || !ctx)
@@ -4493,7 +6016,10 @@ rc_ty sx_hashfs_list_acl(sx_hashfs_t *h, const sx_hashfs_volume_t *vol, sx_uid_t
             return rc;
 
         rc = FAIL_EINTERNAL;
-        if (cb(user, priv, uid == vol->owner, ctx))
+        is_owner = uid_is_volume_owner(h, vol, uid);
+        if(is_owner < 0)
+            return FAIL_EINTERNAL;
+        if (cb(user, priv, is_owner, ctx))
             return rc;
     }
 
@@ -4509,6 +6035,8 @@ rc_ty sx_hashfs_list_acl(sx_hashfs_t *h, const sx_hashfs_volume_t *vol, sx_uid_t
 	if (qbind_int64(q, ":volid", vol->id))
             break;
         while (1) {
+            rc_ty s;
+            const sx_hashfs_user_t *u = NULL;
             sqlite3_reset(q);
             if (qbind_int64(q, ":lastuid", lastuid))
                 break;
@@ -4517,11 +6045,22 @@ rc_ty sx_hashfs_list_acl(sx_hashfs_t *h, const sx_hashfs_volume_t *vol, sx_uid_t
                break;
             int64_t list_uid = sqlite3_column_int64(q, 2);
             lastuid = list_uid;
-            if (list_uid == uid)
-                continue;/* we've already printed permissions for self */
 	    int perm = sqlite3_column_int64(q, 1);
-	    if (cb((const char*)sqlite3_column_text(q, 0), perm, list_uid == vol->owner, ctx))
-		break;
+            is_owner = uid_is_volume_owner(h, vol, list_uid);
+            if(is_owner < 0)
+                return FAIL_EINTERNAL;
+            for(s = sx_hashfs_list_clones_first(h, list_uid, &u, 0); s == OK; s = sx_hashfs_list_clones_next(h)) {
+                if (u->id == uid)
+                    continue;/* we've already printed permissions for self */
+                if (cb(u->name, perm, is_owner, ctx))
+                    break;
+            }
+
+            if(s != ITER_NO_MORE) {
+                WARN("Failed to iterate over all %lld clones", (long long)list_uid);
+                ret = s;
+                break;
+            }
 	}
 	if (ret != SQLITE_DONE)
 	    break;
@@ -4594,9 +6133,11 @@ rc_ty sx_hashfs_uid_get_name(sx_hashfs_t *h, uint64_t uid, char *name, unsigned 
 }
 
 
-rc_ty sx_hashfs_delete_user(sx_hashfs_t *h, const char *username, const char *new_owner) {
+rc_ty sx_hashfs_delete_user(sx_hashfs_t *h, const char *username, const char *new_owner, int all_clones) {
     rc_ty rc, ret = FAIL_EINTERNAL;
     sx_uid_t old, new;
+    int has_clone = 0;
+    const sx_hashfs_user_t *u = NULL;
 
     if(qbegin(h->db))
 	return FAIL_EINTERNAL;
@@ -4614,23 +6155,79 @@ rc_ty sx_hashfs_delete_user(sx_hashfs_t *h, const char *username, const char *ne
 	goto delete_user_err;
     }
 
+    rc = sx_hashfs_list_clones_first(h, old, &u, 1);
+    if(rc != OK || !u) {
+        WARN("Failed to list clones of %s: %d", username, rc);
+        ret = rc;
+        goto delete_user_err;
+    }
+
+    if(u->id != old) { /* If returned user ID is differend, then clone exists */
+        has_clone = 1;
+    } else if((rc = sx_hashfs_list_clones_next(h)) != ITER_NO_MORE) { /* If got user with same id, then need to check against next one */
+        if(rc != OK || !u) { /* Check for errors again */
+            WARN("Failed to list clones of %s", username);
+            ret = rc;
+            goto delete_user_err;
+        }
+        has_clone = 1; /* Clone exists, got him in second try */
+    }
+
+    if(!all_clones && has_clone) {
+        /* When a clone exists new volume owner will become one of deleted user clones */
+        new = u->id;
+    }
+
+    sqlite3_reset(h->q_chownvol);
+    sqlite3_reset(h->q_deleteuser);
+    sqlite3_reset(h->q_chprivs);
+
+    /* First, change volume ownership to a new owner */
     if(qbind_int64(h->q_chownvol, ":new", new) || 
        qbind_int64(h->q_chownvol, ":old", old) ||
        qstep_noret(h->q_chownvol))
-	goto delete_user_err;
+        goto delete_user_err;
 
-    if(qbind_int64(h->q_deleteuser, ":uid", old) ||
-       qstep_noret(h->q_deleteuser))
-	goto delete_user_err;
+    if(all_clones) {
+        /* When deleting all users, drop them all in a loop */
+        for(rc = sx_hashfs_list_clones_first(h, old, &u, 1); rc == OK; rc = sx_hashfs_list_clones_next(h)) {
+            if(qbind_int64(h->q_deleteuser, ":uid", u->id) ||
+               qstep_noret(h->q_deleteuser)) {
+                WARN("Failed to drop user %s [%lld]", u->name, (long long)u->id);
+                goto delete_user_err;
+            }
+
+            INFO("User %s deleted", u->name);
+        }
+    } else {
+        if(has_clone) {
+            /* In this case we have to grant privileges to given user clone in order to allow all clones still access their vols */
+            if(qbind_int64(h->q_chprivs, ":new", new) || qbind_blob(h->q_chprivs, ":user", u->uid, AUTH_UID_LEN) || qstep_noret(h->q_chprivs)) {
+                WARN("Failed to prepare and evaluate privs change query");
+                goto delete_user_err;
+            }
+        }
+        /* Drop that one particular user */
+        if(qbind_int64(h->q_deleteuser, ":uid", old) ||
+           qstep_noret(h->q_deleteuser)) {
+            WARN("Failed to drop user %s [%lld]", u->name, (long long)u->id);
+	    goto delete_user_err;
+        }
+    }
 
     if(qcommit(h->db))
 	goto delete_user_err;
 
     ret = OK;
-    INFO("User %s removed (and replaced by %s)", username, new_owner);
+    if(all_clones || !has_clone)
+        INFO("User %s removed (and replaced by %s)", username, new_owner);
+    else
+        INFO("User %s removed", username);
 
  delete_user_err:
-    sqlite3_reset(h->q_getuser);
+    sqlite3_reset(h->q_chownvol);
+    sqlite3_reset(h->q_deleteuser);
+    sqlite3_reset(h->q_chprivs);
 
     if(ret != OK)
 	qrollback(h->db);
@@ -4679,9 +6276,9 @@ static int64_t get_cluster_capacity(sx_hashfs_t *h, sx_hashfs_nl_t which) {
     int64_t size = 0;
     unsigned int i, nnodes;
 
-    nnodes = sx_nodelist_count(sx_hashfs_nodelist(h, which));
+    nnodes = sx_nodelist_count(sx_hashfs_all_nodes(h, which));
     for(i = 0; i < nnodes; i++)
-        size += sx_node_capacity(sx_nodelist_get(sx_hashfs_nodelist(h, which), i));
+        size += sx_node_capacity(sx_nodelist_get(sx_hashfs_all_nodes(h, which), i));
 
     return size;
 }
@@ -4747,13 +6344,13 @@ rc_ty sx_hashfs_check_volume_settings(sx_hashfs_t *h, const char *volume, int64_
 	return ret;
 
     if(h->have_hd) {
-	unsigned int nnodes = MIN(sx_nodelist_count(sx_hashfs_nodelist(h, NL_PREV)), sx_nodelist_count(sx_hashfs_nodelist(h, NL_NEXT)));
-	if(replica < 1 || replica > nnodes) {
-	    if(nnodes == 1)
+	unsigned int minreplica = sx_nodelist_count(h->ignored_nodes) + 1;
+	unsigned int maxreplica = MIN(sx_nodelist_count(sx_hashfs_all_nodes(h, NL_PREV)), sx_nodelist_count(sx_hashfs_all_nodes(h, NL_NEXT)));
+	if(replica < minreplica || replica > maxreplica) {
+	    if(maxreplica == 1)
 		msg_set_reason("Invalid replica count %d: must be 1 for a single-node cluster", replica);
 	    else
-		msg_set_reason("Invalid replica count %d: must be between %d and %d",
-			   replica, 1, nnodes);
+		msg_set_reason("Invalid replica count %d: must be between %d and %d", replica, minreplica, maxreplica);
 	    return EINVAL;
 	}
     }
@@ -4984,60 +6581,79 @@ rc_ty sx_hashfs_volume_delete(sx_hashfs_t *h, const char *volume, int force) {
     return ret;
 }
 
-rc_ty sx_hashfs_user_onoff(sx_hashfs_t *h, const char *user, int enable) {
-    int ret = OK;
-
-    if(qbind_text(h->q_onoffuser, ":username", user) ||
-       qbind_int(h->q_onoffuser, ":enable", enable) ||
-       qstep_noret(h->q_onoffuser))
-	ret = FAIL_EINTERNAL;
-    if (ret == OK)
+rc_ty sx_hashfs_user_onoff(sx_hashfs_t *h, const char *user, int enable, int all_clones) {
+    if(!all_clones) {
+        if(qbind_text(h->q_onoffuser, ":username", user) ||
+           qbind_int(h->q_onoffuser, ":enable", enable) ||
+           qstep_noret(h->q_onoffuser))
+            return FAIL_EINTERNAL;
         INFO("User '%s' %s", user, enable ? "enabled" : "disabled");
+    } else {
+        uint8_t user_uid[AUTH_UID_LEN];
+        rc_ty s;
 
-    return ret;
+        if((s = sx_hashfs_get_user_by_name(h, user, user_uid, 1)) != OK) {
+            WARN("Failed to get user by name in order to disable/enable all its clones");
+            return s;
+        }
+        if(qbind_blob(h->q_onoffuserclones, ":user", user_uid, AUTH_UID_LEN) ||
+           qbind_int(h->q_onoffuserclones, ":enable", enable) ||
+           qstep_noret(h->q_onoffuserclones)) {
+            WARN("Failed to disable all %s clones", user);
+            return FAIL_EINTERNAL;
+        }
+
+        INFO("User '%s' and all his clones were %s", user, enable ? "enabled" : "disabled");
+    }
+    return OK;
 }
 
-rc_ty sx_hashfs_volume_first(sx_hashfs_t *h, const sx_hashfs_volume_t **volume, int64_t uid) {
+rc_ty sx_hashfs_volume_first(sx_hashfs_t *h, const sx_hashfs_volume_t **volume, const uint8_t *uid) {
     if(!h || !volume) {
 	WARN("Called with invalid arguments");
 	return EINVAL;
     }
 
     h->curvol.name[0] = '\0';
-    h->curvoluid = uid;
+    h->curvoluser = uid;
     *volume = &h->curvol;
     return sx_hashfs_volume_next(h);
 }
 
-rc_ty sx_hashfs_volume_next(sx_hashfs_t *h) {
+static rc_ty volume_next_common(sx_hashfs_t *h) {
     const char *name;
     rc_ty res = FAIL_EINTERNAL;
     int r;
 
     if(!h) {
-	WARN("Called with invalid arguments");
-	return EINVAL;
+        WARN("Called with invalid arguments");
+        return EINVAL;
     }
 
     sqlite3_reset(h->q_nextvol);
     if(qbind_text(h->q_nextvol, ":previous", h->curvol.name))
-	goto volume_list_err;
-    if(qbind_int64(h->q_nextvol, ":user", h->curvoluid))
-	goto volume_list_err;
+        goto volume_next_common_err;
+    if(h->curvoluser) {
+        if(qbind_blob(h->q_nextvol, ":user", h->curvoluser, AUTH_UID_LEN))
+            goto volume_next_common_err;
+    } else {
+        if(qbind_null(h->q_nextvol, ":user"))
+            goto volume_next_common_err;
+    }
 
     r = qstep(h->q_nextvol);
     if(r == SQLITE_DONE)
-	res = ITER_NO_MORE;
+        res = ITER_NO_MORE;
     if(r != SQLITE_ROW)
-	goto volume_list_err;
+        goto volume_next_common_err;
 
     name = (const char *)sqlite3_column_text(h->q_nextvol, 1);
     if(!name)
-	goto volume_list_err;
+        goto volume_next_common_err;
 
     sxi_strlcpy(h->curvol.name, name, sizeof(h->curvol.name));
     h->curvol.id = sqlite3_column_int64(h->q_nextvol, 0);
-    h->curvol.replica_count = sqlite3_column_int(h->q_nextvol, 2);
+    h->curvol.max_replica = sqlite3_column_int(h->q_nextvol, 2);
     h->curvol.cursize = sqlite3_column_int64(h->q_nextvol, 3);
     h->curvol.size = sqlite3_column_int64(h->q_nextvol, 4);
     h->curvol.owner = sqlite3_column_int64(h->q_nextvol, 5);
@@ -5045,8 +6661,22 @@ rc_ty sx_hashfs_volume_next(sx_hashfs_t *h) {
     h->curvol.changed = sqlite3_column_int64(h->q_nextvol, 7);
 
     res = OK;
-    volume_list_err:
+volume_next_common_err:
     sqlite3_reset(h->q_nextvol);
+    return res;
+}
+
+rc_ty sx_hashfs_volume_next(sx_hashfs_t *h) {
+    rc_ty res = volume_next_common(h);
+    if(res != OK)
+        goto volume_list_err;
+
+    if(sx_nodelist_count(h->ignored_nodes) >= h->curvol.max_replica)
+	return sx_hashfs_volume_next(h);
+    h->curvol.effective_replica = h->curvol.max_replica - sx_nodelist_count(h->ignored_nodes);
+
+    res = OK;
+    volume_list_err:
     return res;
 }
 
@@ -5085,18 +6715,63 @@ static rc_ty volume_get_common(sx_hashfs_t *h, const char *name, int64_t volid, 
 
     sxi_strlcpy(h->curvol.name, name, sizeof(h->curvol.name));
     h->curvol.id = sqlite3_column_int64(q, 0);
-    h->curvol.replica_count = sqlite3_column_int(q, 2);
+    h->curvol.max_replica = sqlite3_column_int(q, 2);
     h->curvol.cursize = sqlite3_column_int64(q, 3);
     h->curvol.size = sqlite3_column_int64(q, 4);
     h->curvol.owner = sqlite3_column_int64(q, 5);
     h->curvol.revisions = sqlite3_column_int(q, 6);
     h->curvol.changed = sqlite3_column_int64(q, 7);
+
+    if(sx_nodelist_count(h->ignored_nodes) >= h->curvol.max_replica) {
+	res = ENOENT;
+	goto volume_err;
+    }
+    h->curvol.effective_replica = h->curvol.max_replica - sx_nodelist_count(h->ignored_nodes);
+
     *volume = &h->curvol;
     res = OK;
 
     volume_err:
     sqlite3_reset(q);
     return res;
+}
+
+static rc_ty get_priv_holder(sx_hashfs_t *h, uint64_t uid, const char *volume, int64_t *holder) {
+    uint8_t user[AUTH_UID_LEN];
+    rc_ty s;
+    int r;
+
+    if(!volume || !holder) {
+        NULLARG();
+        return EINVAL;
+    }
+
+    if((s = sx_hashfs_get_user_by_uid(h, uid, user, 1)) != OK) {
+        WARN("Failed to get priv holder: %s", rc2str(s));
+        return s;
+    }
+
+    sqlite3_reset(h->q_getprivholder);
+    if(qbind_blob(h->q_getprivholder, ":user", user, AUTH_UID_LEN)) {
+        WARN("Failed to prepare query");
+        sqlite3_reset(h->q_getprivholder);
+        return FAIL_EINTERNAL;
+    }
+
+    r = qstep(h->q_getprivholder);
+    if(r == SQLITE_DONE) {
+        *holder = -1;
+        s = ENOENT;
+    } else if(r == SQLITE_ROW) {
+        *holder = sqlite3_column_int64(h->q_getprivholder, 0);
+        s = OK;
+    } else {
+        WARN("Failed to get existing priv holder");
+        *holder = -1;
+        s = FAIL_EINTERNAL;
+    }
+    sqlite3_reset(h->q_getprivholder);
+    return s;
 }
 
 rc_ty sx_hashfs_grant(sx_hashfs_t *h, uint64_t uid, const char *volume, int priv)
@@ -5109,12 +6784,24 @@ rc_ty sx_hashfs_grant(sx_hashfs_t *h, uint64_t uid, const char *volume, int priv
     sqlite3_reset(q);
     const sx_hashfs_volume_t *vol = NULL;
     do {
+        int64_t privholder = -1;
+        char name[SXLIMIT_MAX_USERNAME_LEN+1];
+
 	rc = volume_get_common(h, volume, -1, &vol);
 	if (rc) {
 	    WARN("Cannot retrieve volume id for '%s': %s", volume, rc2str(rc));
 	    break;
 	}
-	if (qbind_int64(q,":uid", uid))
+
+        rc = get_priv_holder(h, uid, volume, &privholder);
+        if(rc != OK && rc != ENOENT) {
+            WARN("Failed to get priv holder");
+            break;
+        }
+        if(rc == ENOENT)
+            privholder = uid;
+        rc = OK;
+	if (qbind_int64(q,":uid", privholder))
 	    break;
 	if (qbind_int64(q,":volid", vol->id))
 	    break;
@@ -5122,7 +6809,12 @@ rc_ty sx_hashfs_grant(sx_hashfs_t *h, uint64_t uid, const char *volume, int priv
 	    break;
 	if (qstep_noret(q))
 	    break;
-	INFO("%s: granted priv %d to %ld on %s", h->dir, priv, (long)uid, volume);
+
+        if(sx_hashfs_uid_get_name(h, uid, name, SXLIMIT_MAX_USERNAME_LEN+1)) {
+            WARN("Failed to get user %lld name", (long long)uid);
+            INFO("Granted '%s' permission to %lld on volume %s", (priv & PRIV_READ ? "read" : "write"), (long long)uid, volume);
+        } else
+            INFO("Granted '%s' permission to '%s' on volume %s", (priv & PRIV_READ ? "read" : "write"), name, volume);
     } while(0);
     sqlite3_reset(q);
     return rc;
@@ -5137,12 +6829,22 @@ rc_ty sx_hashfs_revoke(sx_hashfs_t *h, uint64_t uid, const char *volume, int pri
     sqlite3_reset(q);
     const sx_hashfs_volume_t *vol = NULL;
     do {
+        int64_t privholder;
+        char name[SXLIMIT_MAX_USERNAME_LEN+1];
+
 	rc = volume_get_common(h, volume, -1, &vol);
 	if (rc) {
 	    WARN("Cannot retrieve volume id for '%s': %s", volume, rc2str(rc));
 	    break;
 	}
-	if (qbind_int64(q,":uid", uid))
+        rc = get_priv_holder(h, uid, volume, &privholder);
+        if(rc != OK && rc != ENOENT) {
+            WARN("Failed to get priv holder");
+            break;
+        }
+        if(rc == ENOENT)
+            privholder = uid;
+	if (qbind_int64(q,":uid", privholder))
 	    break;
 	if (qbind_int64(q,":volid", vol->id))
 	    break;
@@ -5150,7 +6852,12 @@ rc_ty sx_hashfs_revoke(sx_hashfs_t *h, uint64_t uid, const char *volume, int pri
 	    break;
 	if (qstep_noret(q))
 	    break;
-	INFO("%s: revoked privmask %d to %ld on %s", h->dir, privmask, (long)uid, volume);
+
+        if(sx_hashfs_uid_get_name(h, uid, name, SXLIMIT_MAX_USERNAME_LEN+1)) {
+            WARN("Failed to get user %lld name", (long long)uid);
+            INFO("Revoked '%s' permission from %lld on volume %s", (~privmask & PRIV_READ ? "read" : "write"), (long long)uid, volume);
+        } else
+	    INFO("Revoked '%s' permission from '%s' on volume %s", (~privmask & PRIV_READ ? "read" : "write"), name, volume);
     } while(0);
     sqlite3_reset(q);
     return rc;
@@ -5247,9 +6954,10 @@ rc_ty sx_hashfs_getfile_begin(sx_hashfs_t *h, const char *volume, const char *fi
 	return FAIL_EINTERNAL;
     }
 
-    h->get_replica = vol->replica_count;
+    h->get_replica = vol->max_replica;
 
     if(filedata) {
+        filedata->volume_id = vol->id;
 	filedata->file_size = size;
 	filedata->block_size = bsize;
 	filedata->nblocks = h->get_nblocks;
@@ -5278,7 +6986,7 @@ rc_ty sx_hashfs_getfile_block(sx_hashfs_t *h, const sx_hash_t **hash, sx_nodelis
      * 1. client -> next: not found
      * 2. prev -> next: move block
      * 3. client -> prev: not found */
-    *nodes = sx_hashfs_hashnodes(h, NL_PREVNEXT, h->get_content, h->get_replica);
+    *nodes = sx_hashfs_effective_hashnodes(h, NL_PREVNEXT, h->get_content, h->get_replica);
     if(!*nodes) {
 	sx_hashfs_getfile_end(h);
 	return FAIL_EINTERNAL;
@@ -5366,105 +7074,134 @@ static rc_ty sx_hashfs_hashop_ishash(sx_hashfs_t *h, unsigned hs, const sx_hash_
     return ret;
 }
 
-static rc_ty sx_hashfs_hashop_moduse(sx_hashfs_t *h, const char *id, unsigned int hs, const sx_hash_t *hash, unsigned replica, int64_t op, uint64_t op_expires_at)
+static rc_ty sx_hashfs_revision_op_internal(sx_hashfs_t *h, unsigned int hs, const sx_hash_t *revision_id, int op, int age)
+{
+    for (unsigned ndb=0;ndb<HASHDBS;ndb++) {
+        sqlite3_stmt *q = h->qb_addtoken[hs][ndb];
+        sqlite3_reset(q);
+        if (qbind_blob(q, ":revision_id", revision_id->b, sizeof(revision_id->b)) ||
+            qbind_int(q, ":op", op) ||
+            qbind_int(q, ":age", age) ||
+            qstep_noret(q)) {
+            sqlite3_reset(q);
+            return FAIL_EINTERNAL;
+        }
+        sqlite3_reset(q);
+    }
+    return OK;
+}
+
+rc_ty sx_hashfs_revision_op(sx_hashfs_t *h, unsigned blocksize, const sx_hash_t *revision_id, int op)
+{
+    unsigned hs;
+    int age;
+    for(hs = 0; hs < SIZES; hs++) {
+        if(blocksize == bsz[hs])
+            break;
+    }
+
+    if(hs == SIZES) {
+        WARN("Failed to get hash size database, blocksize: %u", blocksize);
+        return EINVAL;
+    }
+    age = sxi_hdist_version(h->hd);
+    if (revision_id)
+        DEBUGHASH("revision_op on", revision_id);
+    if (datadb_begin(h, hs))
+        return FAIL_EINTERNAL;
+    if (sx_hashfs_revision_op_internal(h, hs, revision_id, op, age)) {
+        datadb_rollback(h, hs);
+        return FAIL_EINTERNAL;
+    }
+    if (datadb_commit(h, hs))
+        return FAIL_EINTERNAL;
+    DEBUG("ok");
+    return OK;
+}
+
+static rc_ty sx_hashfs_hashop_moduse_internal(sx_hashfs_t *h, const sx_hash_t *revision_id, unsigned int hs, unsigned int ndb, const sx_hash_t *hash, unsigned replica, unsigned age)
+{
+    sqlite3_reset(h->qb_moduse[hs][ndb]);
+    if (qbind_blob(h->qb_moduse[hs][ndb], ":hash", hash, sizeof(*hash)) ||
+            qbind_int(h->qb_moduse[hs][ndb], ":replica", replica) ||
+            qbind_int(h->qb_moduse[hs][ndb], ":age", age) ||
+            qbind_blob(h->qb_moduse[hs][ndb], ":revision_id", revision_id, sizeof(*revision_id)) ||
+            qstep_noret(h->qb_moduse[hs][ndb]))
+        return FAIL_EINTERNAL;
+    sqlite3_reset(h->qb_moduse[hs][ndb]);
+    return OK;
+}
+
+static rc_ty sx_hashfs_hashop_moduse(sx_hashfs_t *h, const sx_hash_t *reserve_id, const sx_hash_t *revision_id, unsigned int hs, const sx_hash_t *hash, unsigned replica, int64_t op, uint64_t op_expires_at)
 {
     unsigned ndb;
-    unsigned int age, n;
-    sx_hash_t reserveid, tokenid;
+    unsigned int age;
     rc_ty ret = FAIL_EINTERNAL;
     /* FIXME: maybe enable this
     if(!is_hash_local(h, hash, replica_count))
 	return ENOENT;*/
 
+    if (!h || !hash) {
+        NULLARG();
+        return EFAULT;
+    }
+    if (hs >= SIZES) {
+        WARN("invalid hash size: %d", hs);
+        return EINVAL;
+    }
     if (!replica) {
-        if (op) {
-            msg_set_reason("replica is zero is only valid for reservations");
-            return EINVAL;
-        }
+        msg_set_reason("replica zero is not valid");
+        return EINVAL;
     }
 
-    if (!op) {
-        if (replica) {
-            msg_set_reason("op=0 is valid only for reservations");
-            return EINVAL;
-        }
-    }
-
-    if (!id) {
-        msg_set_reason("missing id");
+    if (!revision_id) {
+        msg_set_reason("missing revision id");
         return EINVAL;
     }
     ndb = gethashdb(hash);
 
-    sqlite3_reset(h->qb_moduse[hs][ndb]);
-    sqlite3_reset(h->qb_op[hs][ndb]);
+    sqlite3_reset(h->qb_addtoken[hs][ndb]);
     sqlite3_reset(h->qb_reserve[hs][ndb]);
-    sqlite3_reset(h->qb_add_reserve[hs][ndb]);
-    n = strlen(id);
-    if (n != SXI_SHA1_TEXT_LEN && n != SXI_SHA1_TEXT_LEN * 2) {
-        WARN("wrong id length: %d", n);
-        return EINVAL;
-    }
-    /* groupid = either the fileid, or a token.
-     * When there is no activity on the groupid, the reservations on all hashes
-     * from that groupid are dropped */
-    if (hex2bin(id, SXI_SHA1_TEXT_LEN, reserveid.b, sizeof(reserveid.b))) {
-        WARN("Cannot decode hash id: %s", id);
-        return FAIL_EINTERNAL;
-    }
-    if (n == SXI_SHA1_TEXT_LEN*2) {
-        if (hex2bin(id + SXI_SHA1_TEXT_LEN, SXI_SHA1_TEXT_LEN, tokenid.b, sizeof(tokenid.b))) {
-            WARN("Cannot decode hash id: %s", id);
-            return FAIL_EINTERNAL;
-        }
-    } else {
-        memcpy(tokenid.b, reserveid.b, sizeof(tokenid.b));
-    }
-    DEBUG("moduse %lld, groupid: %s", (long long)op, id);
-    DEBUGHASH("reserveid", &reserveid);
-    DEBUGHASH("tokenid", &tokenid);
+    sqlite3_reset(h->qb_moduse[hs][ndb]);
+    DEBUG("moduse %lld", (long long)op);
+    if (reserve_id)
+        DEBUGHASH("reserve_id", reserve_id);
+    if (revision_id)
+        DEBUGHASH("revision_id", revision_id);
     if (qbegin(h->datadb[hs][ndb]))
         return FAIL_EINTERNAL;
     do {
-        if (qbind_blob(h->qb_add_reserve[hs][ndb], ":hash", hash, sizeof(*hash)) ||
-            qstep_noret(h->qb_add_reserve[hs][ndb]))
-            break;
-        sqlite3_reset(h->qb_add_reserve[hs][ndb]);
         if (op) { /* +N or -N */
-            if (qbind_blob(h->qb_del_reserve[hs][ndb], ":reserveid", &reserveid, sizeof(reserveid)) ||
-                qbind_blob(h->qb_del_reserve[hs][ndb], ":hash", hash, sizeof(*hash)) ||
-                qstep_noret(h->qb_del_reserve[hs][ndb]))
-                break;
-            if (qbind_blob(h->qb_op[hs][ndb], ":hash", hash, sizeof(*hash)) ||
-                qbind_blob(h->qb_op[hs][ndb], ":tokenid", &tokenid, sizeof(tokenid)) ||
-                qbind_int(h->qb_op[hs][ndb], ":replica",replica) ||
-                qbind_int64(h->qb_op[hs][ndb], ":op", op) ||
-                qbind_int64(h->qb_op[hs][ndb], ":ttl", op_expires_at) ||
-                qstep_noret(h->qb_op[hs][ndb]))
-                break;
-            sqlite3_reset(h->qb_op[hs][ndb]);
-            age = sxi_hdist_version(h->hd);
-            if (sqlite3_changes(h->datadb[hs][ndb]->handle)) {
-                /* apply only non-dup operations */
-                if (qbind_blob(h->qb_moduse[hs][ndb], ":hash", hash, sizeof(*hash)) ||
-                    qbind_int(h->qb_moduse[hs][ndb], ":replica", replica) ||
-                    qbind_int(h->qb_moduse[hs][ndb], ":age", age) ||
-                    qbind_int64(h->qb_moduse[hs][ndb], ":used", op) ||
-                    qstep_noret(h->qb_moduse[hs][ndb]))
-                    break;
-                DEBUGHASH("moduse on", hash);
-                DEBUG("op: %ld, replica: %d, age: %d", op, replica, age);
+            if (reserve_id) {
+                if (qbind_blob(h->qb_del_reserve[hs][ndb], ":reserve_id", reserve_id, sizeof(*reserve_id)) ||
+                    qstep_noret(h->qb_del_reserve[hs][ndb]))
+                   break;
             }
-            sqlite3_reset(h->qb_moduse[hs][ndb]);
         } else {
             /* reserve */
-            if (qbind_blob(h->qb_reserve[hs][ndb], ":hash", hash, sizeof(*hash)) ||
-                qbind_blob(h->qb_reserve[hs][ndb], ":reserveid", &reserveid, sizeof(reserveid)) ||
+            if (!reserve_id) {
+                WARN("reserve without id!");
+                break;
+            }
+            if (qbind_blob(h->qb_reserve[hs][ndb], ":revision_id", revision_id, sizeof(*revision_id)) ||
+                qbind_blob(h->qb_reserve[hs][ndb], ":reserve_id", reserve_id, sizeof(*reserve_id)) ||
                 qbind_int64(h->qb_reserve[hs][ndb], ":ttl", op_expires_at) ||
                 qstep_noret(h->qb_reserve[hs][ndb]))
                 break;
             sqlite3_reset(h->qb_reserve[hs][ndb]);
         }
+
+        age = sxi_hdist_version(h->hd);
+        if (qbind_blob(h->qb_addtoken[hs][ndb], ":revision_id", revision_id, sizeof(*revision_id)) ||
+            qbind_int(h->qb_addtoken[hs][ndb], ":op", op) ||
+            qbind_int(h->qb_addtoken[hs][ndb], ":age", age) ||
+            qstep_noret(h->qb_addtoken[hs][ndb]))
+            break;
+        sqlite3_reset(h->qb_addtoken[hs][ndb]);
+        DEBUGHASH("moduse on", hash);
+        DEBUG("op: %ld, replica: %d, age: %d", op, replica, age);
+        if (sx_hashfs_hashop_moduse_internal(h, revision_id, hs, ndb, hash, replica, age))
+            break;
         if (qcommit(h->datadb[hs][ndb]))
             break;
         ret = OK;
@@ -5474,7 +7211,7 @@ static rc_ty sx_hashfs_hashop_moduse(sx_hashfs_t *h, const char *id, unsigned in
     return ret;
 }
 
-rc_ty sx_hashfs_hashop_perform(sx_hashfs_t *h, unsigned int block_size, unsigned replica_count, enum sxi_hashop_kind kind, const sx_hash_t *hash, const char *id, uint64_t op_expires_at, int *present)
+rc_ty sx_hashfs_hashop_perform(sx_hashfs_t *h, unsigned int block_size, unsigned replica_count, enum sxi_hashop_kind kind, const sx_hash_t *hash, const sx_hash_t *reserve_id, const sx_hash_t *revision_id, uint64_t op_expires_at, int *present)
 {
     unsigned int hs;
     rc_ty rc;
@@ -5482,11 +7219,15 @@ rc_ty sx_hashfs_hashop_perform(sx_hashfs_t *h, unsigned int block_size, unsigned
     if (UNLIKELY(sxi_log_is_debug(&logger))) {
         char debughash[sizeof(sx_hash_t)*2+1];		\
         bin2hex(hash->b, sizeof(*hash), debughash, sizeof(debughash));	\
-        DEBUG("processing %s, #%s# (id: %s)",
+        DEBUG("processing %s, #%s#",
               kind == HASHOP_RESERVE ? "reserve" :
               kind == HASHOP_INUSE ? "inuse" :
               kind == HASHOP_DELETE ? "decuse" : "??",
-              debughash, id ? id : "");
+              debughash);
+        if (reserve_id)
+            DEBUGHASH("reserve_id: ", reserve_id);
+        if (revision_id)
+            DEBUGHASH("revision_id: ", revision_id);
     }
 
     for(hs = 0; hs < SIZES; hs++)
@@ -5501,15 +7242,15 @@ rc_ty sx_hashfs_hashop_perform(sx_hashfs_t *h, unsigned int block_size, unsigned
             break;
         case HASHOP_RESERVE:
             /* we must always reserve, even if ENOENT */
-            rc = sx_hashfs_hashop_moduse(h, id, hs, hash, 0, 0, op_expires_at);
+            rc = sx_hashfs_hashop_moduse(h, reserve_id, revision_id, hs, hash, replica_count, 0, op_expires_at);
             if (rc == OK)
                 rc = sx_hashfs_hashop_ishash(h, hs, hash);
             break;
         case HASHOP_INUSE:
-            rc = sx_hashfs_hashop_mod(h, hash, id, block_size, replica_count, 1, op_expires_at);
+            rc = sx_hashfs_hashop_mod(h, hash, reserve_id, revision_id, block_size, replica_count, 1, op_expires_at);
             break;
         case HASHOP_DELETE:
-            rc = sx_hashfs_hashop_mod(h, hash, id, block_size, replica_count, -1, op_expires_at);
+            rc = sx_hashfs_hashop_mod(h, hash, reserve_id, revision_id, block_size, replica_count, -1, op_expires_at);
             break;
 
         default:
@@ -5524,7 +7265,7 @@ rc_ty sx_hashfs_hashop_perform(sx_hashfs_t *h, unsigned int block_size, unsigned
     return rc;
 }
 
-rc_ty sx_hashfs_hashop_mod(sx_hashfs_t *h, const sx_hash_t *hash, const char *id, unsigned int bs, unsigned replica, int count, uint64_t op_expires_at)
+rc_ty sx_hashfs_hashop_mod(sx_hashfs_t *h, const sx_hash_t *hash, const sx_hash_t *reserve_id, const sx_hash_t *revision_id, unsigned int bs, unsigned replica, int count, uint64_t op_expires_at)
 {
     unsigned int hs;
     rc_ty rc;
@@ -5535,7 +7276,7 @@ rc_ty sx_hashfs_hashop_mod(sx_hashfs_t *h, const sx_hash_t *hash, const char *id
 	WARN("bad blocksize: %d", bs);
 	return FAIL_BADBLOCKSIZE;
     }
-    rc = sx_hashfs_hashop_moduse(h, id, hs, hash, replica, count, op_expires_at);
+    rc = sx_hashfs_hashop_moduse(h, reserve_id, revision_id, hs, hash, replica, count, op_expires_at);
     if (rc == OK)
         rc = sx_hashfs_hashop_ishash(h, hs, hash);
     return rc;
@@ -5648,31 +7389,15 @@ rc_ty sx_hashfs_block_put(sx_hashfs_t *h, const uint8_t *data, unsigned int bs, 
         DEBUG("r: %d, changes: %d", r, sqlite3_changes(h->datadb[hs][ndb]->handle));
         if (r == SQLITE_DONE && !sqlite3_changes(h->datadb[hs][ndb]->handle)) {
             DEBUG("checking for race condition");
-            /* race condition or missing reserve */
+            /* race condition */
             r = qstep(h->qb_get[hs][ndb]);
             sqlite3_reset(h->qb_get[hs][ndb]);
             if (r == SQLITE_ROW) {
 		DEBUG("Race in block_store, falling back");
                 ret = EAGAIN;
             } else if (r == SQLITE_DONE) {
-                WARNHASH("Hash was not reserved", &hash);
-                sqlite3_reset(h->qb_add_reserve[hs][ndb]);
-                if (qbind_blob(h->qb_add_reserve[hs][ndb], ":hash", &hash, sizeof(hash)) ||
-                    qstep_noret(h->qb_add_reserve[hs][ndb]))
-                    ret = FAIL_EINTERNAL;
-                else {
-                    sqlite3_reset(h->qb_add[hs][ndb]);
-                    r = qstep(h->qb_add[hs][ndb]);
-                    DEBUG("r: %d, changes: %d", r, sqlite3_changes(h->datadb[hs][ndb]->handle));
-                    if (r == SQLITE_DONE && sqlite3_changes(h->datadb[hs][ndb]->handle))
-                        ret = OK;
-                    else {
-                        WARN("r:%d or 0 changes", r);
-                        ret = FAIL_EINTERNAL;
-                    }
-                }
-                sqlite3_reset(h->qb_add[hs][ndb]);
-                sqlite3_reset(h->qb_add_reserve[hs][ndb]);
+                WARNHASH("Impossible: hash cannot be added but is not present either", &hash);
+                ret = FAIL_EINTERNAL;
             } else
                 ret = FAIL_EINTERNAL;
         } else
@@ -5683,7 +7408,7 @@ rc_ty sx_hashfs_block_put(sx_hashfs_t *h, const uint8_t *data, unsigned int bs, 
 	return FAIL_EINTERNAL;
 
     if(propagate && replica_count > 1) {
-	sx_nodelist_t *targets = sx_hashfs_hashnodes(h, NL_NEXT, &hash, replica_count);
+	sx_nodelist_t *targets = sx_hashfs_effective_hashnodes(h, NL_NEXT, &hash, replica_count);
 	rc_ty ret = sx_hashfs_xfer_tonodes(h, &hash, bs, targets);
 	sx_nodelist_delete(targets);
 	return ret;
@@ -5945,7 +7670,7 @@ rc_ty sx_hashfs_putfile_begin(sx_hashfs_t *h, sx_uid_t user_id, const char *volu
     sqlite3_reset(h->qt_new);
 
     h->put_id = sqlite3_last_insert_rowid(sqlite3_db_handle(h->qt_new));
-    h->put_replica = vol->replica_count;
+    h->put_replica = vol->max_replica;
     return sx_hashfs_countjobs(h, user_id);
 }
 
@@ -5970,27 +7695,27 @@ rc_ty sx_hashfs_putfile_extend_begin(sx_hashfs_t *h, sx_uid_t user_id, const uin
     if(memcmp(self_uuid->binary, tkdt.uuid.binary, sizeof(tkdt.uuid.binary)))
 	return EINVAL;
 
-    sqlite3_reset(h->qt_tokenstats);
-    if(qbind_text(h->qt_tokenstats, ":token", tkdt.token))
+    sqlite3_reset(h->qt_tokendata);
+    if(qbind_text(h->qt_tokendata, ":token", tkdt.token))
 	goto putfile_extend_err;
 
-    r = qstep(h->qt_tokenstats);
+    r = qstep(h->qt_tokendata);
     if(r == SQLITE_DONE)
 	ret = ENOENT;
     if(r != SQLITE_ROW)
 	goto putfile_extend_err;
 
-    if((ret = sx_hashfs_volume_by_id(h, sqlite3_column_int64(h->qt_tokenstats, 2), &vol)))
+    if((ret = sx_hashfs_volume_by_id(h, sqlite3_column_int64(h->qt_tokendata, 2), &vol)))
 	goto putfile_extend_err;
 
-    h->put_id = sqlite3_column_int64(h->qt_tokenstats, 0);
-    h->put_replica = vol->replica_count;
-    h->put_extendsize = sqlite3_column_int64(h->qt_tokenstats, 1);
-    h->put_extendfrom = sqlite3_column_int(h->qt_tokenstats, 3) / sizeof(sx_hash_t);
+    h->put_id = sqlite3_column_int64(h->qt_tokendata, 0);
+    h->put_replica = vol->max_replica;
+    h->put_extendsize = sqlite3_column_int64(h->qt_tokendata, 1);
+    h->put_extendfrom = sqlite3_column_bytes(h->qt_tokendata, 4) / sizeof(sx_hash_t);
     ret = sx_hashfs_countjobs(h, user_id);
 
     putfile_extend_err:
-    sqlite3_reset(h->qt_tokenstats);
+    sqlite3_reset(h->qt_tokendata);
     return ret;
 }
 
@@ -6033,7 +7758,7 @@ rc_ty sx_hashfs_putfile_putmeta(sx_hashfs_t *h, const char *key, const void *val
 	    return rc;
 	memcpy(h->meta[h->nmeta].value, value, value_len);
 	h->meta[h->nmeta].value_len = value_len;
-    }	
+    }
 
     memcpy(h->meta[h->nmeta].key, key, strlen(key)+1);
 
@@ -6110,15 +7835,7 @@ static void build_uniq_hash_index(const sx_hash_t *hashes, unsigned *idxs, unsig
     *n = l+1;
 }
 
-static int unique_tmpid(sx_hashfs_t *h, const char *token, sx_hash_t *hash)
-{
-    sx_uuid_t self;
-
-    if (sx_hashfs_self_uuid(h, &self))
-        return 1;
-    return hash_buf(self.binary, sizeof(self.binary), token, strlen(token), hash);
-}
-
+/* TODO: use volume name */
 static int reserve_fileid(sx_hashfs_t *h, int64_t volume_id, const char *name, sx_hash_t *hash)
 {
     int ret = 0;
@@ -6134,6 +7851,32 @@ static int reserve_fileid(sx_hashfs_t *h, int64_t volume_id, const char *name, s
         !sxi_sha1_final(hash_ctx, hash->b, NULL)) {
         ret = 1;
     }
+
+    sxi_md_cleanup(&hash_ctx);
+    return ret;
+}
+
+int sx_unique_fileid(sxc_client_t *sx, const sx_hashfs_volume_t *volume, const char *name, const char *revision, sx_hash_t *fileid)
+{
+    int ret = 0;
+    if (!name || !revision || !fileid) {
+        NULLARG();
+        return 1;
+    }
+    sxi_md_ctx *hash_ctx = sxi_md_init();
+    if (!hash_ctx)
+        return 1;
+    if (!sxi_sha1_init(hash_ctx))
+        return 1;
+
+    DEBUG("fileid input: %s, %s, %s", volume->name, name, revision);
+    if (!sxi_sha1_update(hash_ctx, volume->name, strlen(volume->name) + 1) ||
+        !sxi_sha1_update(hash_ctx, name, strlen(name) + 1) ||
+        !sxi_sha1_update(hash_ctx, revision, strlen(revision)) ||
+        !sxi_sha1_final(hash_ctx, fileid->b, NULL)) {
+        ret = 1;
+    }
+    DEBUGHASH("FILEID", fileid);
 
     sxi_md_cleanup(&hash_ctx);
     return ret;
@@ -6202,7 +7945,7 @@ rc_ty sx_hashfs_putfile_gettoken(sx_hashfs_t *h, const uint8_t *user, int64_t si
 	/* Lookup first node */
 	for(i=0; i<h->put_putblock; i++) {
 	    /* We (via hash_nidx_tobuf) check presence on the ultimate target nodes, i.e. NL_NEXT */
-	    if(hash_nidx_tobuf(h, &h->put_blocks[h->put_hashnos[i]], 1, &h->put_nidxs[h->put_hashnos[i]]))
+	    if(hash_nidx_tobuf(h, &h->put_blocks[h->put_hashnos[i]], 1, h->put_replica, &h->put_nidxs[h->put_hashnos[i]]) < 1)
 		goto gettoken_err;
 	}
 	if(h->put_putblock > 1) {
@@ -6271,10 +8014,16 @@ rc_ty sx_hashfs_putfile_gettoken(sx_hashfs_t *h, const uint8_t *user, int64_t si
 	goto gettoken_err;
 
 
-    if (reserve_fileid(h, sqlite3_column_int64(h->qt_gettoken, 2), (const char*)sqlite3_column_text(h->qt_gettoken, 3), &h->put_reserve_id))
+    int volid = sqlite3_column_int64(h->qt_gettoken, 2);
+    const char *name = (const char*)sqlite3_column_text(h->qt_gettoken, 3);
+    const char *revision = (const char*)sqlite3_column_text(h->qt_gettoken, 4);
+    const sx_hashfs_volume_t *vol;
+    if (reserve_fileid(h, volid, name, &h->put_reserve_id) ||
+        sx_hashfs_volume_by_id(h, volid, &vol) ||
+        sx_unique_fileid(h->sx, vol, name, revision, &h->put_revision_id))
         goto gettoken_err;
-    DEBUGHASH("file initial PUT reserveid", &h->put_reserve_id);
-    sxi_hashop_begin(&h->hc, h->sx_clust, hdck_cb, HASHOP_RESERVE, 0, NULL, &h->put_reserve_id, hdck_cb_ctx, expires_at);
+    DEBUGHASH("file initial PUT reserve_id", &h->put_reserve_id);
+    sxi_hashop_begin(&h->hc, h->sx_clust, hdck_cb, HASHOP_RESERVE, vol->max_replica, &h->put_reserve_id, &h->put_revision_id, hdck_cb_ctx, expires_at);
     sqlite3_reset(h->qt_gettoken);
     return OK;
 
@@ -6284,6 +8033,93 @@ rc_ty sx_hashfs_putfile_gettoken(sx_hashfs_t *h, const uint8_t *user, int64_t si
     sqlite3_reset(q);
     sqlite3_reset(h->qt_gettoken);
     return ret;
+}
+
+static rc_ty delete_old_revs_common(sx_hashfs_t *h, const sx_hashfs_volume_t *volume, const char *name, const char *revision, int make_place, unsigned int *deletes_scheduled) {
+    int r;
+    int mdb;
+    unsigned int scheduled = 0;
+
+    if(!volume || !name) {
+        NULLARG();
+        return EINVAL;
+    }
+
+    mdb = getmetadb(name);
+    if(mdb < 0 || mdb >= METADBS) {
+        WARN("Failed to get meta db index");
+        return FAIL_EINTERNAL;
+    }
+
+    /* Count old file revisions */
+    sqlite3_reset(h->qm_oldrevs[mdb]);
+    if(qbind_int64(h->qm_oldrevs[mdb], ":volume", volume->id) ||
+       qbind_text(h->qm_oldrevs[mdb], ":name", name))
+        return FAIL_EINTERNAL;
+
+    r = qstep(h->qm_oldrevs[mdb]);
+    if(r == SQLITE_ROW) {
+        unsigned int nrevs = sqlite3_column_int(h->qm_oldrevs[mdb], 2);
+        rc_ty rc = OK;
+        job_t job = JOB_NOPARENT;
+
+        /* There are some revs */
+        while(nrevs >= volume->revisions + (make_place ? 0 : 1)) {
+            const char *tooold_rev = (const char *)sqlite3_column_text(h->qm_oldrevs[mdb], 0);
+
+            if(!tooold_rev) {
+                WARN("NULL old revision");
+                msg_set_reason("Invalid old revision");
+                break;
+            }
+
+            if(revision) { /* If revision is given, then check if it is not outdated */
+                if(strcmp(revision, (const char *)sqlite3_column_text(h->qm_oldrevs[mdb], 0)) < 0) {
+                    msg_set_reason("Newer copies of this file already exist");
+                    rc = EINVAL;
+                    break;
+                }
+            }
+
+            rc = sx_hashfs_filedelete_job(h, 0, volume, name, tooold_rev, &job);
+            if(rc == EEXIST)
+                rc = OK;
+            else if(rc) {
+                msg_set_reason("Failed to mark older file revision '%s' for deletion", tooold_rev);
+                break;
+            }
+
+            scheduled++;
+            nrevs--;
+            if(!nrevs)
+                break;
+
+            r = qstep(h->qm_oldrevs[mdb]);
+            if(r != SQLITE_ROW) {
+                msg_set_reason("There was a problem enumerating current revisions of the file");
+                rc = FAIL_EINTERNAL;
+                break;
+            }
+        }
+
+        sqlite3_reset(h->qm_oldrevs[mdb]);
+        if(rc)
+            return rc;
+        /* Yay we have a slot now */
+    } else {
+        sqlite3_reset(h->qm_oldrevs[mdb]);
+        if(r != SQLITE_DONE) /* Something didn't quite work */
+            return FAIL_EINTERNAL;
+        /* There are no existing revs */
+    }
+
+    if(deletes_scheduled)
+        *deletes_scheduled = scheduled;
+    return OK;
+}
+
+rc_ty sx_hashfs_delete_old_revs(sx_hashfs_t *h, const sx_hashfs_volume_t *volume, const char *name, unsigned int *deletes_scheduled) {
+    return delete_old_revs_common(h, volume, name, NULL, 0, deletes_scheduled);
 }
 
 /* WARNING: MUST BE CALLED WITHIN A TANSACTION ON META !!! */
@@ -6341,83 +8177,38 @@ static rc_ty create_file(sx_hashfs_t *h, const sx_hashfs_volume_t *volume, const
     }
     sqlite3_reset(q);
 
-    /* Count current file revisions */
-    sqlite3_reset(h->qm_oldrevs[mdb]);
-    if(qbind_int64(h->qm_oldrevs[mdb], ":volume", volume->id) ||
-       qbind_text(h->qm_oldrevs[mdb], ":name", name))
-	return FAIL_EINTERNAL;
-
-    r = qstep(h->qm_oldrevs[mdb]);
-    if(r == SQLITE_ROW) {
-	int nrevs = sqlite3_column_int(h->qm_oldrevs[mdb], 2);
-	rc_ty rc = OK;
-	job_t job = JOB_NOPARENT;
-
-	/* There are some revs */
-	while(nrevs >= volume->revisions) {
-	    const char *tooold_rev = (const char *)sqlite3_column_text(h->qm_oldrevs[mdb], 0);
-	    
-	    if(strcmp(revision, (const char *)sqlite3_column_text(h->qm_oldrevs[mdb], 0)) < 0) {
-		msg_set_reason("Newer copies of this file already exist");
-		rc = EINVAL;
-		break;
-	    }
-
-	    rc = sx_hashfs_filedelete_job(h, 0, volume, name, tooold_rev, &job);
-	    if(rc == EEXIST)
-		rc = OK;
-	    else if(rc) {
-		msg_set_reason("Failed to mark older older file revision '%s' for deletion", tooold_rev);
-		break;
-	    }
-
-	    nrevs--;
-	    if(!nrevs)
-		break;
-
-	    r = qstep(h->qm_oldrevs[mdb]);
-	    if(r != SQLITE_ROW) {
-		msg_set_reason("There was a problem enumerating current revisions of the file");
-		rc = FAIL_EINTERNAL;
-		break;
-	    }
-	}	
-
-        sqlite3_reset(h->qm_oldrevs[mdb]);
-	if(rc)
-	    return rc;
-        /* Yay we have a slot now */
-    } else {
-	sqlite3_reset(h->qm_oldrevs[mdb]);
-	if(r != SQLITE_DONE) /* Something didn't quite work */
-	    return FAIL_EINTERNAL;
-
-	/* There are no existing revs */
+    /* Drop old exisiting revisions of the file */
+    if(delete_old_revs_common(h, volume, name, revision, 1, NULL) != OK) {
+        WARN("Failed to remove old revisions");
+        return FAIL_EINTERNAL;
     }
 
+    sx_hash_t revision_id;
     sqlite3_reset(h->qm_ins[mdb]);
     if(qbind_int64(h->qm_ins[mdb], ":volume", volume->id) ||
        qbind_text(h->qm_ins[mdb], ":name", name) ||
        qbind_text(h->qm_ins[mdb], ":revision", revision) ||
+       sx_unique_fileid(sx_hashfs_client(h), volume, name, revision, &revision_id) ||
+       qbind_blob(h->qm_ins[mdb], ":revision_id", &revision_id, sizeof(revision_id)) ||
        qbind_int64(h->qm_ins[mdb], ":size", size) ||
+       qbind_int64(h->qm_ins[mdb], ":age", sxi_hdist_version(h->hd)) ||
        qbind_blob(h->qm_ins[mdb], ":hashes", nblocks ? (const void *)blocks : "", nblocks * sizeof(blocks[0]))) {
 	WARN("Failed to create file '%s' on volume '%s'", name, volume->name);
 	sqlite3_reset(h->qm_ins[mdb]);
 	return FAIL_EINTERNAL;
     }
 
-    r = qstep(h->qm_ins[mdb]);
-    sqlite3_reset(h->qm_ins[mdb]);
-    if(r != SQLITE_DONE) {
+    if (qstep_noret(h->qm_ins[mdb])) {
 	WARN("Failed to create file '%s' on volume '%s'", name, volume->name);
 	return FAIL_EINTERNAL;
     }
+    sqlite3_reset(h->qm_ins[mdb]);
 
     if(file_id)
 	*file_id = sqlite3_last_insert_rowid(sqlite3_db_handle(h->qm_ins[mdb]));
 
     /* Update volume size counter only when size is positive and this node is not becoming a volnode */
-    if(!is_new_volnode(h, volume) && sx_hashfs_update_volume_cursize(h, volume->id, totalsize)) {
+    if(sx_hashfs_update_volume_cursize(h, volume->id, totalsize)) {
         WARN("Failed to update volume size");
         return FAIL_EINTERNAL;
     }
@@ -6525,7 +8316,7 @@ static rc_ty are_blocks_available(sx_hashfs_t *h, sx_hash_t *hashes,
      * count: number of hashes in the list (also the numer of items in hashnos the number of items per replica in nidxs)
      * hash_size: the size (small, medium, big) of the hashes in hashes
      * check_replica: which set to check (1 <= check_replica <= replica_count)
-     * replica_count: the number of replica sets
+     * replica_count: the number of replica sets (max replica!)
      */
 
     /* MODHDIST:
@@ -6537,7 +8328,7 @@ static rc_ty are_blocks_available(sx_hashfs_t *h, sx_hash_t *hashes,
      * A better approach would be to check presence on _prev, then _next and merge the results.
      * This is however not possible without a major api rework :(
      */
-    const sx_nodelist_t *nodes = sx_hashfs_nodelist(h, NL_NEXT);
+    const sx_nodelist_t *nodes = sx_hashfs_all_nodes(h, NL_NEXT);
     unsigned int check_item = *current;
     unsigned int thisnode, nextnode, prevnode = nidxs[replica_count * hashnos[check_item] + check_replica - 1];
 
@@ -6568,7 +8359,7 @@ static rc_ty are_blocks_available(sx_hashfs_t *h, sx_hash_t *hashes,
 	*current = check_item+1;
         if (sxi_hashop_batch_flush(hdck))
             WARN("Failed to query hash: %s", sxc_geterrmsg(h->sx));
-        rc = sx_hashfs_hashop_perform(h, bsz[hash_size], replica_count, hdck->kind, hash, hdck->id, hdck->op_expires_at, NULL);
+        rc = sx_hashfs_hashop_perform(h, bsz[hash_size], hdck->replica, hdck->kind, hash, &hdck->reserve_id, &hdck->revision_id, hdck->op_expires_at, NULL);
         if(rc != OK) {
             WARN("hashop_perform/finish failed: %s", rc2str(rc));
             return rc;
@@ -6593,6 +8384,25 @@ static rc_ty are_blocks_available(sx_hashfs_t *h, sx_hash_t *hashes,
 	WARN("failed to get nodelist");
 	return FAIL_EINTERNAL;
     }
+    if(sx_nodelist_lookup(h->ignored_nodes, sx_node_uuid(node))) {
+	sx_hash_t *hash = &hashes[hashnos[check_item]];
+	*current = check_item+1;
+        if (sxi_hashop_batch_flush(hdck))
+            WARN("Failed to query hash: %s", sxc_geterrmsg(h->sx));
+	if (hdck->cb) {
+	    char thash[SXI_SHA1_TEXT_LEN + 1];
+	    if (bin2hex(hash->b, SXI_SHA1_BIN_LEN, thash, sizeof(thash))) {
+		WARN("bin2hex failed for hash");
+		return FAIL_EINTERNAL;
+	    }
+	    if (hdck->cb(thash, check_item, 444, hdck->context) == -1) {
+		WARN("callback returned failure");
+		return FAIL_EINTERNAL;
+	    }
+	}
+	return OK;
+    }
+
     const char *host = sx_node_internal_addr(node);
     DEBUG("preparing request to %s, node #%d, replica count: %d, current replica: %d", host, prevnode, replica_count,
           check_replica);
@@ -6616,7 +8426,7 @@ static rc_ty are_blocks_available(sx_hashfs_t *h, sx_hash_t *hashes,
     return OK;
 }
 
-rc_ty reserve_replicas(sx_hashfs_t *h, uint64_t op_expires_at)
+static rc_ty reserve_replicas(sx_hashfs_t *h, uint64_t op_expires_at)
 {
     /*
      * assign more understandable names to pointers and counters
@@ -6628,32 +8438,38 @@ rc_ty reserve_replicas(sx_hashfs_t *h, uint64_t op_expires_at)
     unsigned uniq_count = h->put_putblock;
     if (!uniq_count)
         return OK;
-    unsigned int *node_indexes = wrap_malloc((1+h->put_replica) * h->put_nblocks * sizeof(*node_indexes));
-    unsigned hash_size = h->put_hs;
+    unsigned hash_size = h->put_hs, effective_replica = h->put_replica - sx_nodelist_count(h->ignored_nodes);
+    unsigned int *node_indexes = wrap_malloc((1+effective_replica) * h->put_nblocks * sizeof(*node_indexes));
+
     if (!node_indexes)
         return ENOMEM;
 
     unsigned i;
     for(i=0; i<uniq_count; i++) {
 	/* MODHDIST: pick from _next, bidx=0 */
-	if(hash_nidx_tobuf(h, &all_hashes[uniq_hash_indexes[i]],
-                           h->put_replica, &node_indexes[uniq_hash_indexes[i]*h->put_replica])) {
+	if(hash_nidx_tobuf(
+			   h,
+			   &all_hashes[uniq_hash_indexes[i]],
+			   effective_replica,
+			   h->put_replica,
+			   &node_indexes[uniq_hash_indexes[i]*effective_replica]
+			   ) < effective_replica) {
 	    WARN("hash_nidx_tobuf failed");
             ret = FAIL_EINTERNAL;
 	}
     }
     DEBUG("reserve_replicas begin");
-    for(i=2; ret == OK && i<=h->put_replica; i++) {
+    for(i=2; ret == OK && i<=effective_replica; i++) {
         unsigned int cur_item = 0;
-        sort_by_node_then_hash(all_hashes, uniq_hash_indexes, node_indexes, uniq_count, i, h->put_replica);
+        sort_by_node_then_hash(all_hashes, uniq_hash_indexes, node_indexes, uniq_count, i, effective_replica);
         memset(hashop, 0, sizeof(*hashop));
-        DEBUGHASH("reserve_replicas reserveid", &h->put_reserve_id);
+        DEBUGHASH("reserve_replicas reserve_id", &h->put_reserve_id);
         sxi_hashop_begin(hashop, h->sx_clust, NULL,
-                         HASHOP_RESERVE, 0, NULL, &h->put_reserve_id, NULL, op_expires_at);
+                         HASHOP_RESERVE, h->put_replica, &h->put_reserve_id, &h->put_revision_id, NULL, op_expires_at);
         while((ret = are_blocks_available(h, all_hashes, hashop,
                                           uniq_hash_indexes, node_indexes,
                                           &cur_item, uniq_count, hash_size,
-                                          i, h->put_replica)) == OK) {
+                                          i, effective_replica)) == OK) {
             if(cur_item >= uniq_count)
                 break;
         }
@@ -6741,15 +8557,17 @@ unsigned int sx_hashfs_job_file_timeout(sx_hashfs_t *h, unsigned int ndests, uin
 }
 
 rc_ty sx_hashfs_putfile_commitjob(sx_hashfs_t *h, const uint8_t *user, sx_uid_t user_id, const char *token, job_t *job_id) {
-    unsigned int expected_blocks, actual_blocks, ndests;
+    unsigned int expected_blocks, actual_blocks, ndests, blocksize;
     int64_t tmpfile_id, expected_size, volid;
-    rc_ty ret = FAIL_EINTERNAL, ret2;
-    sx_nodelist_t *singlenode = NULL, *volnodes = NULL;
+    rc_ty ret;
+    sx_nodelist_t *singlenode = NULL, *volnodes = NULL, *revisionnodes = NULL;
     const sx_hashfs_volume_t *vol;
     const sx_uuid_t *self_uuid;
     const sx_node_t *self;
     struct token_data tkdt;
-    int r, has_begun = 0;
+    const char *fname;
+    sqlite3_stmt *q;
+    int ndb, r, has_begun = 0;
 
     if(!h || !user || !job_id) {
 	NULLARG();
@@ -6779,45 +8597,122 @@ rc_ty sx_hashfs_putfile_commitjob(sx_hashfs_t *h, const uint8_t *user, sx_uid_t 
 	return ret;
     }
 
-    if(qbegin(h->tempdb))
+    if(qbegin(h->tempdb)) {
+	ret = FAIL_EINTERNAL;
 	goto putfile_commitjob_err;
+    }
     has_begun = 1;
 
-    sqlite3_reset(h->qt_tokenstats);
-    if(qbind_text(h->qt_tokenstats, ":token", tkdt.token))
+    sqlite3_reset(h->qt_tokendata);
+    if(qbind_text(h->qt_tokendata, ":token", tkdt.token)) {
+	ret = FAIL_EINTERNAL;
 	goto putfile_commitjob_err;
-    r = qstep(h->qt_tokenstats);
+    }
+    r = qstep(h->qt_tokendata);
     if(r == SQLITE_DONE) {
         msg_set_reason("Token is unknown or already flushed");
 	ret = ENOENT;
+	goto putfile_commitjob_err;
     }
-    if(r != SQLITE_ROW)
+    if(r != SQLITE_ROW) {
+	ret = FAIL_EINTERNAL;
 	goto putfile_commitjob_err;
+    }
 
-    tmpfile_id = sqlite3_column_int64(h->qt_tokenstats, 0);
-    expected_size = sqlite3_column_int64(h->qt_tokenstats, 1);
-    volid = sqlite3_column_int64(h->qt_tokenstats, 2);
-    ret2 = sx_hashfs_volume_by_id(h, volid, &vol);
-    if(ret2) {
+    tmpfile_id = sqlite3_column_int64(h->qt_tokendata, 0);
+    expected_size = sqlite3_column_int64(h->qt_tokendata, 1);
+    volid = sqlite3_column_int64(h->qt_tokendata, 2);
+    fname = (const char *)sqlite3_column_text(h->qt_tokendata, 3);
+    actual_blocks = sqlite3_column_bytes(h->qt_tokendata, 4);
+    ret = sx_hashfs_volume_by_id(h, volid, &vol);
+    if(ret) {
 	WARN("Cannot locate volume %lld for tmp file %lld", (long long)volid, (long long)tmpfile_id);
-	ret = ret2;
 	goto putfile_commitjob_err;
+    }
+
+    ndb = getmetadb(fname);
+    q = h->qm_get[ndb];
+    sqlite3_reset(q);
+    if(qbind_int64(q, ":volume", volid) || qbind_text(q, ":name", fname)) {
+	WARN("Failed to lookup latest revision for tmpfile %lld", (long long)tmpfile_id);
+	sqlite3_reset(q);
+	ret = FAIL_EINTERNAL;
+	goto putfile_commitjob_err;
+    }
+    r = qstep(q);
+    if(r == SQLITE_ROW) {
+	/* Don't create a new revision if the file hasn't changed */
+	if(expected_size == sqlite3_column_int64(q, 1) &&
+	   actual_blocks == sqlite3_column_bytes(q, 2) &&
+	   (actual_blocks == 0 || !memcmp(sqlite3_column_blob(q, 2), sqlite3_column_blob(h->qt_tokendata, 4), actual_blocks))) {
+	    int64_t fid = sqlite3_column_int64(q, 0);
+	    sxc_meta_t *fmeta;
+	    unsigned int i;
+
+	    sqlite3_reset(q);
+	    if((ret = fill_filemeta(h, ndb, fid)))
+		goto putfile_commitjob_err;
+	    if(!(fmeta = sxc_meta_new(h->sx))) {
+		ret = ENOMEM;
+		goto putfile_commitjob_err;
+	    }
+
+	    if((ret = sx_hashfs_tmp_getmeta(h, tmpfile_id, fmeta))) {
+		sxc_meta_free(fmeta);
+		goto putfile_commitjob_err;
+	    }
+	    for(i=0; i < h->nmeta; i++) {
+		const void *v;
+		unsigned int vlen;
+
+		/* if(!strcmp(h->meta[i].key, "attribsAtime")) continue; */
+		if(sxc_meta_getval(fmeta, h->meta[i].key, &v, &vlen))
+		    break;
+		if(h->meta[i].value_len != vlen || memcmp(h->meta[i].value, v, vlen))
+		    break;
+	    }
+	    sxc_meta_free(fmeta);
+	    if(i >= h->nmeta) {
+		if((ret = sx_hashfs_tmp_delete(h, tmpfile_id)))
+		    goto putfile_commitjob_err;
+		if((ret = sx_hashfs_job_new(h, user_id, job_id, JOBTYPE_DUMMY, 3600, NULL, NULL, 0, singlenode)))
+		    goto putfile_commitjob_err;
+		if(qcommit(h->tempdb))
+		    ret = FAIL_EINTERNAL;
+		else
+		    ret = OK;
+		goto putfile_commitjob_err;
+	    }
+	}
+	r = SQLITE_DONE;
+    }
+
+    sqlite3_reset(q);
+    if(r != SQLITE_DONE) {
+	WARN("Failed to lookup latest revision for tmpfile %lld, %d", (long long)tmpfile_id, r);
+	ret = FAIL_EINTERNAL;
+	goto putfile_commitjob_err;
+    }
+
+    if (revision_spec.nodes(h, NULL, &revisionnodes)) {
+        WARN("cannot allocate nodes");
+        ret = FAIL_EINTERNAL;
+        goto putfile_commitjob_err;
     }
     /* Flushed tempfiles are propagated to all volnodes (both PREV and NEXT),
      * in no particular order (NL_PREVNEXT would be fine as well) */
-    ret2 = sx_hashfs_volnodes(h, NL_NEXTPREV, vol, 0, &volnodes, NULL);
-    if(ret2) {
+    ret = sx_hashfs_effective_volnodes(h, NL_NEXTPREV, vol, 0, &volnodes, NULL);
+    if(ret) {
 	WARN("Cannot determine volume nodes for '%s'", vol->name);
-	ret = ret2;
 	goto putfile_commitjob_err;
     }
-    actual_blocks = sqlite3_column_int64(h->qt_tokenstats, 3);
     if(actual_blocks % sizeof(sx_hash_t)) {
 	msg_set_reason("Corrupted token data");
+	ret = FAIL_EINTERNAL;
 	goto putfile_commitjob_err;
     }
     actual_blocks /= sizeof(sx_hash_t);
-    expected_blocks = size_to_blocks(expected_size, NULL, NULL);
+    expected_blocks = size_to_blocks(expected_size, NULL, &blocksize);
     if(actual_blocks != expected_blocks) {
 	/* File was not extended enough to match its size */
 	msg_set_reason("Token not extended to its final size");
@@ -6829,40 +8724,47 @@ rc_ty sx_hashfs_putfile_commitjob(sx_hashfs_t *h, const uint8_t *user, sx_uid_t 
     if(qbind_int64(h->qt_flush, ":id", tmpfile_id) ||
        qstep_noret(h->qt_flush)) {
 	/* The job itself will fail in case a token is still present */
+	ret = FAIL_EINTERNAL;
 	goto putfile_commitjob_err;
     }
 
     ndests = sx_nodelist_count(volnodes);
-    ret2 = sx_hashfs_job_new_begin(h);
-    if(ret2) {
+    ret = sx_hashfs_job_new_begin(h);
+    if(ret) {
         INFO("Failed to begin jobadd");
-	ret = ret2;
 	goto putfile_commitjob_err;
     }
 
-    ret2 = sx_hashfs_job_new_notrigger(h, JOB_NOPARENT, user_id, job_id, JOBTYPE_REPLICATE_BLOCKS, sx_hashfs_job_file_timeout(h, ndests, expected_size), token, &tmpfile_id, sizeof(tmpfile_id), singlenode);
-    if(ret2) {
-        INFO("job_new (replicate) returned: %s", rc2str(ret2));
-	ret = ret2;
+    ret = sx_hashfs_job_new_notrigger(h, JOB_NOPARENT, user_id, job_id, JOBTYPE_REPLICATE_BLOCKS, sx_hashfs_job_file_timeout(h, ndests, expected_size), token, &tmpfile_id, sizeof(tmpfile_id), singlenode);
+    if(ret) {
+        INFO("job_new (replicate) returned: %s", rc2str(ret));
 	goto putfile_commitjob_err;
     }
 
-    ret2 = sx_hashfs_job_new_notrigger(h, *job_id, user_id, job_id, JOBTYPE_FLUSH_FILE, 60*ndests, token, &tmpfile_id, sizeof(tmpfile_id), volnodes);
-    if(ret2) {
-        INFO("job_new (flush) returned: %s", rc2str(ret2));
-	ret = ret2;
+    /* when flush fails we need to undo the parent job which was targeted to
+     * all (revision) nodes, so we need to target the flush jub to all nodes.
+     * In the request/commit we'll skip the non-volnode nodes */
+    ret = sx_hashfs_job_new_notrigger(h, *job_id, user_id, job_id, JOBTYPE_FLUSH_FILE_REMOTE, 60*ndests, token, &tmpfile_id, sizeof(tmpfile_id), revisionnodes);
+    if(ret) {
+        INFO("job_new (flush remote) returned: %s", rc2str(ret));
+	goto putfile_commitjob_err;
+    }
+    ret = sx_hashfs_job_new_notrigger(h, *job_id, user_id, job_id, JOBTYPE_FLUSH_FILE_LOCAL, 60, token, &tmpfile_id, sizeof(tmpfile_id), revisionnodes);
+    if(ret) {
+        INFO("job_new (flush local) returned: %s", rc2str(ret));
 	goto putfile_commitjob_err;
     }
 
-    ret2 = sx_hashfs_job_new_end(h);
-    if(ret2) {
+    ret = sx_hashfs_job_new_end(h);
+    if(ret) {
         INFO("Failed to commit jobadd");
-	ret = ret2;
 	goto putfile_commitjob_err;
     }
 
-    if(qcommit(h->tempdb))
+    if(qcommit(h->tempdb)) {
+	ret = FAIL_EINTERNAL;
 	goto putfile_commitjob_err;
+    }
 
     ret = OK;
     sx_hashfs_job_trigger(h);
@@ -6871,8 +8773,9 @@ rc_ty sx_hashfs_putfile_commitjob(sx_hashfs_t *h, const uint8_t *user, sx_uid_t 
     if(ret != OK && has_begun)
 	qrollback(h->tempdb);
 
-    sqlite3_reset(h->qt_tokenstats);
+    sqlite3_reset(h->qt_tokendata);
 
+    sx_nodelist_delete(revisionnodes);
     sx_nodelist_delete(volnodes);
     sx_nodelist_delete(singlenode);
 
@@ -6900,7 +8803,7 @@ static int tmp_getmissing_cb(const char *hexhash, unsigned int index, int code, 
           index, blockno,
           mis->current_replica-1, sx_node_internal_addr(pusher), pushingidx, mis->replica_count, mis->current_replica);
     DEBUG("remote hash #%.*s#: %d", SXI_SHA1_TEXT_LEN, hexhash, code);
-    if(code != 200 && code != 404)
+    if(code != 200 && code != 404 && code != 444)
 	return 0;
 
     if(index >= mis->nuniq) {
@@ -6917,7 +8820,7 @@ static int tmp_getmissing_cb(const char *hexhash, unsigned int index, int code, 
 	return -1;
     }
 
-    int changeto = code == 200 ? 1 : -1;
+    int changeto = code != 404 ? 1 : -1;
     if(mis->avlblty[blockno * mis->replica_count + mis->current_replica - 1] != changeto) {
 	mis->avlblty[blockno * mis->replica_count + mis->current_replica - 1] = changeto;
 	mis->somestatechanged = 1;
@@ -6930,27 +8833,7 @@ static int tmp_getmissing_cb(const char *hexhash, unsigned int index, int code, 
     return 0;
 }
 
-static int unique_fileid(sxc_client_t *sx, const sx_hashfs_volume_t *volume, const char *name, const char *revision, sx_hash_t *fileid)
-{
-    int ret = 0;
-    sxi_md_ctx *hash_ctx = sxi_md_init();
-    if (!hash_ctx)
-        return 1;
-    if (!sxi_sha1_init(hash_ctx))
-        return 1;
-
-    if (!sxi_sha1_update(hash_ctx, volume->name, strlen(volume->name) + 1) ||
-        !sxi_sha1_update(hash_ctx, name, strlen(name) + 1) ||
-        !sxi_sha1_update(hash_ctx, revision, strlen(revision)) ||
-        !sxi_sha1_final(hash_ctx, fileid->b, NULL)) {
-        ret = 1;
-    }
-
-    sxi_md_cleanup(&hash_ctx);
-    return ret;
-}
-
-rc_ty sx_hashfs_tmp_getinfo(sx_hashfs_t *h, int64_t tmpfile_id, sx_hashfs_tmpinfo_t **tmpinfo, int recheck_presence, uint64_t op_expires_at) {
+rc_ty sx_hashfs_tmp_getinfo(sx_hashfs_t *h, int64_t tmpfile_id, sx_hashfs_tmpinfo_t **tmpinfo, int recheck_presence) {
     unsigned int contentsz, nblocks, bs, nuniqs, i, hash_size, navl;
     const unsigned int *uniqs;
     const sx_hashfs_volume_t *volume;
@@ -6962,6 +8845,7 @@ rc_ty sx_hashfs_tmp_getinfo(sx_hashfs_t *h, int64_t tmpfile_id, sx_hashfs_tmpinf
     int64_t file_size;
     int r;
     char token[TOKEN_RAND_BYTES*2 + 1];
+    sqlite3_stmt *q;
 
     if(!h || !tmpinfo) {
 	NULLARG();
@@ -6970,11 +8854,12 @@ rc_ty sx_hashfs_tmp_getinfo(sx_hashfs_t *h, int64_t tmpfile_id, sx_hashfs_tmpinf
     DEBUG("tmp_getinfo for file %ld", tmpfile_id);
 
     /* Get tmp data */
-    sqlite3_reset(h->qt_tmpdata);
-    if(qbind_int64(h->qt_tmpdata, ":id", tmpfile_id))
+    q = h->qt_tmpdata;
+    sqlite3_reset(q);
+    if(qbind_int64(q, ":id", tmpfile_id))
 	goto getmissing_err;
 
-    r = qstep(h->qt_tmpdata);
+    r = qstep(q);
     if(r == SQLITE_DONE) {
 	msg_set_reason("Token not found");
 	ret = ENOENT;
@@ -6984,7 +8869,7 @@ rc_ty sx_hashfs_tmp_getinfo(sx_hashfs_t *h, int64_t tmpfile_id, sx_hashfs_tmpinf
 	goto getmissing_err;
     }
 
-    if(sqlite3_column_int(h->qt_tmpdata, 6) == 0) {
+    if(sqlite3_column_int(q, 6) == 0) {
 	/* Not yet flushed, need to retry later */
 	msg_set_reason("Token not ready yet");
 	ret = EAGAIN;
@@ -6992,7 +8877,7 @@ rc_ty sx_hashfs_tmp_getinfo(sx_hashfs_t *h, int64_t tmpfile_id, sx_hashfs_tmpinf
     }
 
     /* Quickly validate tmp data */
-    revision = (const char *)sqlite3_column_text(h->qt_tmpdata, 0);
+    revision = (const char *)sqlite3_column_text(q, 0);
     if(!revision || strlen(revision) >= sizeof(tbd->revision)) {
 	WARN("Tmpfile with %s revision", revision ? "bad" : "NULL");
 	msg_set_reason("Internal corruption detected (bad revision)");
@@ -7000,14 +8885,14 @@ rc_ty sx_hashfs_tmp_getinfo(sx_hashfs_t *h, int64_t tmpfile_id, sx_hashfs_tmpinf
 	goto getmissing_err;
     }
 
-    if((ret2 = sx_hashfs_volume_by_id(h, sqlite3_column_int64(h->qt_tmpdata, 3), &volume))) {
+    if((ret2 = sx_hashfs_volume_by_id(h, sqlite3_column_int64(q, 3), &volume))) {
 	ret = ret2;
 	if(ret2 == ENOENT)
 	    msg_set_reason("Volume no longer exists");
 	goto getmissing_err;
     }
 
-    name = (const char *)sqlite3_column_text(h->qt_tmpdata, 1);
+    name = (const char *)sqlite3_column_text(q, 1);
     if(check_file_name(name) < 0) {
 	WARN("Tmpfile with bad name");
 	msg_set_reason("Internal corruption detected (bad name)");
@@ -7015,11 +8900,11 @@ rc_ty sx_hashfs_tmp_getinfo(sx_hashfs_t *h, int64_t tmpfile_id, sx_hashfs_tmpinf
 	goto getmissing_err;
     }
 
-    file_size = sqlite3_column_int64(h->qt_tmpdata, 2);
+    file_size = sqlite3_column_int64(q, 2);
     nblocks = size_to_blocks(file_size, &hash_size, &bs);
 
-    content = sqlite3_column_blob(h->qt_tmpdata, 4);
-    contentsz = sqlite3_column_bytes(h->qt_tmpdata, 4);
+    content = sqlite3_column_blob(q, 4);
+    contentsz = sqlite3_column_bytes(q, 4);
     if(contentsz % sizeof(sx_hash_t) || contentsz / sizeof(*content) != nblocks) {
 	WARN("Tmpfile with bad content length");
 	msg_set_reason("Internal corruption detected (bad content)");
@@ -7027,8 +8912,8 @@ rc_ty sx_hashfs_tmp_getinfo(sx_hashfs_t *h, int64_t tmpfile_id, sx_hashfs_tmpinf
 	goto getmissing_err;
     }
 
-    uniqs = sqlite3_column_blob(h->qt_tmpdata, 5);
-    contentsz = sqlite3_column_bytes(h->qt_tmpdata, 5);
+    uniqs = sqlite3_column_blob(q, 5);
+    contentsz = sqlite3_column_bytes(q, 5);
     nuniqs = contentsz / sizeof(*uniqs);
     if(contentsz % sizeof(*uniqs) || nuniqs > nblocks)  {
 	WARN("Tmpfile with bad unique length");
@@ -7037,22 +8922,22 @@ rc_ty sx_hashfs_tmp_getinfo(sx_hashfs_t *h, int64_t tmpfile_id, sx_hashfs_tmpinf
 	goto getmissing_err;
     }
 
-    avl = sqlite3_column_blob(h->qt_tmpdata, 7);
+    avl = sqlite3_column_blob(q, 7);
     if(avl) {
-	navl = sqlite3_column_bytes(h->qt_tmpdata, 7);
-	if(navl != nblocks * volume->replica_count) {
+	navl = sqlite3_column_bytes(q, 7);
+	if(navl != nblocks * volume->max_replica) {
 	    WARN("Tmpfile with bad availability length");
 	    msg_set_reason("Internal corruption detected (bad availability content)");
 	    ret = EFAULT;
 	    goto getmissing_err;
 	}
     } else
-	navl = nblocks * volume->replica_count;
+	navl = nblocks * volume->max_replica;
 
     tbd = wrap_malloc(sizeof(*tbd) + /* The struct itself */
 		      nblocks * sizeof(sx_hash_t) + /* all_blocks */
 		      nuniqs * sizeof(tbd->uniq_ids[0]) + /* uniq_ids */
-		      nblocks * sizeof(tbd->nidxs[0]) * volume->replica_count + /* nidxs */
+		      nblocks * sizeof(tbd->nidxs[0]) * volume->max_replica + /* nidxs */
 		      navl); /* avlblty */
     if(!tbd) {
 	OOM();
@@ -7060,19 +8945,19 @@ rc_ty sx_hashfs_tmp_getinfo(sx_hashfs_t *h, int64_t tmpfile_id, sx_hashfs_tmpinf
 	goto getmissing_err;
     }
 
-    tbd->allnodes = sx_hashfs_nodelist(h, NL_NEXT);
+    tbd->allnodes = sx_hashfs_all_nodes(h, NL_NEXT);
 
     tbd->volume_id = volume->id;
     tbd->all_blocks = (sx_hash_t *)(tbd+1);
     tbd->uniq_ids = (unsigned int *)&tbd->all_blocks[nblocks];
     tbd->nidxs = &tbd->uniq_ids[nuniqs];
-    tbd->avlblty = (int8_t *)&tbd->nidxs[nblocks * volume->replica_count];
+    tbd->avlblty = (int8_t *)&tbd->nidxs[nblocks * volume->max_replica];
     memcpy(tbd->all_blocks, content, nblocks * sizeof(sx_hash_t));
     memcpy(tbd->uniq_ids, uniqs, nuniqs * sizeof(tbd->uniq_ids[0]));
-    memset(tbd->nidxs, -1, nblocks * sizeof(tbd->nidxs[0]) * volume->replica_count);
+    memset(tbd->nidxs, -1, nblocks * sizeof(tbd->nidxs[0]) * volume->max_replica);
     for(i=0; i<nuniqs; i++) {
 	/* MODHDIST: pick from _next, bidx=0 */
-	if(hash_nidx_tobuf(h, &tbd->all_blocks[tbd->uniq_ids[i]], volume->replica_count, &tbd->nidxs[tbd->uniq_ids[i]*volume->replica_count])) {
+	if(hash_nidx_tobuf(h, &tbd->all_blocks[tbd->uniq_ids[i]], volume->max_replica, volume->max_replica, &tbd->nidxs[tbd->uniq_ids[i]*volume->max_replica]) < 0) {
 	    WARN("hash_nidx_tobuf failed");
 	    goto getmissing_err;
 	}
@@ -7083,35 +8968,36 @@ rc_ty sx_hashfs_tmp_getinfo(sx_hashfs_t *h, int64_t tmpfile_id, sx_hashfs_tmpinf
 	memcpy(tbd->avlblty, avl, navl);
     tbd->nall = nblocks;
     tbd->nuniq = nuniqs;
-    tbd->replica_count = volume->replica_count;
+    tbd->replica_count = volume->max_replica;
     tbd->block_size = bs;
-    strcpy(tbd->revision, revision);
-    strcpy(tbd->name, name);
-    strcpy(tbd->revision, revision);
+    sxi_strlcpy(tbd->revision, revision, sizeof(tbd->revision));
+    sxi_strlcpy(tbd->name, name, sizeof(tbd->name));
     tbd->file_size = file_size;
     tbd->tmpfile_id = tmpfile_id;
     tbd->somestatechanged = 0;
 
-    sxi_strlcpy(token, (const char*)sqlite3_column_text(h->qt_tmpdata, 8), sizeof(token));
-    sqlite3_reset(h->qt_tmpdata); /* Do not deadlock if we need to update this very entry */
+    sxi_strlcpy(token, (const char*)sqlite3_column_text(q, 8), sizeof(token));
+    sqlite3_reset(q); /* Do not deadlock if we need to update this very entry */
 
     if(nuniqs && recheck_presence) {
 	unsigned int r, l;
 
 	/* For each replica set populate tbd->avlblty via hash_presence callback */
 	for(i=1; i<=tbd->replica_count; i++) {
-            sx_hash_t tmpid, reserveid;
+            sx_hash_t revision_id, reserve_id;
 	    unsigned int cur_item = 0;
 	    sort_by_node_then_hash(tbd->all_blocks, tbd->uniq_ids, tbd->nidxs, tbd->nuniq, i, tbd->replica_count);
-            /* tmpid must match the ID used for reserving hashes in gettoken */
-            if (unique_tmpid(h, token, &tmpid))
+            /* revision_id when deleting the file must match
+	     * the revision_id used here when creating it */
+            if (sx_unique_fileid(h->sx, volume, tbd->name, tbd->revision, &revision_id))
                 goto getmissing_err;
-            if (reserve_fileid(h, tbd->volume_id, tbd->name, &reserveid))
+            /* reserve_id must match the id used in reserve */
+            if (reserve_fileid(h, tbd->volume_id, tbd->name, &reserve_id))
                 goto getmissing_err;
-            DEBUGHASH("tmp_get_info reserveid", &reserveid);
-            DEBUGHASH("tmp_get_info tmpid", &tmpid);
+            DEBUGHASH("tmp_get_info reserve_id", &reserve_id);
+            DEBUGHASH("tmp_get_info revision_id", &revision_id);
             sxi_hashop_begin(&h->hc, h->sx_clust, tmp_getmissing_cb,
-                             HASHOP_INUSE, tbd->replica_count, &reserveid, &tmpid, tbd, op_expires_at);
+                             HASHOP_INUSE, tbd->replica_count, &reserve_id, &revision_id, tbd, 0);
 	    tbd->current_replica = i;
             DEBUG("begin queries for replica #%d", i);
 	    while((ret2 = are_blocks_available(h,
@@ -7178,44 +9064,60 @@ rc_ty sx_hashfs_tmp_getinfo(sx_hashfs_t *h, int64_t tmpfile_id, sx_hashfs_tmpinf
 	free(tbd);
     }
 
-    sqlite3_reset(h->qt_tmpdata);
+    sqlite3_reset(q);
 
     return ret;
 }
 
-static rc_ty get_tempfile_metasize(sx_hashfs_t *h, int64_t tid, int64_t *size) {
-    int r;
-    int64_t metasize = 0;
-
-    if(!h || !size) {
-        NULLARG();
-        return EFAULT;
+rc_ty sx_hashfs_getinfo_by_revision(sx_hashfs_t *h, const char *revision, sx_hashfs_file_t *filerev)
+{
+    unsigned ndb;
+    if(!h || !revision || !filerev) {
+	NULLARG();
+	return EFAULT;
     }
 
-    sqlite3_reset(h->qt_getmeta);
-    if(qbind_int64(h->qt_getmeta, ":id", tid))
-        return FAIL_EINTERNAL;
-    while((r = qstep(h->qt_getmeta)) == SQLITE_ROW) {
-        const char *key = (const char *)sqlite3_column_text(h->qt_getmeta, 0);
-        int value_len = sqlite3_column_bytes(h->qt_getmeta, 1);
-
-        metasize += strlen(key) + value_len;
-    }
-    sqlite3_reset(h->qt_getmeta);
-    if(r != SQLITE_DONE) {
-        msg_set_reason("Failed to get temp file metadata size");
-        return FAIL_EINTERNAL;
+    DEBUG("looking up revision %s", revision);
+    if(check_revision(revision)) {
+	msg_set_reason("Invalid file revision");
+	return EINVAL;
     }
 
-    *size = metasize;
-    return OK;
+    for(ndb=0;ndb<METADBS;ndb++) {
+        sqlite3_stmt *q = h->qm_findrev[ndb];
+        if(qbind_text(q, ":revision", revision))
+            return FAIL_EINTERNAL;
+
+        sqlite3_reset(q);
+        int r = qstep(q);
+        if(r == SQLITE_DONE) {
+            sqlite3_reset(q);
+            continue;
+        }
+        if(r != SQLITE_ROW)
+            return FAIL_EINTERNAL;
+
+        filerev->volume_id = sqlite3_column_int64(q, 0);
+        const unsigned char *name = sqlite3_column_text(q, 1);
+        filerev->file_size = sqlite3_column_int64(q, 2);
+        size_to_blocks(filerev->file_size, NULL, &filerev->block_size);
+        strncpy(filerev->name, (const char*)name, sizeof(filerev->name));
+        filerev->name[sizeof(filerev->name)-1] = '\0';
+        strncpy(filerev->revision, revision, sizeof(filerev->revision));
+        filerev->revision[sizeof(filerev->revision)-1] = '\0';
+        sqlite3_reset(q);
+        return OK;
+    }
+    return ENOENT;
 }
 
 rc_ty sx_hashfs_tmp_tofile(sx_hashfs_t *h, const sx_hashfs_tmpinfo_t *missing) {
     rc_ty ret = FAIL_EINTERNAL, ret2;
     const sx_hashfs_volume_t *volume;
     int64_t file_id, totalsize = 0;
-    int r, mdb;
+    int mdb;
+    sxc_meta_t *meta;
+    unsigned int i;
 
     if(!h || !missing) {
 	NULLARG();
@@ -7235,13 +9137,34 @@ rc_ty sx_hashfs_tmp_tofile(sx_hashfs_t *h, const sx_hashfs_tmpinfo_t *missing) {
     }
 
     sqlite3_reset(h->qt_getmeta);
+    if(!(meta = sxc_meta_new(h->sx)))
+        return ENOMEM;
 
-    if(qbegin(h->metadb[mdb]))
-	return FAIL_EINTERNAL;
+    if((ret2 = sx_hashfs_tmp_getmeta(h, missing->tmpfile_id, meta)) != OK) {
+        sxc_meta_free(meta);
+        return ret2;
+    }
 
-    if(get_tempfile_metasize(h, missing->tmpfile_id, &totalsize))
-        goto tmp2file_rollback;
-    totalsize += missing->file_size + strlen(missing->name);
+    /* Calculate total file size */
+    totalsize = missing->file_size + strlen(missing->name);
+    for(i = 0; i < sxc_meta_count(meta); i++) {
+        const void *value;
+        const char *key;
+        unsigned int value_len;
+
+        if(sxc_meta_getkeyval(meta, i, &key, &value, &value_len)) {
+            WARN("Failed to get tempfile meta entry");
+            sxc_meta_free(meta);
+            return FAIL_EINTERNAL;
+        }
+
+        totalsize += strlen(key) + value_len;
+    }
+
+    if(qbegin(h->metadb[mdb])) {
+        sxc_meta_free(meta);
+        return FAIL_EINTERNAL;
+    }
 
     ret2 = create_file(h, volume, missing->name, missing->revision, missing->all_blocks, missing->nall, missing->file_size, totalsize, &file_id);
     if(ret2) {
@@ -7249,27 +9172,28 @@ rc_ty sx_hashfs_tmp_tofile(sx_hashfs_t *h, const sx_hashfs_tmpinfo_t *missing) {
 	goto tmp2file_rollback;
     }
 
-    if(qbind_int64(h->qt_getmeta, ":id", missing->tmpfile_id))
-	goto tmp2file_rollback;
-    while((r = qstep(h->qt_getmeta)) == SQLITE_ROW) {
-	const char *key = (const char *)sqlite3_column_text(h->qt_getmeta, 0);
-	const void *value = sqlite3_column_blob(h->qt_getmeta, 1);
-	int value_len = sqlite3_column_bytes(h->qt_getmeta, 1);
+    /* Set new file meta */
+    for(i = 0; i < sxc_meta_count(meta); i++) {
+        const void *value;
+        const char *key;
+        unsigned int value_len;
 
-	sqlite3_reset(h->qm_metaset[mdb]);
-	if(qbind_int64(h->qm_metaset[mdb], ":file", file_id) ||
-	   qbind_text(h->qm_metaset[mdb], ":key", key) ||
-	   qbind_blob(h->qm_metaset[mdb], ":value", value, value_len) ||
-	   qstep_noret(h->qm_metaset[mdb])) {
-	    sqlite3_reset(h->qm_metaset[mdb]);
-	    goto tmp2file_rollback;
-	}
+        if(sxc_meta_getkeyval(meta, i, &key, &value, &value_len)) {
+            WARN("Failed to get tempfile meta entry");
+            goto tmp2file_rollback;
+        }
+
+        sqlite3_reset(h->qm_metaset[mdb]);
+        if(qbind_int64(h->qm_metaset[mdb], ":file", file_id) ||
+           qbind_text(h->qm_metaset[mdb], ":key", key) ||
+           qbind_blob(h->qm_metaset[mdb], ":value", value, value_len) ||
+           qstep_noret(h->qm_metaset[mdb])) {
+            sqlite3_reset(h->qm_metaset[mdb]);
+            goto tmp2file_rollback;
+        }
     }
-    sqlite3_reset(h->qm_metaset[mdb]);
-    sqlite3_reset(h->qt_getmeta);
-    if(r != SQLITE_DONE)
-	goto tmp2file_rollback;
 
+    sqlite3_reset(h->qm_metaset[mdb]);
     if(qcommit(h->metadb[mdb]))
 	goto tmp2file_rollback;
 
@@ -7282,125 +9206,12 @@ rc_ty sx_hashfs_tmp_tofile(sx_hashfs_t *h, const sx_hashfs_tmpinfo_t *missing) {
 
     sqlite3_reset(h->qm_metaset[mdb]);
     sqlite3_reset(h->qt_getmeta);
+    sxc_meta_free(meta);
 
     return ret;
 }
 
-
-static rc_ty file_totmp(sx_hashfs_t *h, const sx_hashfs_volume_t *vol, const char *name, const char *revision, int64_t *tmpfile_id, unsigned int *timeout) {
-    unsigned int nblocks, bsize, content_len, avail_len;
-    char rev[REV_LEN + 1];
-    const void *content;
-    int8_t *avail;
-    int64_t size;
-    int r, ndb;
-
-    if(!h || !vol || !name || !revision || !tmpfile_id || !timeout) {
-	NULLARG();
-	return EFAULT;
-    }
-
-    if(check_file_name(name)<0) {
-	msg_set_reason("Invalid file name");
-	return EINVAL;
-    }
-
-    sxi_strlcpy(rev, revision, sizeof(rev));
-    if(check_revision(rev)) {
-	msg_set_reason("Invalid file revision");
-	return EINVAL;
-    }
-    rev[REV_TIME_LEN] = '\0';
-
-    ndb = getmetadb(name);
-    if(ndb < 0) {
-	msg_set_reason("Failed to locate file database");
-	return FAIL_EINTERNAL;
-    }
-
-    if(qbind_int64(h->qm_getrev[ndb], ":volume", vol->id) ||
-       qbind_text(h->qm_getrev[ndb], ":name", name) ||
-       qbind_text(h->qm_getrev[ndb], ":revision", revision))
-	return FAIL_EINTERNAL;
-
-    r = qstep(h->qm_getrev[ndb]);
-    if(r == SQLITE_DONE)
-	return ENOENT;
-    if(r != SQLITE_ROW)
-	return FAIL_EINTERNAL;
-
-    size = sqlite3_column_int64(h->qm_getrev[ndb], 1);
-    nblocks = size_to_blocks(size, NULL, &bsize);
-    content = sqlite3_column_blob(h->qm_getrev[ndb], 2);
-    content_len = sqlite3_column_bytes(h->qm_getrev[ndb], 2);
-    avail_len = nblocks * vol->replica_count;
-    avail = malloc(avail_len);
-    if(!avail) {
-	sqlite3_reset(h->qm_getrev[ndb]);
-	return ENOMEM;
-    }
-    memset(avail, 1, avail_len);
-
-    *timeout = sx_hashfs_job_file_timeout(h, vol->replica_count, size);
-
-    if(qbind_int64(h->qt_new4del, ":volume", vol->id) ||
-       qbind_text(h->qt_new4del, ":name", name) ||
-       qbind_int64(h->qt_new4del, ":size", size) ||
-       qbind_text(h->qt_new4del, ":token", &rev[REV_TIME_LEN+1]) ||
-       qbind_text(h->qt_new4del, ":time", rev) ||
-       qbind_blob(h->qt_new4del, ":content", content, content_len) ||
-       qbind_blob(h->qt_new4del, ":avail", avail, avail_len) ||
-       qbind_int64(h->qt_new4del, ":expires", time(NULL) + *timeout)) {
-	sqlite3_reset(h->qm_getrev[ndb]);
-	free(avail);
-	return FAIL_EINTERNAL;
-    }
-
-    r = qstep(h->qt_new4del);
-    sqlite3_reset(h->qm_getrev[ndb]);
-    free(avail);
-
-    if(r == SQLITE_CONSTRAINT)
-	return EEXIST;
-    if(r != SQLITE_DONE)
-	return FAIL_EINTERNAL;
-
-    *tmpfile_id = sqlite3_last_insert_rowid(sqlite3_db_handle(h->qt_new4del));
-    DEBUG("Turned file %s/%s::%s into tempfile id %lld", vol->name, name, revision, (long long)*tmpfile_id);
-    return OK;
-}
-
-static rc_ty revision_tmpfile_id(sx_hashfs_t *h, const sx_hashfs_volume_t *vol, const char *name, const char *revision, int64_t *tmpfile_id) {
-    rc_ty ret = FAIL_EINTERNAL;
-    int r;
-
-    if(!tmpfile_id) {
-        WARN("NULL argument");
-        return ret;
-    }
-
-    sqlite3_reset(h->qt_tmpbytoken);
-    if(qbind_int64(h->qt_tmpbytoken, ":volume", vol->id) || qbind_text(h->qt_tmpbytoken, ":name", name) ||
-       qbind_text(h->qt_tmpbytoken, ":token", &revision[REV_TIME_LEN+1]))
-        goto revision_tmpfile_id_err;
-
-    r = qstep(h->qt_tmpbytoken);
-    if(r == SQLITE_DONE) {
-        ret = ENOENT;
-    } else if(r == SQLITE_ROW) {
-        /* Get token id needed to get job id */
-        *tmpfile_id = sqlite3_column_int64(h->qt_tmpbytoken, 0);
-        ret = OK;
-    } else {
-        WARN("Failed to get tempfile for %s/%s %s", vol->name, name, revision);
-    }
-
-revision_tmpfile_id_err:
-    sqlite3_reset(h->qt_tmpbytoken);
-    return ret;
-}
-
-static rc_ty get_tmpfile_job(sx_hashfs_t *h, int64_t tempfile_id, job_t *job_id) {
+static rc_ty get_existing_delete_job(sx_hashfs_t *h, const char *revision, job_t *job_id) {
     rc_ty ret = FAIL_EINTERNAL;
     int r;
 
@@ -7409,36 +9220,224 @@ static rc_ty get_tmpfile_job(sx_hashfs_t *h, int64_t tempfile_id, job_t *job_id)
         return FAIL_EINTERNAL;
     }
 
-    sqlite3_reset(h->qe_jobbydata);
-    if(qbind_blob(h->qe_jobbydata, ":data", &tempfile_id, sizeof(tempfile_id))) {
-        WARN("Failed to prepare query for temp file %lld", (long long)tempfile_id);
-        goto get_tmpfile_job_err;
+    sqlite3_reset(h->qe_getfiledeljob);
+    if(qbind_blob(h->qe_getfiledeljob, ":data", revision, strlen(revision))) {
+        WARN("Failed to prepare query with revision %s", revision);
+        goto get_existing_delete_job_err;
     }
 
-    r = qstep(h->qe_jobbydata);
+    r = qstep(h->qe_getfiledeljob);
     if(r == SQLITE_DONE) {
         ret = ENOENT;
-        WARN("Job for temp file %lld does not exist", (long long)tempfile_id);
-        goto get_tmpfile_job_err;
+        goto get_existing_delete_job_err;
     } else if(r == SQLITE_ROW) {
         /* Set parent ID for current job */
-        *job_id = sqlite3_column_int64(h->qe_jobbydata, 0);
+        *job_id = sqlite3_column_int64(h->qe_getfiledeljob, 0);
+        ret = OK;
     } else {
-        WARN("Failed to get job for temp file %lld", (long long)tempfile_id);
-        goto get_tmpfile_job_err;
+        WARN("Failed to get job for revision %s", revision);
+        goto get_existing_delete_job_err;
     }
 
-    ret = OK;
-get_tmpfile_job_err:
-    sqlite3_reset(h->qe_jobbydata);
+get_existing_delete_job_err:
+    sqlite3_reset(h->qe_getfiledeljob);
     return ret;
 }
+
+rc_ty sx_hashfs_job_new_2pc(sx_hashfs_t *hashfs, const job_2pc_t *spec, void *yctx, sx_uid_t uid, job_t *job, int execute)
+{
+    sxc_client_t *sx = sx_hashfs_client(hashfs);
+    sx_nodelist_t *nodes = NULL;
+    rc_ty rc = FAIL_EINTERNAL;
+    sx_blob_t *joblb = NULL;
+
+    do {
+        joblb = sx_blob_new();
+        if (!joblb) {
+            msg_set_reason("Cannot allocate job blob");
+            break;
+        }
+
+        if (spec->nodes(hashfs, joblb, &nodes))
+            break;
+
+        if (spec->to_blob(sx, sx_nodelist_count(nodes), yctx, joblb)) {
+            const char *msg = msg_get_reason();
+            if(!msg || !*msg)
+                msg_set_reason("Cannot create job blob");
+            break;
+        }
+
+        if(execute) {
+            sx_blob_reset(joblb);
+            rc = spec->execute_blob(hashfs, joblb, JOBPHASE_REQUEST, 1);
+            if (rc != OK) {
+                const char *msg = msg_get_reason();
+                if (!msg)
+                    msg_set_reason("%s", rc2str(rc));
+                WARN("Failed to execute job(%d): %s", rc2http(rc), msg);
+                break;
+            }
+        } else {
+            const void *job_data;
+            unsigned int job_datalen;
+            unsigned int job_timeout;
+
+            /* create job, must not reset yet */
+            sx_blob_to_data(joblb, &job_data, &job_datalen);
+            /* must reset now */
+            sx_blob_reset(joblb);
+            if (!spec->get_lock) {
+                NULLARG();
+                rc = EFAULT;
+                break;
+            }
+            const char *lock = spec->get_lock(joblb);
+            sx_blob_reset(joblb);
+            job_timeout = spec->timeout(sx, sx_nodelist_count(nodes));
+            if (*job == JOB_NOPARENT)
+                rc = sx_hashfs_job_new(hashfs, uid, job, spec->job_type, job_timeout, lock, job_data, job_datalen, nodes);
+            else {
+                job_t parent = *job;
+                rc = sx_hashfs_job_new_notrigger(hashfs, parent, uid, job, spec->job_type, job_timeout, lock, job_data, job_datalen, nodes);
+                DEBUG("job %ld created, parent: %ld", *job, parent);
+            }
+        }
+    } while(0);
+    sx_blob_free(joblb);
+    sx_nodelist_delete(nodes);
+    return rc;
+}
+
+/* FIXME: this belongs in fcgi-actions-block.c, but then delete_job, and
+ * create_file and all their callers have to be moved to fcgi-actions-file.c too
+ * or there would be a linker error */
+
+static int revision_to_blob(sxc_client_t *sx, int nodes, void *yctx, sx_blob_t *blob)
+{
+    sx_revision_op_t *op = yctx;
+
+    if (!blob) {
+        msg_set_reason("cannot allocate job storage");
+        return -1;
+    }
+    if (!op) {
+        NULLARG();
+        return -1;
+    }
+
+    if (sx_blob_add_string(blob, op->lock ? op->lock : "") ||
+        sx_blob_add_int32(blob, op->blocksize) ||
+        sx_blob_add_blob(blob, op->revision_id.b, sizeof(op->revision_id.b)) ||
+        sx_blob_add_int32(blob, op->op)) {
+        msg_set_reason("Cannot create job storage");
+        return -1;
+    }
+    return 0;
+}
+
+int sx_revision_op_of_blob(sx_blob_t *b, sx_revision_op_t *op)
+{
+    const char *lock;
+    const void *ptr;
+    unsigned int len;
+    if  (!op) {
+        NULLARG();
+        return -1;
+    }
+    if (sx_blob_get_string(b, &lock) ||
+        sx_blob_get_int32(b, &op->blocksize) ||
+        sx_blob_get_blob(b, &ptr, &len) || len != sizeof(op->revision_id.b) ||
+        sx_blob_get_int32(b, &op->op)) {
+        msg_set_reason("Corrupt revision blob");
+        return -1;
+    }
+    memcpy(op->revision_id.b, ptr, sizeof(op->revision_id.b));
+    op->lock = NULL;
+    return 0;
+}
+
+static rc_ty revision_execute_blob(sx_hashfs_t *hashfs, sx_blob_t *b, jobphase_t phase, int remote)
+{
+    sx_revision_op_t op;
+    rc_ty rc;
+
+    DEBUG("executing");
+    if (remote && phase == JOBPHASE_REQUEST)
+        phase = JOBPHASE_COMMIT;
+    if (sx_revision_op_of_blob(b, &op))
+        return FAIL_EINTERNAL;
+    switch (phase) {
+        case JOBPHASE_COMMIT:
+            rc = sx_hashfs_revision_op(hashfs, op.blocksize, &op.revision_id, op.op);
+            if (rc != OK)
+                WARN("Failed to (un)bump revision: %s", msg_get_reason());
+            return rc;
+        case JOBPHASE_ABORT:/* fall-through */
+        case JOBPHASE_UNDO:
+            rc = sx_hashfs_revision_op(hashfs, op.blocksize, &op.revision_id, -op.op);
+            if (rc != OK)
+                WARN("Failed to (un)bump revision: %s", msg_get_reason());
+            return rc;
+        default:
+            WARN("Impossible job phase: %d", phase);
+            return FAIL_EINTERNAL;
+    }
+}
+
+static sxi_query_t* revision_proto_from_blob(sxc_client_t *sx, sx_blob_t *b, jobphase_t phase)
+{
+    sx_revision_op_t op;
+    if (sx_revision_op_of_blob(b, &op))
+        return NULL;
+
+    if (phase == JOBPHASE_ABORT || phase == JOBPHASE_UNDO)
+        op.op = -op.op;
+    return sxi_hashop_proto_revision(sx, op.blocksize, &op.revision_id, op.op);
+}
+
+static rc_ty revision_nodes(sx_hashfs_t *hashfs, sx_blob_t *blob, sx_nodelist_t **nodes)
+{
+    /* all nodes */
+    if (!nodes)
+        return FAIL_EINTERNAL;
+    *nodes = sx_nodelist_dup(sx_hashfs_effective_nodes(hashfs, NL_NEXTPREV));
+    if (!*nodes)
+        return FAIL_EINTERNAL;
+    DEBUG("returning nodes");
+    return OK;
+}
+
+static unsigned revision_timeout(sxc_client_t *sx, int nodes)
+{
+    return 12 * nodes;
+}
+
+static const char *revision_get_lock(sx_blob_t *b)
+{
+    const char *ret = NULL;
+    if (sx_blob_get_string(b, &ret))
+        return NULL;
+    sx_blob_reset(b);
+    return ret;
+}
+
+const job_2pc_t revision_spec = {
+    NULL,
+    JOBTYPE_BLOCKS_REVISION,
+    NULL,
+    revision_get_lock,
+    revision_to_blob,
+    revision_execute_blob,
+    revision_proto_from_blob,
+    revision_nodes,
+    revision_timeout
+};
 
 rc_ty sx_hashfs_filedelete_job(sx_hashfs_t *h, sx_uid_t user_id, const sx_hashfs_volume_t *vol, const char *name, const char *revision, job_t *job_id) {
     const sx_hashfs_file_t *filerev;
     sx_nodelist_t *targets;
     unsigned int timeout;
-    int64_t tmpfile_id;
     char *lockname;
     rc_ty ret, s;
     int added = 0; /* Set to 1 if already added job for a chain */
@@ -7448,7 +9447,7 @@ rc_ty sx_hashfs_filedelete_job(sx_hashfs_t *h, sx_uid_t user_id, const sx_hashfs
 	return EFAULT;
     }
 
-    ret = sx_hashfs_volnodes(h, NL_NEXTPREV, vol, 0, &targets, NULL);
+    ret = sx_hashfs_effective_volnodes(h, NL_NEXTPREV, vol, 0, &targets, NULL);
     if(ret)
 	return ret;
 
@@ -7463,65 +9462,65 @@ rc_ty sx_hashfs_filedelete_job(sx_hashfs_t *h, sx_uid_t user_id, const sx_hashfs
         goto sx_hashfs_filedelete_job_err;
 
     if(revision) {
-	do {
-            if(revision_tmpfile_id(h, vol, name, revision, &tmpfile_id) == OK) {
-                /* Found revision, set job assigned to this tempfile as parent for current operation */
-                ret = get_tmpfile_job(h, tmpfile_id, job_id);
-                if(ret != OK)
-                    WARN("Failed to get tmpfile revision job");
-                break;
-            }
-
-            /* Tempfile does not exist, create new one */
-            ret = file_totmp(h, vol, name, revision, &tmpfile_id, &timeout);
-            if(ret)
-                break;
+        sx_hashfs_file_t filerev;
+        if (sx_hashfs_getinfo_by_revision(h, revision, &filerev))
+            goto sx_hashfs_filedelete_job_err;
+        /* Check if delete job for this revision exist and if not, create new one */
+        if((ret = get_existing_delete_job(h, revision, job_id)) == ENOENT) {
             lockname = malloc(strlen(name) + 1 + strlen(revision) + 1);
             if(!lockname) {
                 msg_set_reason("Internal error: not enough memory to delete the specified file");
                 ret = ENOMEM;
-                break;
+                goto sx_hashfs_filedelete_job_err;
             }
             sprintf(lockname, "%s:%s", name, revision);
-    
-            /* Create a job for newly created tempfile */
-            ret = sx_hashfs_job_new_notrigger(h, *job_id, user_id, job_id, JOBTYPE_DELETE_FILE, timeout, lockname, &tmpfile_id, sizeof(tmpfile_id), targets);
-            free(lockname);
 
-            if(ret)
-                sx_hashfs_tmp_delete(h, tmpfile_id);
-	} while(0);
+            timeout = sx_hashfs_job_file_timeout(h, vol->effective_replica, filerev.file_size);
+            /* Create a job for newly created tempfile */
+            ret = sx_hashfs_job_new_notrigger(h, *job_id, user_id, job_id, JOBTYPE_DELETE_FILE, timeout, lockname, revision, strlen(revision), targets);
+            if (ret == OK) {
+                sx_revision_op_t revision_op;
+                ret = sx_unique_fileid(h->sx, vol, name, revision, &revision_op.revision_id);
+                if (ret == OK) {
+                    revision_op.lock = lockname;
+                    revision_op.op = -1;
+                    revision_op.blocksize = filerev.block_size;
+                    /* job to unbump revision for blocks */
+                    ret = sx_hashfs_job_new_2pc(h, &revision_spec, &revision_op, user_id, job_id, 0);
+                    DEBUG("ret3: %d", ret);
+                }
+            }
+            free(lockname);
+        } else if(ret != OK) {
+            WARN("Failed to get job for revision %s", revision);
+            goto sx_hashfs_filedelete_job_err;
+        }
 
 	goto sx_hashfs_filedelete_job_err;
     }
 
     *job_id = JOB_NOPARENT;
     for(s = sx_hashfs_revision_first(h, vol, name, &filerev, 1); s == OK; s = sx_hashfs_revision_next(h, 1)) {
-        if(revision_tmpfile_id(h, vol, name, filerev->revision, &tmpfile_id) == OK) {
-            /* Found revision, set job assigned to this tempfile as parent for current operation */
-            ret = get_tmpfile_job(h, tmpfile_id, job_id);
-            if(ret) {
-                WARN("Failed to get tmpfile revision job");
-                goto sx_hashfs_filedelete_job_err;
-            }
+        if((ret = get_existing_delete_job(h, filerev->revision, job_id)) == OK)
+            break;
+        else if(ret != ENOENT) {
+            WARN("Failed to get job for revision %s", filerev->revision);
+            s = ret;
             break;
         }
     }
 
-    if(s == OK) {/* If locked revisions were found, take next revision in ascending order */
+    if(s == OK) /* If locked revisions were found, take next revision in ascending order */
         s = sx_hashfs_revision_next(h, 0);
-    } else if(s == ITER_NO_MORE) {/* If no locked revision was found, restart listing from the beginning */
+    else if(s == ITER_NO_MORE) /* If no locked revision was found, restart listing from the beginning */
         s = sx_hashfs_revision_first(h, vol, name, &filerev, 0);
-    } else { /* Handle ENOENT case */
+
+    if(s != OK && s != ITER_NO_MORE) {
         ret = s;
         goto sx_hashfs_filedelete_job_err;
     }
 
     for(; s == OK; s = sx_hashfs_revision_next(h, 0)) {
-	ret = file_totmp(h, vol, name, filerev->revision, &tmpfile_id, &timeout);
-	if(ret)
-	    goto sx_hashfs_filedelete_job_err;
-
 	lockname = malloc(strlen(name) + 1 + strlen(filerev->revision) + 1);
 	if(!lockname) {
 	    msg_set_reason("Internal error: not enough memory to delete the specified file");
@@ -7530,12 +9529,26 @@ rc_ty sx_hashfs_filedelete_job(sx_hashfs_t *h, sx_uid_t user_id, const sx_hashfs
 	}
 	sprintf(lockname, "%s:%s", name, filerev->revision);
 
-	ret = sx_hashfs_job_new_notrigger(h, *job_id, user_id, job_id, JOBTYPE_DELETE_FILE, timeout, lockname, &tmpfile_id, sizeof(tmpfile_id), targets);
+        timeout = sx_hashfs_job_file_timeout(h, vol->effective_replica, filerev->file_size);
+	ret = sx_hashfs_job_new_notrigger(h, *job_id, user_id, job_id, JOBTYPE_DELETE_FILE, timeout, lockname, filerev->revision, REV_LEN, targets);
+        if (ret == OK) {
+            sx_revision_op_t revision_op;
+            ret = sx_unique_fileid(h->sx, vol, name, filerev->revision, &revision_op.revision_id);
+            if (ret == OK) {
+                revision_op.lock = lockname;
+                revision_op.op = -1;
+                revision_op.blocksize = filerev->block_size;
+                /* job to unbump revision for blocks */
+                ret = sx_hashfs_job_new_2pc(h, &revision_spec, &revision_op, user_id, job_id, 0);
+                DEBUG("ret5: %d", ret);
+            }
+        }
 	free(lockname);
 
         if(ret != OK) {
             if(ret != FAIL_ETOOMANY)
                 WARN("Failed to add delete job: %s", msg_get_reason());
+            DEBUG("jumping, ret: %d", ret);
             goto sx_hashfs_filedelete_job_err;
         }
         added = 1;
@@ -7558,6 +9571,7 @@ rc_ty sx_hashfs_filedelete_job(sx_hashfs_t *h, sx_uid_t user_id, const sx_hashfs
 
     ret = OK;
 sx_hashfs_filedelete_job_err:
+    DEBUG("end ret:%d", ret);
     sx_nodelist_delete(targets);
     if(!ret) {
         if(!qcommit(h->tempdb)) {
@@ -7722,10 +9736,13 @@ rc_ty sx_hashfs_file_delete(sx_hashfs_t *h, const sx_hashfs_volume_t *volume, co
 	msg_set_reason("Invalid file revision");
 	return EINVAL;
     }
+    DEBUG("Deleting file %s, revision %s", file, revision);
 
     ret = get_file_id(h, volume->name, file, revision, &file_id, &mdb, NULL, NULL, &size);
-    if(ret)
+    if(ret) {
+        DEBUG("get_file_id failed: %s", rc2str(ret));
         return ret;
+    }
 
     if(qbind_int64(h->qm_delfile[mdb], ":file", file_id) ||
        qstep_noret(h->qm_delfile[mdb])) {
@@ -7736,169 +9753,13 @@ rc_ty sx_hashfs_file_delete(sx_hashfs_t *h, const sx_hashfs_volume_t *volume, co
     deleted = sqlite3_changes(h->metadb[mdb]->handle);
 
     /* Update counters only when file deletion succeeded and this node is not becoming a volnode */
-    if(ret == OK && deleted && !is_new_volnode(h, volume) && sx_hashfs_update_volume_cursize(h, volume->id, -size)) {
+    if(ret == OK && deleted && sx_hashfs_update_volume_cursize(h, volume->id, -size)) {
         WARN("Failed to update volume size");
         return FAIL_EINTERNAL;
     }
 
     return OK;
 }
-
-static int tmp_unbump_cb(const char *hexhash, unsigned int idx, int code, void *context) {
-    sx_hashfs_tmpinfo_t *tmp = (sx_hashfs_tmpinfo_t *)context;
-    char idxhash[SXI_SHA1_TEXT_LEN + 1];
-    unsigned int nblock, replica;
-
-
-    if(!hexhash || !tmp) {
-	WARN("Called with NULL values");
-	return -1;
-    }
-
-    if(code != 200 && code != 404)
-	return 0;
-
-    if(!tmp->replica_count) {
-	WARN("Called with null replica count");
-	return -1;
-    }
-
-    nblock = idx / tmp->replica_count;
-    replica = idx % tmp->replica_count;
-
-    if(nblock >= tmp->nall) {
-	WARN("Block out of range (%u / %u)", nblock, tmp->nall);
-	return -1;
-    }
-
-    bin2hex(&tmp->all_blocks[nblock], sizeof(tmp->all_blocks[0]), idxhash, sizeof(idxhash));
-    if(memcmp(idxhash, hexhash, SXI_SHA1_TEXT_LEN)) {
-	WARN("Hash mismatch: called for %.*s but index %d points to %s", SXI_SHA1_TEXT_LEN, hexhash, idx, idxhash);
-	return -1;
-    }
-
-    if(tmp->avlblty[idx] != 0) {
-	tmp->avlblty[idx] = 0;
-	tmp->somestatechanged = 1;
-        DEBUG("Block %s (replica %u) unbumped", idxhash, replica);
-    } else
-	DEBUG("Called for block %s (replica %u) which was not bumped", idxhash, replica);
-
-    return 0;
-}
-
-rc_ty sx_hashfs_tmp_unbump(sx_hashfs_t *h, int64_t tmpfile_id) {
-    unsigned int nnode, nnodes, nblock, replica;
-    char fileidhex[SXI_SHA1_TEXT_LEN+1];
-    const sx_hashfs_volume_t *vol;
-    sx_hashfs_tmpinfo_t *tmp;
-    uint64_t op_expires_at;
-    const sx_node_t *self;
-    sx_hash_t fileid;
-    rc_ty s, ret = OK;
-
-    s = sx_hashfs_tmp_getinfo(h, tmpfile_id, &tmp, 0, 0);
-    if(s != OK)
-	return s;
-
-    s = sx_hashfs_volume_by_id(h, tmp->volume_id, &vol);
-    if(s) {
-	free(tmp);
-	return s;
-    }
-    if(!tmp->nall) {
-	free(tmp);
-	return ITER_NO_MORE;
-    }
-
-    for(nblock=0; nblock<tmp->nall; nblock++) {
-	/* MODHDIST: pick from _next, bidx=0 */
-	if(hash_nidx_tobuf(h, &tmp->all_blocks[nblock], vol->replica_count, &tmp->nidxs[nblock*vol->replica_count])) {
-	    WARN("hash_nidx_tobuf failed");
-	    free(tmp);
-	    return FAIL_EINTERNAL;
-	}
-    }
-
-    if(unique_fileid(h->sx, vol, tmp->name, tmp->revision, &fileid)) {
-	free(tmp);
-	return FAIL_EINTERNAL;
-    }
-    bin2hex(&fileid, sizeof(fileid), fileidhex, sizeof(fileidhex));
-
-    op_expires_at = time(NULL) + JOB_FILE_MAX_TIME;
-    sxi_hashop_begin(&h->hc, h->sx_clust, tmp_unbump_cb, HASHOP_DELETE, vol->replica_count, NULL, &fileid, tmp, op_expires_at);
-
-    self = sx_hashfs_self(h);
-    nnodes = sx_nodelist_count(tmp->allnodes);
-    for(nnode = 0; nnode < nnodes; nnode++) {
-	const sx_node_t *node = sx_nodelist_get(tmp->allnodes, nnode);
-	int local = !sx_node_cmp(node, self);
-
-	DEBUG("Processing node %u / %u", nnode, nnodes);
-	for(nblock = 0; nblock < tmp->nall; nblock++) {
-	    DEBUG("Processing block %u / %u", nblock, tmp->nall);
-	    for(replica = 0; replica < tmp->replica_count; replica++) {
-		unsigned int idx = nblock * tmp->replica_count + replica;
-		unsigned int ntarget = tmp->nidxs[idx];
-		int avail = tmp->avlblty[idx];
-
-		DEBUG("Processing replica %u / %u: target %u, avail %d", replica, tmp->replica_count, ntarget, avail);
-		if(ntarget != nnode || !avail)
-		    continue;
-
-		if(local) {
-		    s = sx_hashfs_hashop_perform(h, tmp->block_size, tmp->replica_count, HASHOP_DELETE, &tmp->all_blocks[nblock], fileidhex, op_expires_at, NULL);
-		    if(s == OK) {
-			char hexhash[sizeof(sx_hash_t) * 2 + 1];
-			bin2hex(&tmp->all_blocks[nblock], sizeof(tmp->all_blocks[0]), hexhash, sizeof(hexhash));
-			tmp_unbump_cb(hexhash, idx, 200, tmp);
-		    } else {
-			WARN("hashop_perform failed: %s", rc2str(s));
-			ret = s;
-		    }
-		} else {
-		    s = sxi_hashop_batch_add(&h->hc, sx_node_internal_addr(node), idx, tmp->all_blocks[nblock].b, tmp->block_size);
-		    if(s) {
-			ret = s;
-			WARN("hashop_batch_add failed: %s", rc2str(s));
-		    }
-		}
-	    }
-	}
-    }
-
-    if(sxi_hashop_end(&h->hc) == -1) {
-	WARN("hashop_end failed: %s", sxc_geterrmsg(h->sx));
-	ret = FAIL_EINTERNAL;
-    }
-
-    if(tmp->somestatechanged) {
-	sqlite3_reset(h->qt_updateuniq);
-	if(!qbind_int64(h->qt_updateuniq, ":id", tmpfile_id) &&
-	   !qbind_blob(h->qt_updateuniq, ":uniq", "", 0) &&
-	   !qbind_blob(h->qt_updateuniq, ":avail", tmp->avlblty, tmp->nall * vol->replica_count))
-	    qstep_noret(h->qt_updateuniq);
-	sqlite3_reset(h->qt_updateuniq);
-    }
-
-
-    if(ret == OK) {
-	unsigned int idx = tmp->nall * tmp->replica_count;
-	ret = ITER_NO_MORE;
-	while(idx--) {
-	    if(tmp->avlblty[idx] != 0) {
-		ret = OK;
-		break;
-	    }
-	}
-    }
-
-    free(tmp);
-
-    return ret;
-}
-
 
 static rc_ty fill_filemeta(sx_hashfs_t *h, unsigned int metadb, int64_t file_id) {
     sqlite3_stmt *q = h->qm_metaget[metadb];
@@ -8029,7 +9890,7 @@ rc_ty sx_hashfs_volumemeta_next(sx_hashfs_t *h, const char **key, const void **v
     return sx_hashfs_getfilemeta_next(h, key, value, value_len);
 }
 
-rc_ty sx_hashfs_get_user_info(sx_hashfs_t *h, const uint8_t *user, sx_uid_t *uid, uint8_t *key, sx_priv_t *basepriv) {
+rc_ty sx_hashfs_get_user_info(sx_hashfs_t *h, const uint8_t *user, sx_uid_t *uid, uint8_t *key, sx_priv_t *basepriv, char **desc) {
     const uint8_t *kcol;
     rc_ty ret = FAIL_EINTERNAL;
     sx_priv_t userpriv;
@@ -8037,6 +9898,8 @@ rc_ty sx_hashfs_get_user_info(sx_hashfs_t *h, const uint8_t *user, sx_uid_t *uid
 
     if(!h || !user)
 	return EINVAL;
+    if (desc)
+        *desc = NULL;
 
     sqlite3_reset(h->q_getuser);
     if(qbind_blob(h->q_getuser, ":user", user, AUTH_UID_LEN))
@@ -8076,6 +9939,14 @@ rc_ty sx_hashfs_get_user_info(sx_hashfs_t *h, const uint8_t *user, sx_uid_t *uid
 	memcpy(key, kcol, AUTH_KEY_LEN);
     if(uid)
 	*uid = sqlite3_column_int64(h->q_getuser, 0);
+    if (desc) {
+        const char *udesc = (const char*)sqlite3_column_text(h->q_getuser, 3);
+        *desc = wrap_strdup(udesc ? udesc : "");
+        if (!*desc) {
+            ret = ENOMEM;
+            goto get_user_info_err;
+        }
+    }
     ret = OK;
 
 get_user_info_err:
@@ -8083,7 +9954,7 @@ get_user_info_err:
     return ret;
 }
 
-static rc_ty get_user_common(sx_hashfs_t *h, sx_uid_t uid, const char *name, uint8_t *user) {
+static rc_ty get_user_common(sx_hashfs_t *h, sx_uid_t uid, const char *name, uint8_t *user, int inactivetoo) {
     rc_ty ret = FAIL_EINTERNAL;
     sqlite3_stmt *q;
     int r;
@@ -8096,7 +9967,7 @@ static rc_ty get_user_common(sx_hashfs_t *h, sx_uid_t uid, const char *name, uin
     if(!name) {
 	q = h->q_getuserbyid;
 	sqlite3_reset(q);
-	if(qbind_int64(q, ":uid", uid)) 
+	if(qbind_int64(q, ":uid", uid) || qbind_int(q, ":inactivetoo", inactivetoo))
 	    goto get_user_common_fail;
     } else {
 	if(sx_hashfs_check_username(name)) {
@@ -8105,7 +9976,7 @@ static rc_ty get_user_common(sx_hashfs_t *h, sx_uid_t uid, const char *name, uin
 	}
 	q = h->q_getuserbyname;
 	sqlite3_reset(q);
-	if(qbind_text(q, ":name", name)) 
+	if(qbind_text(q, ":name", name) || qbind_int(q, ":inactivetoo", inactivetoo))
 	    goto get_user_common_fail;
     }
 
@@ -8126,20 +9997,52 @@ static rc_ty get_user_common(sx_hashfs_t *h, sx_uid_t uid, const char *name, uin
 }
 
 
-rc_ty sx_hashfs_get_user_by_uid(sx_hashfs_t *h, sx_uid_t uid, uint8_t *user) {
-    return get_user_common(h, uid, NULL, user);
+rc_ty sx_hashfs_get_user_by_uid(sx_hashfs_t *h, sx_uid_t uid, uint8_t *user, int inactivetoo) {
+    return get_user_common(h, uid, NULL, user, inactivetoo);
 }
 
-rc_ty sx_hashfs_get_user_by_name(sx_hashfs_t *h, const char *name, uint8_t *user) {
-    return get_user_common(h, -1, name, user);
+rc_ty sx_hashfs_get_user_by_name(sx_hashfs_t *h, const char *name, uint8_t *user, int inactivetoo) {
+    return get_user_common(h, -1, name, user, inactivetoo);
 }
 
-rc_ty sx_hashfs_get_access(sx_hashfs_t *h, sx_uid_t uid, const char *volume, sx_priv_t *access) {
+#define MAX_UID_GEN_TRIES     100
+/* TODO: Find a better way to generate unique UIDs */
+rc_ty sx_hashfs_generate_uid(sx_hashfs_t *h, uint8_t *uid) {
+    unsigned int i = 0;
+
+    if(!uid) {
+        NULLARG();
+        return FAIL_EINTERNAL;
+    }
+
+    if(qbegin(h->db)) {
+        WARN("Failed to lock database");
+        return FAIL_LOCKED;
+    }
+
+    sxi_rand_pseudo_bytes(uid + AUTH_CID_LEN, AUTH_UID_LEN - AUTH_CID_LEN);
+    while(sx_hashfs_get_user_info(h, uid, NULL, NULL, NULL, NULL) != ENOENT && i < MAX_UID_GEN_TRIES) {
+        i++;
+        sxi_rand_pseudo_bytes(uid + AUTH_CID_LEN, AUTH_UID_LEN - AUTH_CID_LEN);
+    }
+
+    if(i == MAX_UID_GEN_TRIES) {
+        WARN("Failed to generate user ID: reached iteration limit");
+        return EEXIST;
+    }
+
+    qrollback(h->db);
+    return OK;
+}
+
+rc_ty sx_hashfs_get_access(sx_hashfs_t *h, const uint8_t *user, const char *volume, sx_priv_t *access) {
     const sx_hashfs_volume_t *vol;
-    rc_ty ret;
+    rc_ty ret, rc;
     int r;
+    int64_t owner_id;
+    uint8_t owner_uid[AUTH_UID_LEN];
 
-    if(!h || !volume || !access)
+    if(!h || !user || !volume || !access)
 	return EINVAL;
 
     ret = sx_hashfs_volume_by_name(h, volume, &vol);
@@ -8148,7 +10051,7 @@ rc_ty sx_hashfs_get_access(sx_hashfs_t *h, sx_uid_t uid, const char *volume, sx_
 
     sqlite3_reset(h->q_getaccess);
     if(qbind_int64(h->q_getaccess, ":volume", vol->id) ||
-       qbind_int64(h->q_getaccess, ":user", uid))
+       qbind_blob(h->q_getaccess, ":user", user, AUTH_UID_LEN))
 	return FAIL_EINTERNAL;
 
     r = qstep(h->q_getaccess);
@@ -8163,10 +10066,22 @@ rc_ty sx_hashfs_get_access(sx_hashfs_t *h, sx_uid_t uid, const char *volume, sx_
     if(!(r & ~(PRIV_READ | PRIV_WRITE))) {
 	ret = OK;
 	*access = r;
-    } else
-	WARN("Found invalid priv for user %lld on volume %lld: %d", (long long int)uid, (long long int)vol->id, r);
-    if (sqlite3_column_int(h->q_getaccess, 1) == uid)
-	*access |= PRIV_ACL;
+    } else {
+        char hex[AUTH_UID_LEN*2+1];
+
+        bin2hex(user, AUTH_UID_LEN, hex, AUTH_UID_LEN*2+1);
+	WARN("Found invalid priv for user %s on volume %lld: %d", hex, (long long int)vol->id, r);
+    }
+
+    owner_id = sqlite3_column_int64(h->q_getaccess, 1);
+    if((rc = sx_hashfs_get_user_by_uid(h, owner_id, owner_uid, 0)) != OK) {
+        WARN("Failed to get volume %s owner by ID", volume);
+        return rc;
+    }
+
+    /* Compare common ID part of UIDs */
+    if(!memcmp(owner_uid, user, AUTH_CID_LEN))
+        *access |= PRIV_ACL;
 
     sqlite3_reset(h->q_getaccess);
     return ret;
@@ -8243,7 +10158,7 @@ static const char *locknames[] = {
     "USER", /* JOBTYPE_CREATE_USER */
     "ACL", /* JOBTYPE_VOLUME_ACL */
     NULL, /* JOBTYPE_REPLICATE_BLOCKS */
-    "TOKEN", /* JOBTYPE_FLUSH_FILE */
+    "TOKEN", /* JOBTYPE_FLUSH_FILE_REMOTE */
     "DELFILE", /* JOBTYPE_DELETE_FILE */
     "*", /* JOBTYPE_DISTRIBUTION */
     "STARTREBALANCE", /* JOBTYPE_STARTREBALANCE */
@@ -8260,6 +10175,13 @@ static const char *locknames[] = {
     "REPLACE_BLOCKS", /* JOBTYPE_REPLACE_BLOCKS */
     "REPLACE_FILES", /* JOBTYPE_REPLACE_FILES */
     NULL, /* JOBTYPE_DUMMY */
+    NULL, /* JOBTYPE_REVSCLEAN */
+    "DISTLOCK", /* JOBTYPE_DISTLOCK */
+    "CLUSTER_MODE", /* JOBTYPE_CLUSTER_MODE */
+    "IGNNODES", /* JOBTYPE_IGNODES */
+    NULL, /* JOBTYPE_BLOCKS_REVISION */
+    "TOKEN_LOCAL", /* JOBTYPE_FLUSH_FILE_LOCAL */
+    "UPGRADE", /* JOBTYPE_UPGRADE_1_0_TO_1_1 */
 };
 
 #define MAX_PENDING_JOBS 128
@@ -8285,7 +10207,7 @@ rc_ty sx_hashfs_countjobs(sx_hashfs_t *h, sx_uid_t user_id) {
 rc_ty sx_hashfs_job_new_begin(sx_hashfs_t *h) {
     int r;
 
-    DEBUG("IN %s", __FUNCTION__);
+    DEBUG("IN %s", __func__);
     if(!h) {
 	NULLARG();
 	return EFAULT;
@@ -8387,7 +10309,7 @@ rc_ty sx_hashfs_job_new_notrigger(sx_hashfs_t *h, job_t parent, sx_uid_t user_id
     if(!data)
 	data = "";
 
-    if (type < 0 || type >= sizeof(locknames) / sizeof(locknames[0])) {
+    if ((unsigned)type >= sizeof(locknames) / sizeof(locknames[0])) {
 	msg_set_reason("Internal error: bad action type");
 	goto addjob_error;
     }
@@ -8438,7 +10360,7 @@ rc_ty sx_hashfs_job_new_notrigger(sx_hashfs_t *h, job_t parent, sx_uid_t user_id
 
     r = qstep(h->qe_addjob);
     if(r == SQLITE_CONSTRAINT) {
-	msg_set_reason("Resource is temporarily locked");
+	msg_set_reason("Resource is temporarily locked%s%s", lockstr ? ": " : "", lockstr ? lockstr : "");
 	ret = FAIL_LOCKED;
 	goto addjob_error;
     }
@@ -8614,25 +10536,28 @@ rc_ty sx_hashfs_job_unlock(sx_hashfs_t *h, const char *owner) {
     return ret;
 }
 
+static void ignore(int v)
+{
+    if (v < 0)
+        PWARN("ignoring write failure");
+}
+
 void sx_hashfs_job_trigger(sx_hashfs_t *h) {
     if(h && h->job_trigger >= 0) {
-	int w = write(h->job_trigger, ".", 1);
-	w = w;
+        ignore(write(h->job_trigger, ".", 1));
     }
 }
 
 void sx_hashfs_xfer_trigger(sx_hashfs_t *h) {
     if(h && h->xfer_trigger >= 0) {
-	int w = write(h->xfer_trigger, ".", 1);
-	w = w;
+        ignore(write(h->xfer_trigger, ".", 1));
     }
 }
 
 void sx_hashfs_gc_trigger(sx_hashfs_t *h) {
     if(h && h->gc_trigger >= 0) {
         INFO("triggered GC");
-	int w = write(h->gc_trigger, ".", 1);
-	w = w;
+        ignore(write(h->gc_trigger, ".", 1));
     }
 }
 
@@ -8687,6 +10612,8 @@ rc_ty sx_hashfs_xfer_tonodes(sx_hashfs_t *h, sx_hash_t *block, unsigned int size
     ret = (i == nnodes) ? OK : FAIL_EINTERNAL;
     DEBUG("xfer_to_nodes job added: %s", ret == OK ? "OK" : "Error");
 
+    /* Trigger block manager to perform pushes */
+    sx_hashfs_xfer_trigger(h);
  xfer_err:
     sqlite3_reset(h->qx_add);
 
@@ -8713,204 +10640,160 @@ rc_ty sx_hashfs_xfer_tonode(sx_hashfs_t *h, sx_hash_t *block, unsigned int size,
     return ret;
 }
 
+static rc_ty hash_of_blob_result(sx_hash_t *hash, sqlite3_stmt *stmt, int col)
+{
+    int len = sqlite3_column_bytes(stmt, col);
+    if (len != sizeof(hash->b)) {
+        WARN("Bad blob result length: %d", len);
+        return FAIL_EINTERNAL;
+    }
+    memcpy(hash->b, sqlite3_column_blob(stmt, col), sizeof(hash->b));
+    return OK;
+}
+
+static rc_ty foreach_hdb_blob(sx_hashfs_t *h, int *terminate,
+                              sqlite3_stmt *loop[][HASHDBS], const char *loopvar, int col, uint64_t *count)
+{
+    unsigned i,j;
+    int64_t k;
+    if (!h || !terminate || !loop || !count) {
+	NULLARG();
+        return EFAULT;
+    }
+    *count = 0;
+    for (j=0;j<SIZES && !*terminate;j++) {
+        for (i=0;i<HASHDBS && !*terminate;i++) {
+            int ret;
+            sqlite3_stmt *q = loop[j][i];
+            DEBUG("Running %s", sqlite3_sql(q));
+            sqlite3_stmt *q_gc1 = h->qb_gc_revision_blocks[j][i];
+            sqlite3_stmt *q_gc2 = h->qb_gc_revision[j][i];
+            sqlite3_stmt *q_gc3 = h->qb_gc_reserve[j][i];
+            sqlite3_reset(q);
+            if (loopvar && qbind_blob(q, loopvar, "", 0))
+                return FAIL_EINTERNAL;
+            int has_last;
+            do {
+                has_last = 0;
+                if (qbegin(h->datadb[j][i]))
+                    return FAIL_EINTERNAL;
+                ret = SQLITE_ROW;
+                sqlite3_reset(q);
+                sx_hash_t last;
+                for (k=0;k<gc_max_batch && ret == SQLITE_ROW && !*terminate; k++) {
+                    ret = qstep(q);
+                    if (ret == SQLITE_ROW) {
+                        sx_hash_t var;
+                        sqlite3_reset(q_gc1);
+                        sqlite3_reset(q_gc2);
+                        if (!hash_of_blob_result(&last, q, 0) &&
+                            !hash_of_blob_result(&var, q, col) &&
+                            !qbind_blob(q_gc1, ":revision_id", var.b, sizeof(var.b)) &&
+                            !qbind_blob(q_gc2, ":revision_id", var.b, sizeof(var.b)) &&
+                            !qbind_blob(q_gc3, ":revision_id", var.b, sizeof(var.b)) &&
+                            !qstep_noret(q_gc1)) {
+                            has_last = 1;
+                            k += sqlite3_changes(h->datadb[j][i]->handle);
+                            if (!qstep_noret(q_gc2)) {
+                                k += sqlite3_changes(h->datadb[j][i]->handle);
+                                if (!qstep_noret(q_gc3)) {
+                                    k += sqlite3_changes(h->datadb[j][i]->handle);
+                                    (*count)++;
+                                }
+                            } else {
+                                ret = -1;
+                            }
+                        } else {
+                            ret = -1;
+                        }
+                        DEBUGHASH("Got revision_id", &var);
+                        DEBUGHASH("Got loop id", &last);
+                    }
+                }
+                sqlite3_reset(q);
+                if ((ret == SQLITE_ROW || ret == SQLITE_DONE) && qcommit(h->datadb[j][i]))
+                    return FAIL_EINTERNAL;
+                if(loopvar && has_last && qbind_blob(q, loopvar, last.b, sizeof(last.b)))
+                    ret = -1;
+            } while (!*terminate && (ret == SQLITE_ROW || (ret == SQLITE_DONE && has_last)));
+            sqlite3_reset(q);
+            sqlite3_reset(q_gc1);
+            sqlite3_reset(q_gc2);
+            if (ret != SQLITE_DONE) {
+                qrollback(h->datadb[j][i]);
+                return FAIL_EINTERNAL;
+            }
+        }
+    }
+    return OK;
+}
+
+static rc_ty bindall(sqlite3_stmt *stmt[][HASHDBS], const char *var, int64_t val)
+{
+    unsigned j, i;
+    if (!stmt) {
+        NULLARG();
+        return EFAULT;
+    }
+    for (j=0;j<SIZES;j++) {
+        for (i=0;i<HASHDBS;i++) {
+            sqlite3_reset(stmt[j][i]);
+            if (qbind_int64(stmt[j][i], var, val))
+                return FAIL_EINTERNAL;
+        }
+    }
+    return OK;
+}
+
 rc_ty sx_hashfs_gc_periodic(sx_hashfs_t *h, int *terminate, int grace_period)
 {
-    unsigned i, j, k;
     /* tokens expire when there was no upload activity within GC_GRACE_PERIOD
      * (i.e. ~2 days) */
     uint64_t real_now = time(NULL), now;
-    uint64_t gc = 0, gcops = 0, expires = real_now - grace_period;
-    int ret1 = 0, ret2 = 0;
-    sqlite3_reset(h->qt_gc_tokens);
+    uint64_t gc_noactivity = 0, gc_ttl = 0, expires = real_now - grace_period;
+    rc_ty ret = OK;
+    sqlite3_reset(h->qt_gc_revisions);
     if (grace_period < 0) {
         now = 1ll << 62;
         DEBUG("now set to: %lld", (long long)now);
     } else
         now = real_now;
-    if (qbind_int64(h->qt_gc_tokens, ":now", now) ||
-        qstep_noret(h->qt_gc_tokens))
+    if (qbind_int64(h->qt_gc_revisions, ":now", now) ||
+        qstep_noret(h->qt_gc_revisions))
         return FAIL_EINTERNAL;
     INFO("Deleted %d tokens", sqlite3_changes(h->tempdb->handle));
-    for (j=0;j<SIZES && !ret1 && !ret2 && !*terminate;j++) {
-        for (i=0;i<HASHDBS && !ret1 && !ret2 && !*terminate;i++) {
-            if (qbind_blob(h->qb_find_expired_reservation[j][i], ":lastreserveid", "", 0)) {
-                ret1 = -1;
-                break;
-            }
-            /* TODO: eliminate code duplication and use a function */
-            ret1 = SQLITE_ROW;
-            do {
-              if (qbegin(h->datadb[j][i])) {
-                    ret1 = -1;
-                    break;
-              }
-              for (k=0;k<gc_max_batch && ret1 == SQLITE_ROW && !*terminate;k++) {
-                sx_hash_t last;
-                sqlite3_stmt *q = h->qb_find_expired_reservation[j][i];
-                sqlite3_stmt *q_gc = h->qb_gc_reserve[j][i];
-                sqlite3_reset(q);
-                sqlite3_reset(q_gc);
-                if (qbind_int64(q, ":expires", expires)) {
-                    ret1 = -1;
-                    break;
-                }
-                DEBUG("find_expired, expires: %lld", (long long)expires);
-                ret1 = qstep(q);
-                if (ret1 == SQLITE_ROW) {
-                    if (sqlite3_column_bytes(q, 0) != sizeof(last.b)) {
-                        WARN("bad reserveid length");
-                        ret1 = -1;
-                        break;
-                    }
-                    memcpy(last.b, sqlite3_column_blob(q, 0), sizeof(last.b));
-                    sqlite3_reset(q);
-                    if (qbind_blob(q, ":lastreserveid", last.b, sizeof(last.b))) {
-                        ret1 = -1;
-                        break;
-                    }
-                    if (!qbind_blob(q_gc, ":reserveid", last.b, sizeof(last.b)) &&
-                        !qstep_noret(q_gc)) {
-                        gc++;
-                    }
-                }
-                sqlite3_reset(q);
-                sqlite3_reset(q_gc);
-                if (ret1 == SQLITE_DONE) {
-                    DEBUG("find_expired: done");
-                    ret1 = 0;
-                }
-	     }
-             if (qcommit(h->datadb[j][i])) {
-                 ret1 = -1;
-                 break;
-             }
-            } while (ret1 == SQLITE_ROW);
-            if (ret1) {
-               qrollback(h->datadb[j][i]);
-               break;
-            }
-            if (qbind_int64(h->qb_find_expired_reservation2[j][i], ":lastrowid", 0)) {
-                ret1 = -1;
-                break;
-            }
-            do {
-              if (qbegin(h->datadb[j][i])) {
-                    ret1 = -1;
-                    break;
-              }
-              for (k=0;k<gc_max_batch && ret1 == SQLITE_ROW && !*terminate;k++) {
-                sqlite3_stmt *q = h->qb_find_expired_reservation2[j][i];
-                sqlite3_stmt *q_gc = h->qb_gc_reserve2[j][i];
-                sqlite3_reset(q);
-                sqlite3_reset(q_gc);
-                if (qbind_int64(q, ":now", now)) {
-                    ret1 = -1;
-                    break;
-                }
-                ret1 = qstep(q);
-                if (ret1 == SQLITE_ROW) {
-                    int64_t last_rowid = sqlite3_column_int64(q, 0);
-                    sqlite3_reset(q);
-                    if (qbind_int64(q, ":lastrowid", last_rowid)) {
-                        ret1 = -1;
-                        break;
-                    }
-                    if (!qbind_int64(q_gc, ":rowid", last_rowid) &&
-                        !qstep_noret(q_gc)) {
-                        gc++;
-                    }
-                }
-                sqlite3_reset(q);
-                sqlite3_reset(q_gc);
-                if (ret1 == SQLITE_DONE)
-                    ret1 = 0;
-             }
-             if (qcommit(h->datadb[j][i])) {
-                 ret1 = -1;
-                 break;
-             }
-	    } while (ret1 == SQLITE_ROW);
-            if (ret1) {
-               qrollback(h->datadb[j][i]);
-               break;
-            }
-            ret2 = SQLITE_ROW;
-	    do {
-              if (qbegin(h->datadb[j][i])) {
-                    ret1 = -1;
-                    break;
-              }
-              for (k=0;k<gc_max_batch && ret2 == SQLITE_ROW && !*terminate;k++) {
-		sqlite3_stmt *q = h->qb_find_expired_ops[j][i];
-                sqlite3_stmt *q_gc = h->qb_gc_op[j][i];
-                sqlite3_reset(q);
-                sqlite3_reset(q_gc);
-                if (qbind_int64(q, ":now", real_now)) {
-                    ret2 = -1;
-                    break;
-                }
-                ret2 = qstep(q);
-                if (ret2 == SQLITE_ROW) {
-                    if (!qbind_int64(q_gc, ":rowid", sqlite3_column_int64(q, 0)) &&
-                        !qstep_noret(q_gc)) {
-                        gcops++;
-                    }
-                }
-                if (ret2 == SQLITE_DONE)
-                    ret2 = 0;
-                sqlite3_reset(q);
-                sqlite3_reset(q_gc);
-              }
-              if (qcommit(h->datadb[j][i])) {
-                 ret2 = -1;
-                 break;
-              }
-            } while (ret2 == SQLITE_ROW);
-            if (ret2) {
-               qrollback(h->datadb[j][i]);
-               break;
-            }
-        }
-    }
-    INFO("GCed %lld reservations, %lld operations", (long long)gc, (long long)gcops);
-    return (ret1 || ret2) ? FAIL_EINTERNAL : OK;
+    DEBUG("find_expired, expires: %lld", (long long)expires);
+    if (bindall(h->qb_find_expired_reservation, ":expires", expires) ||
+        bindall(h->qb_find_expired_reservation2, ":now", now) ||
+        foreach_hdb_blob(h, terminate,
+                         h->qb_find_expired_reservation, ":lastreserve_id",
+                         1, &gc_noactivity) ||
+        foreach_hdb_blob(h, terminate,
+                         h->qb_find_expired_reservation2, NULL, 0, &gc_ttl))
+        ret = FAIL_EINTERNAL;
+    INFO("GCed reservations: no activity %lld, ttl expired %lld", (long long)gc_noactivity, (long long)gc_ttl);
+    if (gc_eventdb(h))
+        ret = FAIL_EINTERNAL;
+    return ret;
 }
 
 rc_ty sx_hashfs_gc_run(sx_hashfs_t *h, int *terminate)
 {
     unsigned i, j, k;
-    uint64_t gc = 0;
+    uint64_t gc_unused_tokens = 0, gc_blocks = 0;
     int ret = 0;
-    int64_t bad = 0;
-    for (j=0;j<SIZES && !ret && !*terminate; j++) {
-        for (i=0;i<HASHDBS && !ret && !*terminate;i++) {
-            sqlite3_reset(h->qb_find_bad[j][i]);
-            do {
-                ret = qstep(h->qb_find_bad[j][i]);
-                if (ret == SQLITE_ROW)
-                    bad += sqlite3_column_int64(h->qb_find_bad[j][i], 0);
-            } while(ret == SQLITE_ROW);
-            if (ret != SQLITE_DONE) {
-                WARN("Cannot query block counters");
-                return FAIL_EINTERNAL;
-            }
-            sqlite3_reset(h->qb_find_bad[j][i]);
-        }
-    }
-    if (bad > 0) {
-        if (sx_hashfs_is_rebalancing(h))
-            /* can happen during rebalance without causing data loss */
-            INFO("Not running garbage collection, %llu block counters are negative", (long long)bad);
-        else
-            CRIT("Refusing to run garbage collection to avoid data loss: %llu block counters are negative", (long long)bad);
-        return FAIL_EINTERNAL;
-    }
     ret = 0;
 
+    int age = sxi_hdist_version(h->hd);
+    if (bindall(h->qb_find_unused_revision, ":age", age) ||
+        foreach_hdb_blob(h, terminate,
+                         h->qb_find_unused_revision, ":last_revision_id",
+                         0, &gc_unused_tokens))
+        ret = -1;
     for (j=0;j<SIZES && !ret && !*terminate ;j++) {
         for (i=0;i<HASHDBS && !ret && !*terminate;i++) {
             int64_t last = 0;
-            sqlite3_stmt *q = h->qb_find_unused[j][i];
+            sqlite3_stmt *q = h->qb_find_unused_block[j][i];
             sqlite3_stmt *q_gc = h->qb_gc1[j][i];
             sqlite3_stmt *q_setfree = h->qb_setfree[j][i];
             do {
@@ -8949,7 +10832,7 @@ rc_ty sx_hashfs_gc_run(sx_hashfs_t *h, int *terminate)
                         ret = -1;
                         break;
                     }
-                    gc++;
+                    gc_blocks++;
                 }
                 sqlite3_reset(q);
                 sqlite3_reset(q_gc);
@@ -8963,10 +10846,10 @@ rc_ty sx_hashfs_gc_run(sx_hashfs_t *h, int *terminate)
                     }
                 } else
                     qrollback(h->datadb[j][i]);
-            } while (ret == SQLITE_ROW);
+            } while (ret == SQLITE_ROW && !*terminate);
         }
     }
-    INFO("GCed %lld hashes", (long long)gc);
+    INFO("GCed %lld hashes and %lld unused tokens", (long long)gc_blocks, (long long)gc_unused_tokens);
     return ret ? FAIL_EINTERNAL : OK;
 }
 
@@ -9003,9 +10886,9 @@ rc_ty sx_hashfs_gc_info(sx_hashfs_t *h, int *terminate)
     struct timeval tv0, tv1;
     gettimeofday(&tv0, NULL);
     if (print_datadb_count(h, "blocks", terminate) ||
+        print_datadb_count(h, "revision_ops", terminate) ||
         print_datadb_count(h, "reservations", terminate) ||
-        print_datadb_count(h, "operations", terminate) ||
-        print_datadb_count(h, "use", terminate) ||
+        print_datadb_count(h, "revision_blocks", terminate) ||
         print_datadb_count(h, "avail", terminate))
         ret = FAIL_EINTERNAL;
     gettimeofday(&tv1, NULL);
@@ -9017,9 +10900,8 @@ rc_ty sx_hashfs_gc_expire_all_reservations(sx_hashfs_t *h)
 {
     if(h && h->gc_trigger >= 0 && h->gc_expire_trigger >= 0) {
         INFO("triggered force expire");
-        int w = write(h->gc_expire_trigger, ".", 1);
-	w = write(h->gc_trigger, ".", 1);
-	w = w;
+        ignore(write(h->gc_expire_trigger, ".", 1));
+        ignore(write(h->gc_trigger, ".", 1));
     }
     return OK;
 }
@@ -9037,7 +10919,7 @@ rc_ty sx_hashfs_hdist_change_req(sx_hashfs_t *h, const sx_nodelist_t *newdist, j
     const void *cfg;
     rc_ty r;
 
-    DEBUG("IN %s", __FUNCTION__);
+    DEBUG("IN %s", __func__);
     if(!h || !newdist || !job_id) {
 	NULLARG();
 	return EFAULT;
@@ -9055,6 +10937,11 @@ rc_ty sx_hashfs_hdist_change_req(sx_hashfs_t *h, const sx_nodelist_t *newdist, j
 
     if(sx_nodelist_count(h->faulty_nodes)) {
 	msg_set_reason("The cluster contains faulty nodes which are still being replaced");
+	return EINVAL;
+    }
+
+    if(sx_nodelist_count(h->ignored_nodes)) {
+	msg_set_reason("The cluster is degraded, please replace all faulty nodes and try again");
 	return EINVAL;
     }
 
@@ -9089,6 +10976,11 @@ rc_ty sx_hashfs_hdist_change_req(sx_hashfs_t *h, const sx_nodelist_t *newdist, j
     for(i=0; i<nnodes; i++) {
 	const sx_node_t *n = sx_nodelist_get(newdist, i);
 	unsigned int j;
+	if(sx_node_capacity(n) < SXLIMIT_MIN_NODE_SIZE) {
+	    sxi_hdist_free(newmod);
+	    msg_set_reason("Invalid capacity: Node %s cannot be smaller than %u bytes", sx_node_uuid_str(n), SXLIMIT_MIN_NODE_SIZE);
+	    return EINVAL;
+	}
 	for(j=i+1; j<nnodes; j++) {
 	    const sx_node_t *other = sx_nodelist_get(newdist, j);
 	    if(!sx_node_cmp(n, other)) {
@@ -9148,7 +11040,6 @@ rc_ty sx_hashfs_hdist_change_req(sx_hashfs_t *h, const sx_nodelist_t *newdist, j
     if(r) {
 	sx_nodelist_delete(targets);
 	sxi_hdist_free(newmod);
-	msg_set_reason("Failed to setup job targets");
 	return r;
     }
 
@@ -9202,7 +11093,7 @@ rc_ty sx_hashfs_hdist_replace_req(sx_hashfs_t *h, const sx_nodelist_t *replaceme
     const void *cfg;
     rc_ty r;
 
-    DEBUG("IN %s", __FUNCTION__);
+    DEBUG("IN %s", __func__);
     if(!h || !replacements || !job_id) {
 	NULLARG();
 	return EFAULT;
@@ -9223,7 +11114,16 @@ rc_ty sx_hashfs_hdist_replace_req(sx_hashfs_t *h, const sx_nodelist_t *replaceme
 	return EINVAL;
     }
 
-    curdist = sx_hashfs_nodelist(h, NL_PREV);
+    for(i = 0; i<sx_nodelist_count(h->ignored_nodes); i++) {
+	const sx_node_t *ignode = sx_nodelist_get(h->ignored_nodes, i);
+	const sx_uuid_t *ignuuid = sx_node_uuid(ignode);
+	if(sx_nodelist_lookup(replacements, ignuuid))
+	    continue;
+	msg_set_reason("Faulty node %s must be replaced too", ignuuid->string);
+	return EINVAL;
+    }
+
+    curdist = sx_hashfs_all_nodes(h, NL_PREV);
     nnodes = sx_nodelist_count(replacements);
     if(!nnodes) {
 	msg_set_reason("No node replacement requested");
@@ -9358,7 +11258,7 @@ rc_ty sx_hashfs_hdist_change_add(sx_hashfs_t *h, const void *cfg, unsigned int c
     sqlite3_stmt *q = NULL;
     rc_ty ret;
 
-    DEBUG("IN %s", __FUNCTION__);
+    DEBUG("IN %s", __func__);
     if(!h || !cfg) {
 	NULLARG();
 	return EINVAL;
@@ -9414,6 +11314,11 @@ rc_ty sx_hashfs_hdist_change_add(sx_hashfs_t *h, const void *cfg, unsigned int c
     for(i = 0; i<nnodes; i++) {
 	const sx_node_t *n = sx_nodelist_get(nodes, i);
 	unsigned int j;
+	if(sx_node_capacity(n) < SXLIMIT_MIN_NODE_SIZE) {
+	    msg_set_reason("Invalid capacity: Node %s cannot be smaller than %u bytes", sx_node_uuid_str(n), SXLIMIT_MIN_NODE_SIZE);
+	    ret = EINVAL;
+	    goto change_add_fail;
+	}
 	for(j=i+1; j<nnodes; j++) {
 	    const sx_node_t *other = sx_nodelist_get(nodes, j);
 	    if(!sx_node_cmp(n, other)) {
@@ -9516,7 +11421,7 @@ rc_ty sx_hashfs_hdist_replace_add(sx_hashfs_t *h, const void *cfg, unsigned int 
     sqlite3_stmt *q = NULL;
     rc_ty ret;
 
-    DEBUG("IN %s", __FUNCTION__);
+    DEBUG("IN %s", __func__);
     if(!h || !cfg || !badnodes) {
 	NULLARG();
 	return EINVAL;
@@ -9535,6 +11440,15 @@ rc_ty sx_hashfs_hdist_replace_add(sx_hashfs_t *h, const void *cfg, unsigned int 
 
     if(sx_nodelist_count(h->faulty_nodes)) {
 	msg_set_reason("The cluster contains faulty nodes which are still being replaced");
+	return EINVAL;
+    }
+
+    for(i = 0; i<sx_nodelist_count(h->ignored_nodes); i++) {
+	const sx_node_t *ignode = sx_nodelist_get(h->ignored_nodes, i);
+	const sx_uuid_t *ignuuid = sx_node_uuid(ignode);
+	if(sx_nodelist_lookup(badnodes, ignuuid))
+	    continue;
+	msg_set_reason("Node %s is currently marked as fault and must be replaced", ignuuid->string);
 	return EINVAL;
     }
 
@@ -9568,7 +11482,7 @@ rc_ty sx_hashfs_hdist_replace_add(sx_hashfs_t *h, const void *cfg, unsigned int 
 	goto replace_add_fail;
     }
     if(h->have_hd) {
-	oldnodes = sx_hashfs_nodelist(h, NL_NEXT);
+	oldnodes = sx_hashfs_all_nodes(h, NL_NEXT);
 	if(nnodes != sx_nodelist_count(oldnodes)) {
 	    msg_set_reason("Distribution has changed: different count.");
 	    ret = EINVAL;
@@ -9737,18 +11651,41 @@ rc_ty sx_hashfs_hdist_change_revoke(sx_hashfs_t *h) {
 	return FAIL_EINTERNAL;
 
     if(h->have_hd) {
-	/* Revert to previous distribution */
-	if(qprep(h->db, &q, "DELETE FROM hashfs WHERE key IN ('dist_rev', 'dist')") || qstep_noret(q))
+	/* Revert to previous distribution (if any exists) */
+	int rcount;
+	if(qprep(h->db, &q, "SELECT COUNT(*) FROM hashfs WHERE key IN ('current_dist_rev', 'current_dist')") || qstep_ret(q))
 	    goto change_revoke_fail;
+	rcount = sqlite3_column_int(q, 0);
 	qnullify(q);
+	if(rcount == 2) {
+	    if(qprep(h->db, &q, "DELETE FROM hashfs WHERE key IN ('dist_rev', 'dist')") || qstep_noret(q))
+		goto change_revoke_fail;
+	    qnullify(q);
 
-	if(qprep(h->db, &q, "UPDATE hashfs SET key = 'dist' WHERE key = 'current_dist'") || qstep_noret(q))
-	    goto change_revoke_fail;
-	qnullify(q);
+	    if(qprep(h->db, &q, "UPDATE hashfs SET key = 'dist' WHERE key = 'current_dist'") || qstep_noret(q))
+		goto change_revoke_fail;
+	    qnullify(q);
 
-	if(qprep(h->db, &q, "UPDATE hashfs SET key = 'dist_rev' WHERE key = 'current_dist_rev'") || qstep_noret(q))
-	    goto change_revoke_fail;
-	qnullify(q);
+	    if(qprep(h->db, &q, "UPDATE hashfs SET key = 'dist_rev' WHERE key = 'current_dist_rev'") || qstep_noret(q))
+		goto change_revoke_fail;
+	    qnullify(q);
+	} else if(rcount != 0) {
+	    WARN("Found severe inconsistentencies in the distribution, attempting to recover");
+	    /* Should really never land in here */
+	    if(qprep(h->db, &q, "DELETE FROM hashfs WHERE key = 'dist_rev' AND EXISTS (SELECT 1 FROM hashfs WHERE key = 'current_dist_rev')") || qstep_noret(q))
+		goto change_revoke_fail;
+	    qnullify(q);
+	    if(qprep(h->db, &q, "UPDATE hashfs SET key = 'dist_rev' WHERE key = 'current_dist_rev'") || qstep_noret(q))
+		goto change_revoke_fail;
+	    qnullify(q);
+
+	    if(qprep(h->db, &q, "DELETE FROM hashfs WHERE key = 'dist' AND EXISTS (SELECT 1 FROM hashfs WHERE key = 'current_dist')") || qstep_noret(q))
+		goto change_revoke_fail;
+	    qnullify(q);
+	    if(qprep(h->db, &q, "UPDATE hashfs SET key = 'dist' WHERE key = 'current_dist'") || qstep_noret(q))
+		goto change_revoke_fail;
+	    qnullify(q);
+	}
     } else {
 	/* Revirgin the node */
 	if(qprep(h->db, &q, "DELETE FROM hashfs WHERE key IN ('current_dist_rev', 'current_dist', 'dist_rev', 'dist', 'cluster_name')") || qstep_noret(q))
@@ -9896,7 +11833,7 @@ static rc_ty create_repair_job(sx_hashfs_t *h) {
     job_t job_id;
     rc_ty ret;
 
-    DEBUG("IN %s", __FUNCTION__);
+    DEBUG("IN %s", __func__);
     singlenode = sx_nodelist_new();
     if(!singlenode) {
 	WARN("Cannot allocate single node nodelist");
@@ -9929,7 +11866,7 @@ static rc_ty create_repair_job(sx_hashfs_t *h) {
 
  create_repair_err:
     sx_nodelist_delete(singlenode);
-    DEBUG("OUT %s with %d", __FUNCTION__, ret);
+    DEBUG("OUT %s with %d", __func__, ret);
     return ret;
 }
 
@@ -9937,7 +11874,7 @@ rc_ty sx_hashfs_hdist_change_commit(sx_hashfs_t *h) {
     sqlite3_stmt *q = NULL;
     rc_ty s = OK;
 
-    DEBUG("IN %s", __FUNCTION__);
+    DEBUG("IN %s", __func__);
     if(qprep(h->db, &q, "DELETE FROM hashfs WHERE key IN ('current_dist', 'current_dist_rev')") ||
        qstep_noret(q)) {
 	msg_set_reason("Failed to enable new distribution model");
@@ -9959,7 +11896,7 @@ rc_ty sx_hashfs_hdist_rebalance(sx_hashfs_t *h) {
     const sx_node_t *self = sx_hashfs_self(h);
     rc_ty ret;
 
-    DEBUG("IN %s", __FUNCTION__);
+    DEBUG("IN %s", __func__);
 
     sqlite3_reset(h->qx_wipehold);
     if(qstep_noret(h->qx_wipehold)) {
@@ -10248,24 +12185,30 @@ void sx_hashfs_blockmeta_free(block_meta_t **blockmetaptr)
     *blockmetaptr = NULL;
 }
 
-static rc_ty fill_block_meta(sx_hashfs_t *h, sqlite3_stmt *qmeta, block_meta_t *blockmeta, int64_t blockid)
+static rc_ty fill_block_meta(sx_hashfs_t *h, sqlite3_stmt *qmeta, block_meta_t *blockmeta)
 {
     int ret;
-    if (qbind_int64(qmeta, ":blockid", blockid))
+    if (qbind_blob(qmeta, ":hash", blockmeta->hash.b, sizeof(blockmeta->hash.b)))
         return FAIL_EINTERNAL;
     blockmeta->count = 0;
-    blockmeta->blockid = blockid;
     sqlite3_reset(qmeta);
     while ((ret = qstep(qmeta)) == SQLITE_ROW) {
-        int count = sqlite3_column_int(qmeta, 1);
-        if (!count)
+        int op = sqlite3_column_int(qmeta, 1);
+        if (!op)
             continue;
         blockmeta->entries = wrap_realloc_or_free(blockmeta->entries, ++blockmeta->count * sizeof(*blockmeta->entries));
         if (!blockmeta->entries)
             return ENOMEM;
         block_meta_entry_t *e = &blockmeta->entries[blockmeta->count - 1];
+        int len = sqlite3_column_bytes(qmeta, 2);
+        if (len != sizeof(e->revision_id.b)) {
+            WARN("bad revision size: %d", len);
+            return FAIL_EINTERNAL;
+        }
+        memcpy(&e->revision_id.b, sqlite3_column_blob(qmeta, 2), len);
         e->replica = sqlite3_column_int(qmeta, 0);
-        e->count = count;
+        DEBUG("set replica to %d", e->replica);
+        e->op = op;
     }
     sqlite3_reset(qmeta);
     if (ret != SQLITE_DONE)
@@ -10285,14 +12228,13 @@ static rc_ty sx_hashfs_blockmeta_get(sx_hashfs_t *h, rc_ty ret, sqlite3_stmt *q,
             return FAIL_EINTERNAL;
         }
     } else if (ret == SQLITE_ROW) {
-        int64_t blockid = sqlite3_column_int64(q, 0);
-        if (sqlite3_column_bytes(q, 1) != sizeof(blockmeta->hash)) {
-            WARN("bad blob size");
+        if (sqlite3_column_bytes(q, 0) != sizeof(blockmeta->hash)) {
+            WARN("bad blob size for query: %s", sqlite3_sql(q));
             sqlite3_reset(q);
             sqlite3_reset(qmeta);
             return FAIL_EINTERNAL;
         }
-        memcpy(blockmeta, sqlite3_column_blob(q, 1), sizeof(blockmeta->hash));
+        memcpy(blockmeta, sqlite3_column_blob(q, 0), sizeof(blockmeta->hash));
         blockmeta->blocksize = blocksize;
         sqlite3_reset(q);
         if (qbind_blob(q, ":prevhash", blockmeta->hash.b, sizeof(blockmeta->hash.b))) {
@@ -10300,7 +12242,7 @@ static rc_ty sx_hashfs_blockmeta_get(sx_hashfs_t *h, rc_ty ret, sqlite3_stmt *q,
             sqlite3_reset(qmeta);
             return FAIL_EINTERNAL;
         }
-        if (fill_block_meta(h, qmeta, blockmeta, blockid)) {
+        if (fill_block_meta(h, qmeta, blockmeta)) {
             sqlite3_reset(q);
             sqlite3_reset(qmeta);
             WARN("failed to fill block meta");
@@ -10328,28 +12270,34 @@ static rc_ty sx_hashfs_blocks_retry_next(sx_hashfs_t *h, block_meta_t *blockmeta
 {
     sqlite3_stmt *q = h->rit.q_sel;
     sqlite3_reset(q);
-    rc_ty ret = qstep(q);
-    int hs;
+    rc_ty ret;
+    do {
+        ret = qstep(q);
+        int hs;
 
-    if (ret == SQLITE_DONE) {
-        sx_hashfs_blockmeta_get(h, ret, q, NULL, 0, NULL);
-        return ITER_NO_MORE;
-    }
-    if (ret == SQLITE_ROW) {
-        int bs = sqlite3_column_int(q, 2);
-        for(hs = 0; hs < SIZES; hs++)
-            if(bsz[hs] == bs)
-                break;
-        if(hs == SIZES) {
-            WARN("bad blocksize: %d", bs);
-            return FAIL_BADBLOCKSIZE;
+        if (ret == SQLITE_DONE) {
+            sx_hashfs_blockmeta_get(h, ret, q, NULL, 0, NULL);
+            return ITER_NO_MORE;
         }
-        const sx_hash_t* hash = sqlite3_column_blob(q, 1);
-        DEBUGHASH("retry_next", hash);
-        unsigned int ndb = gethashdb(hash);
-        ret = sx_hashfs_blockmeta_get(h, ret, q, h->qb_get_meta[hs][ndb], bs, blockmeta);
-        return ret;
-    }
+        if (ret == SQLITE_ROW) {
+            int bs = sqlite3_column_int(q, 1);
+            for(hs = 0; hs < SIZES; hs++)
+                if(bsz[hs] == bs)
+                    break;
+            if(hs == SIZES) {
+                WARN("bad blocksize: %d", bs);
+                return FAIL_BADBLOCKSIZE;
+            }
+            const sx_hash_t* hash = sqlite3_column_blob(q, 0);
+            if (!hash)
+                return EFAULT;
+            DEBUGHASH("retry_next", hash);
+            unsigned int ndb = gethashdb(hash);
+            ret = sx_hashfs_blockmeta_get(h, ret, q, h->qb_get_meta[hs][ndb], bs, blockmeta);
+            if (ret != SQLITE_ROW)
+                return ret;
+        }
+    } while (ret == SQLITE_ROW);
     sqlite3_reset(q);
     return ret;
 }
@@ -10460,7 +12408,6 @@ rc_ty sx_hashfs_br_use(sx_hashfs_t *h, const block_meta_t *blockmeta)
     sqlite3_reset(h->rit.q_add);
     if(qbind_blob(h->rit.q_add, ":hash", &blockmeta->hash, sizeof(blockmeta->hash)) ||
        qbind_int(h->rit.q_add, ":blocksize", blockmeta->blocksize) ||
-       qbind_int(h->rit.q_add, ":id", blockmeta->blockid) ||
        qstep_noret(h->rit.q_add))
         ret = FAIL_EINTERNAL;
     sqlite3_reset(h->rit.q_add);
@@ -10632,13 +12579,13 @@ rc_ty sx_hashfs_relocs_populate(sx_hashfs_t *h) {
 	    return FAIL_EINTERNAL;
 	}
 
-	prevnodes = sx_hashfs_hashnodes(h, NL_PREV, &hash, vol->replica_count);
+	prevnodes = sx_hashfs_all_hashnodes(h, NL_PREV, &hash, vol->max_replica);
 	if(!prevnodes) {
 	    WARN("cannot determine the previous owner of block: %s", msg_get_reason());
 	    return FAIL_EINTERNAL;
 	}
 
-	nextnodes = sx_hashfs_hashnodes(h, NL_NEXT, &hash, vol->replica_count);
+	nextnodes = sx_hashfs_all_hashnodes(h, NL_NEXT, &hash, vol->max_replica);
 	if(!nextnodes) {
 	    WARN("cannot determine the next owner of block");
 	    sx_nodelist_delete(prevnodes);
@@ -10792,7 +12739,7 @@ rc_ty sx_hashfs_relocs_next(sx_hashfs_t *h, const sx_reloc_t **reloc) {
 
 	rlc->file.file_size = sqlite3_column_int64(q, 4);
 	uuid_from_binary(&targetid, sqlite3_column_blob(q, 1));
-	rlc->target = sx_nodelist_lookup(sx_hashfs_nodelist(h, NL_NEXT), &targetid);
+	rlc->target = sx_nodelist_lookup(sx_hashfs_all_nodes(h, NL_NEXT), &targetid);
 	if(!rlc->target) {
 	    WARN("File id %lld in %u has invalid target %s", (long long)h->relocid, ndb, targetid.string);
 	    sqlite3_reset(q);
@@ -10912,7 +12859,7 @@ rc_ty sx_hashfs_rb_cleanup(sx_hashfs_t *h) {
     }
 
     /* Get list of all nodes */
-    nodes = sx_hashfs_nodelist(h, NL_PREVNEXT);
+    nodes = sx_hashfs_all_nodes(h, NL_PREVNEXT);
     if(!nodes) {
         WARN("Failed to get NL_PREVNEXT nodes list");
         return FAIL_EINTERNAL;
@@ -10937,7 +12884,7 @@ rc_ty sx_hashfs_rb_cleanup(sx_hashfs_t *h) {
 
     if(sx_hashfs_self_uuid(h, &selfuuid))
 	return FAIL_EINTERNAL;
- 
+
     r = sx_hashfs_volume_first(h, &vol, 0);
     while(r == OK) {
 	sx_nodelist_t *volnodes;
@@ -10948,7 +12895,7 @@ rc_ty sx_hashfs_rb_cleanup(sx_hashfs_t *h) {
 	    return FAIL_EINTERNAL;
 	}
 
-	volnodes = sx_hashfs_hashnodes(h, NL_NEXT, &hash, vol->replica_count);
+	volnodes = sx_hashfs_all_hashnodes(h, NL_NEXT, &hash, vol->max_replica);
 	if(!volnodes)
 	    return FAIL_EINTERNAL;
 
@@ -11046,7 +12993,7 @@ rc_ty sx_hashfs_set_progress_info(sx_hashfs_t *h, sx_inprogress_t state, const c
 	return EFAULT;
     }
 
-    if(state < INPRG_IDLE || state > INPRG_REPLACE_COMPLETE)
+    if(state < INPRG_IDLE || state >= INPRG_LAST)
 	return EINVAL;
 
     if(state == INPRG_IDLE) {
@@ -11068,6 +13015,7 @@ rc_ty sx_hashfs_set_progress_info(sx_hashfs_t *h, sx_inprogress_t state, const c
 	goto setrblinfo_fail;
     if(qbind_text(q, ":k", "rebalance_complete") || qbind_int(q, ":v", state) || qstep_noret(q))
 	goto setrblinfo_fail;
+    INFO("Status: %s", description);
     ret = OK;
 
  setrblinfo_fail:
@@ -11171,7 +13119,7 @@ rc_ty sx_hashfs_hdist_endrebalance(sx_hashfs_t *h) {
     const sx_node_t *self = sx_hashfs_self(h);
     rc_ty ret;
 
-    DEBUG("IN %s", __FUNCTION__);
+    DEBUG("IN %s", __func__);
 
     singlenode = sx_nodelist_new();
     if(!singlenode) {
@@ -11251,13 +13199,37 @@ static rc_ty volume_resize(sx_hashfs_t *h, const sx_hashfs_volume_t *vol, int64_
         goto volume_resize_err;
     }
 
+    INFO("Volume %s size changed to %lld", vol->name, (long long)newsize);
     ret = OK;
 volume_resize_err:
     sqlite3_reset(h->q_resizevol);
     return ret;
 }
 
-rc_ty sx_hashfs_volume_mod(sx_hashfs_t *h, const char *volume, const char *newowner, int64_t newsize) {
+static rc_ty volume_change_revs(sx_hashfs_t *h, const sx_hashfs_volume_t *vol, unsigned int max_revs) {
+    rc_ty ret = FAIL_EINTERNAL;
+
+    if(!vol) {
+        NULLARG();
+        return EINVAL;
+    }
+
+    sqlite3_reset(h->q_changerevs);
+    if(qbind_int(h->q_changerevs, ":revs", max_revs)
+       || qbind_int64(h->q_changerevs, ":volid", vol->id)
+       || qstep_noret(h->q_changerevs)) {
+        msg_set_reason("Could not update volume revisions limit");
+        goto volume_change_revs_err;
+    }
+
+    INFO("Volume %s revisions limit changed to %d", vol->name, max_revs);
+    ret = OK;
+volume_change_revs_err:
+    sqlite3_reset(h->q_changerevs);
+    return ret;
+}
+
+rc_ty sx_hashfs_volume_mod(sx_hashfs_t *h, const char *volume, const char *newowner, int64_t newsize, int max_revs) {
     rc_ty ret = FAIL_EINTERNAL, s;
     const sx_hashfs_volume_t *vol = NULL;
     sx_uid_t newid;
@@ -11267,8 +13239,8 @@ rc_ty sx_hashfs_volume_mod(sx_hashfs_t *h, const char *volume, const char *newow
         return ret;
     }
 
-    if(!*newowner && newsize == -1)
-        return OK;
+    if(!*newowner && newsize == -1 && max_revs == -1)
+        return OK; /* Nothing to do */
 
     if(qbegin(h->db)) {
         msg_set_reason("Database is locked");
@@ -11292,11 +13264,12 @@ rc_ty sx_hashfs_volume_mod(sx_hashfs_t *h, const char *volume, const char *newow
             msg_set_reason("Failed to change volume owner: %s", msg_get_reason());
             goto sx_hashfs_volume_mod_err;
         }
+        INFO("Volume %s owner changed to %s", vol->name, newowner);
     }
 
     if(newsize != -1 && newsize != vol->size) {
         /* Check new volume size correctness */
-        if((s = sx_hashfs_check_volume_size(h, newsize, vol->replica_count))) {
+        if((s = sx_hashfs_check_volume_size(h, newsize, vol->max_replica))) {
             WARN("Invalid volume size given");
             ret = s;
             goto sx_hashfs_volume_mod_err;
@@ -11305,6 +13278,15 @@ rc_ty sx_hashfs_volume_mod(sx_hashfs_t *h, const char *volume, const char *newow
         /* Perform resize operation */
         if((s = volume_resize(h, vol, newsize)) != OK) {
             msg_set_reason("Failed to resize volume: %s", msg_get_reason());
+            ret = s;
+            goto sx_hashfs_volume_mod_err;
+        }
+    }
+
+    if(max_revs != -1 && (unsigned int)max_revs <= SXLIMIT_MAX_REVISIONS && (unsigned int)max_revs >= SXLIMIT_MIN_REVISIONS) {
+        /* Revisions correctness has been checked, modify volume now */
+        if((s = volume_change_revs(h, vol, max_revs)) != OK) {
+            msg_set_reason("Failed to change volume revisions limit: %s", msg_get_reason());
             ret = s;
             goto sx_hashfs_volume_mod_err;
         }
@@ -11347,12 +13329,13 @@ static rc_ty sx_hashfs_should_repair(sx_hashfs_t *h, const block_meta_t *blockme
     }
     for (i=0;i<blockmeta->count;i++) {
         const block_meta_entry_t *entry = &blockmeta->entries[i];
-        if (entry->count > 0 && entry->replica > max_replica)
+        if (entry->op > 0 && entry->replica > max_replica)
             max_replica = entry->replica;
     }
     if (!max_replica)
         return ITER_NO_MORE;
-    hashnodes = sx_hashfs_hashnodes(h, NL_PREV, &blockmeta->hash, max_replica);
+    DEBUG("max_replica: %d", max_replica);
+    hashnodes = sx_hashfs_all_hashnodes(h, NL_PREV, &blockmeta->hash, max_replica);
     if (!hashnodes) {
         WARN("cannot determine nodes for hash");
         return FAIL_EINTERNAL;
@@ -11582,7 +13565,7 @@ rc_ty sx_hashfs_replace_getstartblock(sx_hashfs_t *h, unsigned int *version, con
 	    *have_blkidx = 0;
 	uuid_from_binary(&nuuid, nodeid);
 	*version = sxi_hdist_version(h->hd);
-	*node = sx_nodelist_lookup(sx_hashfs_nodelist(h, NL_NEXT), &nuuid);
+	*node = sx_nodelist_lookup(sx_hashfs_all_nodes(h, NL_NEXT), &nuuid);
 	if(*node)
 	    ret = OK;
     } else if (r == SQLITE_DONE)
@@ -11715,7 +13698,7 @@ rc_ty sx_hashfs_init_replacement(sx_hashfs_t *h) {
     }
 
     /* Blocks */
-    nodes = sx_hashfs_nodelist(h, NL_NEXT);
+    nodes = sx_hashfs_all_nodes(h, NL_NEXT);
     nnodes = sx_nodelist_count(nodes);
     if(qprep(h->db, &q, "INSERT INTO replaceblocks (node) VALUES(:uuid)"))
 	goto init_replacement_fail;
@@ -11751,12 +13734,109 @@ rc_ty sx_hashfs_init_replacement(sx_hashfs_t *h) {
     return ret;
 }
 
-rc_ty sx_hashfs_set_unfaulty(sx_hashfs_t *h, const sx_uuid_t *nodeid, int64_t dist_rev) {
-    unsigned int cfg_len, nnode, nnodes;
+static rc_ty bump_hdist_version_only(sx_hashfs_t *h, int inactive_dist, int64_t *new_rev) {
+    unsigned int cur_cfg_len, cfg_len, nnode, nnodes;
     const sx_nodelist_t *nodes;
     sxi_hdist_t *newmod = NULL;
+    const void *cur_cfg, *cfg;
+
+    if(!h) {
+        NULLARG();
+        return EFAULT;
+    }
+
+    if(!h->have_hd) {
+	msg_set_reason("This node is inactive");
+	return EINVAL;
+    }
+
+    if(h->is_rebalancing) {
+	msg_set_reason("The cluster is being rebalanced");
+	return EINVAL;
+    }
+
+    if(sxi_hdist_get_cfg(h->hd, &cur_cfg, &cur_cfg_len)) {
+	msg_set_reason("Failed to retrive current distribution (get)");
+	return FAIL_EINTERNAL;
+    }
+    if(!(newmod = sxi_hdist_from_cfg(cur_cfg, cur_cfg_len))) {
+	msg_set_reason("Failed to duplicate current distribution (from_cfg)");
+	return ENOMEM;
+    }
+    if(sxi_hdist_newbuild(newmod)) {
+	msg_set_reason("Failed to update node distribution");
+	sxi_hdist_free(newmod);
+	return FAIL_EINTERNAL;
+    }
+
+    nodes = sx_hashfs_all_nodes(h, NL_NEXT);
+    nnodes = sx_nodelist_count(nodes);
+    for(nnode=0; nnode<nnodes; nnode++) {
+	const sx_node_t *n = sx_nodelist_get(nodes, nnode);
+	if(sxi_hdist_addnode(newmod, sx_node_uuid(n), sx_node_addr(n), sx_node_internal_addr(n), sx_node_capacity(n), NULL)) {
+	    msg_set_reason("Failed to update node distribution");
+	    sxi_hdist_free(newmod);
+	    return ENOMEM;
+	}
+    }
+    if(sxi_hdist_build(newmod)) {
+	msg_set_reason("Failed to build updated distribution");
+	sxi_hdist_free(newmod);
+	return FAIL_EINTERNAL;
+    }
+    if(sxi_hdist_rebalanced(newmod)) {
+	msg_set_reason("Failed to flat the updated distribution");
+	sxi_hdist_free(newmod);
+	return FAIL_EINTERNAL;
+    }
+    if(sxi_hdist_get_cfg(newmod, &cfg, &cfg_len)) {
+	msg_set_reason("Failed to retrieve the updated distribution model");
+	sxi_hdist_free(newmod);
+	return FAIL_EINTERNAL;
+    }
+
+    if(inactive_dist) {
+	if(qbind_text(h->q_setval, ":k", "current_dist") ||
+	   qbind_blob(h->q_setval, ":v", cur_cfg, cur_cfg_len) ||
+	   qstep_noret(h->q_setval)) {
+	    msg_set_reason("Failed to save updated distribution model");
+	    sxi_hdist_free(newmod);
+	    return FAIL_EINTERNAL;
+	}
+	if(qbind_text(h->q_setval, ":k", "current_dist_rev") ||
+	   qbind_int64(h->q_setval, ":v", sxi_hdist_version(h->hd)) ||
+	   qstep_noret(h->q_setval)) {
+	    msg_set_reason("Failed to save updated distribution model");
+	    sxi_hdist_free(newmod);
+	    return FAIL_EINTERNAL;
+	}
+    }
+
+    sqlite3_reset(h->q_setval);
+    if(qbind_text(h->q_setval, ":k", "dist") ||
+       qbind_blob(h->q_setval, ":v", cfg, cfg_len) ||
+       qstep_noret(h->q_setval)) {
+	msg_set_reason("Failed to save updated distribution model");
+	sxi_hdist_free(newmod);
+	return FAIL_EINTERNAL;
+    }
+    if(qbind_text(h->q_setval, ":k", "dist_rev") ||
+       qbind_int64(h->q_setval, ":v", sxi_hdist_version(newmod)) ||
+       qstep_noret(h->q_setval)) {
+	msg_set_reason("Failed to save updated distribution model");
+	sxi_hdist_free(newmod);
+	return FAIL_EINTERNAL;
+    }
+
+    if(new_rev)
+	*new_rev = sxi_hdist_version(newmod);
+    sxi_hdist_free(newmod);
+    return OK;
+}
+
+rc_ty sx_hashfs_set_unfaulty(sx_hashfs_t *h, const sx_uuid_t *nodeid, int64_t dist_rev) {
+    const sx_nodelist_t *nodes;
     sqlite3_stmt *q = NULL;
-    const void *cfg;
     int r;
     rc_ty ret = FAIL_EINTERNAL;
 
@@ -11768,7 +13848,7 @@ rc_ty sx_hashfs_set_unfaulty(sx_hashfs_t *h, const sx_uuid_t *nodeid, int64_t di
     if(dist_rev != h->hd_rev)
 	return ENOENT;
 
-    nodes = sx_hashfs_nodelist(h, NL_NEXT);
+    nodes = sx_hashfs_all_nodes(h, NL_NEXT);
     if(!sx_nodelist_lookup(nodes, nodeid) ||
        !sx_hashfs_is_node_faulty(h, nodeid))
 	return EINVAL;
@@ -11811,55 +13891,9 @@ rc_ty sx_hashfs_set_unfaulty(sx_hashfs_t *h, const sx_uuid_t *nodeid, int64_t di
     }
     qnullify(q);
 
-    if(sxi_hdist_get_cfg(h->hd, &cfg, &cfg_len)) {
-	msg_set_reason("Failed to duplicate current distribution (get)");
+    ret = bump_hdist_version_only(h, 0, NULL);
+    if(ret != OK)
 	goto unfaulty_err;
-    }
-    if(!(newmod = sxi_hdist_from_cfg(cfg, cfg_len))) {
-	msg_set_reason("Failed to duplicate current distribution (from_cfg)");
-	goto unfaulty_err;
-    }
-    if(sxi_hdist_newbuild(newmod)) {
-	msg_set_reason("Failed to update node distribution");
-	goto unfaulty_err;
-    }
-
-    nnodes = sx_nodelist_count(nodes);
-    for(nnode=0; nnode<nnodes; nnode++) {
-	const sx_node_t *n = sx_nodelist_get(nodes, nnode);
-	if(sxi_hdist_addnode(newmod, sx_node_uuid(n), sx_node_addr(n), sx_node_internal_addr(n), sx_node_capacity(n), NULL)) {
-	    msg_set_reason("Failed to update node distribution");
-	    goto unfaulty_err;
-	}
-    }
-    if(sxi_hdist_build(newmod)) {
-	msg_set_reason("Failed to build updated distribution");
-	goto unfaulty_err;
-    }
-    if(sxi_hdist_rebalanced(newmod)) {
-	msg_set_reason("Failed to flat the updated distribution");
-	goto unfaulty_err;
-    }
-    if(sxi_hdist_get_cfg(newmod, &cfg, &cfg_len)) {
-	msg_set_reason("Failed to retrieve the updated distribution model");
-	goto unfaulty_err;
-    }
-
-    if(qprep(h->db, &q, "INSERT OR REPLACE INTO hashfs (key, value) VALUES (:k , :v)") ||
-       qbind_text(q, ":k", "dist") ||
-       qbind_blob(q, ":v", cfg, cfg_len) ||
-       qstep_noret(q)) {
-	msg_set_reason("Failed to save updated distribution model");
-	goto unfaulty_err;
-    }
-    sqlite3_reset(q);
-    if(qbind_text(q, ":k", "dist_rev") ||
-       qbind_int64(q, ":v", sxi_hdist_version(newmod)) ||
-       qstep_noret(q)) {
-	msg_set_reason("Failed to save updated distribution model");
-	goto unfaulty_err;
-    }
-    qnullify(q);
 
     if(sx_hashfs_set_progress_info(h, INPRG_IDLE, NULL))
 	goto unfaulty_err;
@@ -11870,7 +13904,6 @@ rc_ty sx_hashfs_set_unfaulty(sx_hashfs_t *h, const sx_uuid_t *nodeid, int64_t di
     if(ret == OK && qcommit(h->db))
 	ret = FAIL_EINTERNAL;
 
-    sxi_hdist_free(newmod);
     sqlite3_finalize(q);
     if(ret != OK)
 	qrollback(h->db);
@@ -11878,3 +13911,620 @@ rc_ty sx_hashfs_set_unfaulty(sx_hashfs_t *h, const sx_uuid_t *nodeid, int64_t di
     return ret;
 }
 
+rc_ty sx_hashfs_setignored(sx_hashfs_t *h, const sx_nodelist_t *ignodes) {
+    const sx_nodelist_t *allnodes;
+    sx_nodelist_t *normnodes;
+    unsigned int i, nnodes;
+    sqlite3_stmt *q = NULL;
+    int64_t newrev;
+    rc_ty ret = FAIL_EINTERNAL;
+
+    DEBUG("IN %s", __FUNCTION__);
+    if(!h || !ignodes) {
+	NULLARG();
+	return EINVAL;
+    }
+
+    nnodes = sx_nodelist_count(ignodes);
+    if(!nnodes) {
+	msg_set_reason("No node was provided");
+	return EINVAL;
+    }
+
+    if(!h->have_hd) {
+	msg_set_reason("This node is inactive");
+	return EINVAL;
+    }
+
+    if(h->is_rebalancing) {
+	msg_set_reason("The cluster is being rebalanced");
+	return EINVAL;
+    }
+
+    if(sx_nodelist_count(h->faulty_nodes)) {
+	msg_set_reason("The cluster contains faulty nodes which are still being replaced");
+	return EINVAL;
+    }
+
+    allnodes = sx_hashfs_all_nodes(h, NL_NEXT);
+    normnodes = sx_nodelist_new();
+    if(!normnodes) {
+	msg_set_reason("Out of memory while duplicating list of nodes");
+	return ENOMEM;
+    }
+    for(i=0; i<nnodes; i++) {
+	const sx_node_t *node = sx_nodelist_get(ignodes, i);
+	const sx_uuid_t *nodeid = sx_node_uuid(node);
+
+	if(sx_nodelist_lookup(normnodes, nodeid))
+	    continue;
+
+	if(!sx_nodelist_lookup(allnodes, nodeid)) {
+	    sx_nodelist_delete(normnodes);
+	    msg_set_reason("Node %s is not an active cluster member", nodeid->string);
+	    return EINVAL;
+	}
+
+	if(sx_nodelist_add(normnodes, sx_node_dup(node))) {
+	    sx_nodelist_delete(normnodes);
+	    msg_set_reason("Out of memory while duplicating list of nodes");
+	    return ENOMEM;
+	}
+    }
+
+    if(sx_nodelist_addlist(normnodes, h->ignored_nodes)) {
+	sx_nodelist_delete(normnodes);
+	msg_set_reason("Out of memory while duplicating list of nodes");
+	return ENOMEM;
+    }
+    nnodes = sx_nodelist_count(normnodes);
+    if(nnodes >= sx_nodelist_count(allnodes)) {
+	sx_nodelist_delete(normnodes);
+	msg_set_reason("Cannot tag all nodes");
+	return EINVAL;
+    }
+
+    if(qbegin(h->db)) {
+	sx_nodelist_delete(normnodes);
+	msg_set_reason("Internal error: failed to start trasaction");
+	return FAIL_EINTERNAL;
+    }
+
+    ret = bump_hdist_version_only(h, 1, &newrev);
+    if(ret != OK)
+	goto setignored_fail;
+
+    if(qprep(h->db, &q, "INSERT OR IGNORE INTO ignorednodes (dist, node) VALUES (:dist, :nodeid)") ||
+       qbind_int64(q, ":dist", newrev)) {
+	msg_set_reason("Failed to update the node database");
+	ret = FAIL_EINTERNAL;
+	goto setignored_fail;
+    }
+    for(i = 0; i<nnodes; i++) {
+	const sx_node_t *node = sx_nodelist_get(normnodes, i);
+	const sx_uuid_t *nodeid = sx_node_uuid(node);
+
+	if(qbind_blob(q, ":nodeid", nodeid->binary, sizeof(nodeid->binary)) ||
+	   qstep_noret(q)) {
+	    msg_set_reason("Failed to update the node database");
+	    ret = FAIL_EINTERNAL;
+	    goto setignored_fail;
+	}
+    }
+    qnullify(q);
+
+    if(qcommit(h->db)) {
+	msg_set_reason("Failed to save distribution model");
+	ret = FAIL_EINTERNAL;
+    }
+
+ setignored_fail:
+    qnullify(q);
+    if(ret != OK)
+	qrollback(h->db);
+    sx_nodelist_delete(normnodes);
+
+    return ret;
+}
+
+rc_ty sx_hashfs_node_status(sx_hashfs_t *h, sxi_node_status_t *status) {
+    const sx_node_t *n;
+    time_t t = time(NULL);
+    struct tm *tm;
+
+    if(!status) {
+        NULLARG();
+        return EINVAL;
+    }
+    memset(status, 0, sizeof(*status));
+
+    /* System information */
+    if(sxi_report_os(h->sx, status->os_name, sizeof(status->os_name), status->os_arch, sizeof(status->os_arch),
+        status->os_release, sizeof(status->os_release), status->os_version, sizeof(status->os_version))) {
+        WARN("Failed to get OS information: %s", sxc_geterrmsg(h->sx));
+        return FAIL_EINTERNAL;
+    }
+
+    /* Processor information */
+    if(sxi_report_cpu(h->sx, &status->cores, status->endianness, sizeof(status->endianness))) {
+        WARN("Failed to get CPU information: %s", sxc_geterrmsg(h->sx));
+        return FAIL_EINTERNAL;
+    }
+
+    /* Filesystem information */
+    if(sxi_report_fs(h->sx, h->dir, &status->block_size, &status->total_blocks, &status->avail_blocks)) {
+        WARN("Failed to get hashFS node directory filesystem information: %s", sxc_geterrmsg(h->sx));
+        return FAIL_EINTERNAL;
+    }
+
+    /* Get available memory */
+    if(sxi_report_mem(h->sx, &status->mem_total)) {
+        WARN("Failed to get memory information: %s", sxc_geterrmsg(h->sx));
+        return FAIL_EINTERNAL;
+    }
+
+    tm = gmtime(&t);
+    if (tm && strftime(status->utctime, sizeof(status->utctime), "%Y-%m-%d %H:%M:%S UTC", tm) <= 0) {
+        WARN("Failed to get UTC time");
+        return FAIL_EINTERNAL;
+    }
+    tm = localtime(&t);
+    if (tm && strftime(status->localtime, sizeof(status->localtime), "%Y-%m-%d %H:%M:%S %Z", tm) <= 0) {
+        WARN("Failed to get local time");
+        return FAIL_EINTERNAL;
+    }
+
+    /* Storage information */
+    snprintf(status->storage_dir, sizeof(status->storage_dir), "%s", h->dir);
+    sx_storage_usage(h, &status->storage_allocated, &status->storage_commited);
+    snprintf(status->hashfs_version, sizeof(status->hashfs_version), "%s", sx_hashfs_version(h));
+    n = sx_hashfs_self(h);
+    status->is_bare = n ? 0 : 1; /* Node is bare when n == NULL */
+    if(n) {
+        snprintf(status->internal_addr, sizeof(status->internal_addr), "%s", sx_node_internal_addr(n));
+        snprintf(status->addr, sizeof(status->addr), "%s", sx_node_addr(n));
+        snprintf(status->uuid, sizeof(status->uuid), "%s", sx_node_uuid_str(n));
+    }
+
+    snprintf(status->libsx_version, sizeof(status->libsx_version), "%s", sxc_get_version());
+    snprintf(status->hashfs_version, sizeof(status->hashfs_version), "%s", HASHFS_VERSION);
+
+    const char *local_heal = sx_hashfs_heal_status_local(h);
+    const char *remote_heal = sx_hashfs_heal_status_remote(h);
+    if (local_heal)
+        snprintf(status->heal_status, sizeof(status->heal_status), "local: %s", local_heal);
+    else if (remote_heal)
+        snprintf(status->heal_status, sizeof(status->heal_status), "remote: %s", remote_heal);
+    else
+        snprintf(status->heal_status, sizeof(status->heal_status), "DONE");
+    status->heal_status[sizeof(status->heal_status)-1] = '\0';
+    return OK;
+}
+
+rc_ty sx_hashfs_distlock_get(sx_hashfs_t *h, char *lockid, unsigned int lockid_len) {
+    int r;
+    rc_ty ret = FAIL_EINTERNAL;
+
+    sqlite3_reset(h->q_getval);
+
+    if(qbind_text(h->q_getval, ":k", "distlock")) {
+        WARN("Failed to prepare getval query");
+        goto sx_hashfs_distlock_get_err;
+    }
+
+    r = qstep(h->q_getval);
+    if(r == SQLITE_DONE) {
+        if(lockid && lockid_len)
+            lockid[0] = '\0';
+        ret = ENOENT;
+    } else if(r == SQLITE_ROW) {
+        if(lockid && lockid_len) {
+            const char *lockid_str = (const char *)sqlite3_column_text(h->q_getval, 0);
+
+            if(!lockid_str) {
+                WARN("Failed to get distribution lock");
+                goto sx_hashfs_distlock_get_err;
+            }
+            sxi_strlcpy(lockid, lockid_str, lockid_len);
+        }
+        ret = OK;
+    } else {
+        WARN("Failed to check distribution lock");
+        goto sx_hashfs_distlock_get_err;
+    }
+
+sx_hashfs_distlock_get_err:
+    sqlite3_reset(h->q_getval);
+    return ret;
+}
+
+rc_ty sx_hashfs_distlock_acquire(sx_hashfs_t *h, const char *lockid) {
+    rc_ty ret = FAIL_EINTERNAL, s;
+    char existing_lock[AUTH_UID_LEN*2+32];
+
+    if(!lockid) {
+        WARN("NULL lockid argument");
+        return EINVAL;
+    }
+
+    if(qbegin(h->db)) {
+        WARN("Failed to lock database");
+        return FAIL_LOCKED;
+    }
+
+    s = sx_hashfs_distlock_get(h, existing_lock, sizeof(existing_lock));
+    if(s == OK) {
+        ret = EEXIST;
+        DEBUG("Lock operation requested but there is currently a lock stored: %s", existing_lock);
+        goto sx_hashfs_distlock_acquire_err;
+    } else if(s != ENOENT) {
+        WARN("Failed to check distlock existence");
+        ret = s;
+        goto sx_hashfs_distlock_acquire_err;
+    }
+
+    sqlite3_reset(h->q_setval);
+    if(qbind_text(h->q_setval, ":k", "distlock") ||
+       qbind_text(h->q_setval, ":v", lockid) ||
+       qstep_noret(h->q_setval)) {
+        WARN("Failed to acquire lock");
+        goto sx_hashfs_distlock_acquire_err;
+    }
+
+    if(qcommit(h->db)) {
+        WARN("Failed to commit distlock acquisition");
+        goto sx_hashfs_distlock_acquire_err;
+    }
+
+    ret = OK;
+sx_hashfs_distlock_acquire_err:
+    if(ret != OK)
+        qrollback(h->db);
+    sqlite3_reset(h->q_setval);
+    return ret;
+}
+
+/* Release distribution lock */
+rc_ty sx_hashfs_distlock_release(sx_hashfs_t *h) {
+    sqlite3_reset(h->q_delval);
+    if(qbind_text(h->q_delval, ":k", "distlock") || qstep_noret(h->q_delval)) {
+        WARN("Failed to unlock distribution");
+        return FAIL_EINTERNAL;
+    }
+
+    return OK;
+}
+
+rc_ty sx_hashfs_cluster_set_name(sx_hashfs_t *h, const char *name) {
+    if(!h || !name) {
+        msg_set_reason("Invalid argument");
+        return EINVAL;
+    }
+
+    sqlite3_reset(h->q_setval);
+    if(qbind_text(h->q_setval, ":k", "cluster_name") || qbind_text(h->q_setval, ":v", name) || qstep_noret(h->q_setval)) {
+        msg_set_reason("Failed to set cluster name");
+        return FAIL_EINTERNAL;
+    }
+
+    free(h->cluster_name);
+    h->cluster_name = wrap_strdup(name);
+    if (!h->cluster_name) {
+        msg_set_reason("Failed to get cluster name: Out of memory");
+        return FAIL_EINTERNAL;
+    }
+
+    return OK;
+}
+
+rc_ty sx_hashfs_cluster_get_name(sx_hashfs_t *h, const char **name) {
+    const char *n;
+
+    if(!h || !name) {
+        msg_set_reason("Invalid argument");
+        return EINVAL;
+    }
+
+    sqlite3_reset(h->q_getval);
+    if(qbind_text(h->q_getval, ":k", "cluster_name") || qstep_ret(h->q_getval)) {
+        msg_set_reason("Failed to get cluster name");
+        return FAIL_EINTERNAL;
+    }
+
+    n = (const char*)sqlite3_column_text(h->q_getval, 0);
+    if(!n) {
+        msg_set_reason("Failed go get cluster name");
+        return FAIL_EINTERNAL;
+    }
+
+    free(h->cluster_name);
+    h->cluster_name = wrap_strdup((const char*)sqlite3_column_text(h->q_getval, 0));
+    if (!h->cluster_name) {
+        msg_set_reason("Failed to get cluster name: Out of memory");
+        return FAIL_EINTERNAL;
+    }
+
+    *name = h->cluster_name;
+    return OK;
+}
+
+rc_ty sx_hashfs_cluster_set_mode(sx_hashfs_t *h, int readonly) {
+    sqlite3_reset(h->q_setval);
+    if(readonly != 0 && readonly != 1) {
+        msg_set_reason("Invalid argument");
+        return EINVAL;
+    }
+
+    if(qbind_text(h->q_setval, ":k", "mode") || qbind_text(h->q_setval, ":v", readonly ? "ro" : "rw") || qstep_noret(h->q_setval)) {
+        WARN("Failed to set cluster operating mode");
+        return FAIL_EINTERNAL;
+    }
+
+    INFO("Cluster has been switched to '%s' mode", readonly ? "read-only" : "read-write");
+    return OK;
+}
+
+rc_ty sx_hashfs_cluster_get_mode(sx_hashfs_t *h, int *mode) {
+    const char *mode_str;
+    int r;
+    rc_ty ret = FAIL_EINTERNAL;
+
+    if(!h || !mode) {
+        NULLARG();
+        return EINVAL;
+    }
+
+    sqlite3_reset(h->q_getval);
+    if(qbind_text(h->q_getval, ":k", "mode")) {
+        WARN("Failed to get cluster operating mode");
+        return FAIL_EINTERNAL;
+    }
+
+    r = qstep(h->q_getval);
+    if(r == SQLITE_DONE) {
+        *mode = 0; /* Default fallback, when not set cluster is in read-write mode */
+        ret = OK;
+        goto sx_hashfs_cluster_get_mode_err;
+    } else if(r != SQLITE_ROW) {
+        WARN("Failed to get cluster operating mode");
+        goto sx_hashfs_cluster_get_mode_err;
+    }
+
+    mode_str = (const char *)sqlite3_column_text(h->q_getval, 0);
+    if(!mode_str) {
+        WARN("Failed to get cluster operating mode");
+        goto sx_hashfs_cluster_get_mode_err;
+    }
+
+    if(!strncmp(mode_str, "ro", 2))
+        *mode = 1;
+    else if(!strncmp(mode_str, "rw", 2))
+        *mode = 0;
+    else {
+        WARN("Failed to get cluster operating mode: invalid mode");
+        goto sx_hashfs_cluster_get_mode_err;
+    }
+
+    ret = OK;
+sx_hashfs_cluster_get_mode_err:
+    if(ret == OK)
+        h->readonly = *mode;
+    else
+        h->readonly = 0;
+    sqlite3_reset(h->q_getval);
+    return ret;
+}
+
+int sx_hashfs_is_readonly(sx_hashfs_t *h) {
+    return h ? h->readonly : 0;
+}
+
+rc_ty sx_hashfs_list_revision_blocks(sx_hashfs_t *h, const sx_hashfs_volume_t *vol, const sx_uuid_t *target, sx_hash_t *min_revision_id, unsigned age_limit, unsigned i, lrb_cb_t cb, lrb_count_t cb_count) {
+    rc_ty rc = FAIL_EINTERNAL;
+    if (!vol || !target || !cb) {
+        NULLARG();
+        return rc;
+    }
+    if (i >= METADBS) {
+        msg_set_reason("Invalid metadb");
+        return rc;
+    }
+    sqlite3_reset(h->qm_needs_upgrade[i]);
+    int r = qstep(h->qm_needs_upgrade[i]);
+    sqlite3_reset(h->qm_needs_upgrade[i]);
+    if (r != SQLITE_DONE) {
+        msg_set_reason("Upgrade not yet completed");
+        return EAGAIN;
+    }
+    do {
+        sx_hash_t id;
+        sqlite3_stmt *qcount = h->qm_count_rb[i], *q = h->qm_get_rb[i];
+        sqlite3_reset(qcount);
+        sqlite3_reset(q);
+        int ret, k=0;
+        /* FIXME: bump hashfs version elsewhere, or have local age separate from
+         * hdist version */
+        age_limit++;
+        if (qbind_int64(q, ":volume_id", vol->id) || qbind_int64(qcount, ":volume_id", vol->id) ||
+            qbind_int(q, ":age_limit", age_limit) || qbind_int(qcount, ":age_limit", age_limit))
+            break;
+        if(min_revision_id) {
+            if (qbind_blob(q, ":min_revision_id", min_revision_id->b, sizeof(min_revision_id->b)) ||
+                qbind_blob(qcount, ":min_revision_id", min_revision_id->b, sizeof(min_revision_id->b)))
+                break;
+        } else {
+            if (qbind_blob(q, ":min_revision_id", "", 0) ||
+                qbind_blob(qcount, ":min_revision_id", "", 0))
+                break;
+        }
+        DEBUG("before query, volume name: %s, metadb: %d, volume id: %lld, age_limit: %d", vol->name, i, (long long)vol->id, age_limit);
+        if (qstep_ret(qcount))
+            break;
+        if (cb_count(sqlite3_column_int64(qcount, 0))) {
+            msg_set_reason("count callback failed");
+            ret = -1;
+            break;
+        }
+        sqlite3_reset(qcount);
+        while ((ret = qstep(q)) == SQLITE_ROW && (k++ < gc_max_batch)) {
+            sx_hash_t revision_id;
+            int64_t size = sqlite3_column_int64(q, 0);
+            if (hash_of_blob_result(&revision_id, q, 1)) {
+                msg_set_reason("corrupt hash blob");
+                ret = -1;
+                break;
+            }
+            const sx_hash_t *contents = sqlite3_column_blob(q, 2);
+            unsigned int block_size;
+            int64_t nblocks = size_to_blocks(size, NULL, &block_size);
+            DEBUG("volume: %s, metadb: %d, file: %s", vol->name, i, sqlite3_column_text(q, 3));
+            DEBUGHASH("row revision", &revision_id);
+            if (nblocks * sizeof(*contents) != sqlite3_column_bytes(q, 2)) {
+                msg_set_reason("corrupt file blob: %ld * %lu != %d", nblocks, sizeof(*contents), sqlite3_column_bytes(q, 2));
+                ret = -1;
+                break;
+            }
+            if (cb(vol, target, &revision_id, contents, nblocks, block_size)) {
+                msg_set_reason("block revision list callback failed");
+                ret = -1;
+                break;
+            }
+            if (!min_revision_id)
+                min_revision_id = &id;
+            memcpy(min_revision_id->b, revision_id.b, sizeof(revision_id.b));
+        }
+        sqlite3_reset(q);
+        if (ret != SQLITE_ROW && ret != SQLITE_DONE)
+            break;
+        rc = OK;
+        if (min_revision_id) {
+            DEBUG("after query, volume name: %s, metadb: %d, volume id: %lld, age_limit: %d, sent revisions %d", vol->name, i, (long long)vol->id, age_limit, k);
+            DEBUGHASH("last revision in this iteration", min_revision_id);
+        }
+    } while(0);
+    DEBUG("returning: %s", rc2str(rc));
+    return rc;
+}
+
+rc_ty sx_hashfs_heal_update(sx_hashfs_t *h, const sx_hashfs_volume_t *vol, const sx_hash_t *min_revision_id, unsigned metadb)
+{
+    if (!h || !vol) {
+        NULLARG();
+        return EFAULT;
+    }
+    if (metadb >= METADBS) {
+        WARN("Invalid metadb: %u", metadb);
+        return EINVAL;
+    }
+    if (min_revision_id) {
+        DEBUGHASH("Updating min_revision_id to", min_revision_id);
+        sqlite3_stmt *qupd = h->qm_upd_heal_volume[metadb];
+        sqlite3_reset(qupd);
+        if (qbind_blob(qupd,":min_revision_id",min_revision_id->b,sizeof(min_revision_id->b)) ||
+            qbind_text(qupd,":name",vol->name) ||
+            qstep_noret(qupd))
+            return FAIL_EINTERNAL;
+    } else {
+        DEBUG("Finished volume heal for %s", vol->name);
+        sqlite3_stmt *qdel = h->qm_del_heal_volume[metadb];
+        sqlite3_reset(qdel);
+        if (qbind_text(qdel,":name",vol->name) ||
+            qstep_noret(qdel))
+            return FAIL_EINTERNAL;
+    }
+    return OK;
+}
+
+rc_ty sx_hashfs_remote_heal(sx_hashfs_t *h, heal_cb_t cb)
+{
+    rc_ty rc = FAIL_EINTERNAL;
+    unsigned i;
+    unsigned has_heal = 0;
+    DEBUG("IN");
+    for (i=0;i<METADBS;i++) {
+        char prev[SXLIMIT_MAX_VOLNAME_LEN+1];
+        int ret;
+        prev[0] = 0;
+        sqlite3_stmt *qsel = h->qm_sel_heal_volume[i];
+        sqlite3_stmt *qupd = h->qm_upd_heal_volume[i];
+        sqlite3_reset(qsel);
+        sqlite3_reset(qupd);
+        if(qbind_text(qsel, ":prev", prev))
+                break;
+        do {
+            ret = qstep(qsel);
+            if (ret == SQLITE_ROW) {
+                const sx_hashfs_volume_t *volume;
+                const unsigned char *name = sqlite3_column_text(qsel, 0);
+                int max_age = sqlite3_column_int(qsel, 1);
+                sx_hash_t min_revision_id;
+                const sx_hash_t *min_revision_in = NULL;
+                strncpy(prev, (const char*)name, sizeof(prev));
+                prev[sizeof(prev)-1] = '\0';
+                DEBUG("heal: volume=%s, max_Age=%d, metadb: %d", name, max_age, i);
+                if(sx_hashfs_volume_by_name(h, (const char*)name, &volume))
+                    break;
+                if (sqlite3_column_bytes(qsel, 2)) {
+                    if (hash_of_blob_result(&min_revision_id, qsel, 2))
+                        break;
+                    min_revision_in = &min_revision_id;
+                }
+                /* TODO: transaction? */
+                has_heal = 1;
+                if (cb(h, volume, min_revision_in, max_age, i))
+                    break;
+            }
+        } while(ret == SQLITE_ROW);
+        sqlite3_reset(qsel);
+        sqlite3_reset(qupd);
+        if (ret != SQLITE_DONE)
+            break;
+    }
+    if (i == METADBS)
+        return has_heal ? OK : ITER_NO_MORE;
+    return rc;
+}
+
+int sx_hashfs_has_upgrade_job(sx_hashfs_t *h)
+{
+    int ret;
+    sqlite3_stmt *q = h->qe_count_upgradejobs;
+    sqlite3_reset(q);
+    if (qstep_ret(q))
+        return -1;
+    ret = sqlite3_column_int(q, 0);
+    sqlite3_reset(q);
+    return ret;
+}
+
+const char *sx_hashfs_heal_status_local(sx_hashfs_t *h)
+{
+    switch (sx_hashfs_has_upgrade_job(h))
+        {
+        case 0:
+            return NULL;
+        case 1:
+            return "In progress";
+        default:
+            return "Error";
+        }
+}
+
+const char *sx_hashfs_heal_status_remote(sx_hashfs_t *h)
+{
+    if (sx_hashfs_has_upgrade_job(h))
+        return "Waiting on local heal";
+    for (unsigned i=0;i<METADBS;i++) {
+        sqlite3_stmt *qsel = h->qm_sel_heal_volume[i];
+        sqlite3_reset(qsel);
+        if(qbind_text(qsel, ":prev", ""))
+            break;
+        int ret = qstep(qsel);
+        sqlite3_reset(qsel);
+        if (ret == SQLITE_ROW)
+            return "Pending";
+        else if (ret != SQLITE_DONE)
+            return "Error";
+    }
+    return NULL;
+}

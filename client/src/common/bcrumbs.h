@@ -26,7 +26,7 @@
 #define SXBC_SXINIT_RESOLVE_MSG "Failed to resolve '%s'. Try specifying the IP address manually with: sxinit -l IPaddr sx://%s\n"
 
 #define SXBC_SXINIT_UUID_ERR "UUID mismatch"
-#define SXBC_SXINIT_UUID_MSG "See https://wiki.skylable.com/wiki/FAQ#Server_UUID_mismatch for more information.\n"
+#define SXBC_SXINIT_UUID_MSG "See http://www.skylable.com/docs/faq#Server_UUID_mismatch for more information.\n"
 
 #define SXBC_TOOLS_CFG_ERR "Cannot stat configuration directory"
 #define SXBC_TOOLS_CFG_MSG "Make sure you didn't typo cluster name '%s' or forgot to run 'sxinit sx://%s'\n"
@@ -42,5 +42,8 @@
 
 #define SXBC_TOOLS_CONN_ERR "Failed to connect"
 #define SXBC_TOOLS_CONN_MSG "Please check your network connection or run sxinit again.\n"
+
+#define SXBC_TOOLS_NOTFOUND_ERR "Not Found"
+#define SXBC_TOOLS_NOTFOUND_MSG "Use -r to recursively process all files from %s\n"
 
 #endif

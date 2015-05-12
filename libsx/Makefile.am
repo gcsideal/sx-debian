@@ -1,21 +1,21 @@
 ACLOCAL_AMFLAGS = -I m4
 # https://www.gnu.org/software/libtool/manual/html_node/Updating-version-info.html
-LIBSX_VERSION=1:0:0
+LIBSX_VERSION=2:0:0
 
 SUBDIRS=
 if BUILD_LTDL
 SUBDIRS += libltdl
 endif
 if BUILD_CURL
-SUBDIRS += ../3rdparty/curl
+SUBDIRS += curl-src
 endif
 
-EXTRA_DIST=libltdl ../3rdparty/curl
+EXTRA_DIST=libltdl curl-src
 DIST_SUBDIRS=$(SUBDIRS)
 
 include_HEADERS = include/sx.h
 
-AM_CPPFLAGS = -I $(top_srcdir)/include -I $(top_srcdir)/src $(LTDLINCL)
+AM_CPPFLAGS = -I $(top_srcdir)/include -I $(top_srcdir)/src -I include $(LTDLINCL)
 lib_LTLIBRARIES = src/libsx.la
 src_libsx_la_SOURCES = \
 	include/sx.h \
@@ -54,7 +54,9 @@ src_libsx_la_SOURCES = \
 	src/sxreport.c \
 	src/version.c \
 	src/vcrypto.h \
-	src/vcryptocurl.h
+	src/vcryptocurl.h \
+	src/crypt_blowfish.c \
+	src/crypt_blowfish.h
 if BUILD_NFTW
 src_libsx_la_SOURCES += \
 	src/nftw.c \
@@ -91,9 +93,10 @@ include/extraversion.h: include/extraversion.h.tmp
 #if exported via git archvie the COMMITVER is a commit hash otherwise it is a meaningless 'ormat:%h'
 include/extraversion.h.tmp:
 	$(AM_V_GEN) \
-	    (VER="$$(LANG=C git -C $(top_srcdir) describe --exact-match 2>/dev/null)" &&\
+	    mkdir -p include &&\
+	    (VER="$$(cd $(top_srcdir) && LANG=C git describe --exact-match 2>/dev/null)" &&\
 	    echo "#define SRC_VERSION \"$$VER\"" >$@) ||\
-	    (VER="$$(LANG=C git -C $(top_srcdir) describe --always --dirty=+ 2>/dev/null)" &&\
+	    (VER="$$(cd $(top_srcdir) && LANG=C git describe --always --dirty=+ 2>/dev/null)" &&\
 	    echo "#define SRC_VERSION \"$$VER\"" >$@) ||\
 	    (COMMITVER=$Format:%h$ && test "$$COMMITVER" != "ormat:%h" && \
 	    echo "#define SRC_VERSION SRC_DEFAULT_VERSION\".$$COMMITVER\"" >$@) ||\

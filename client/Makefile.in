@@ -89,6 +89,7 @@ DIST_COMMON = $(srcdir)/Makefile.in $(srcdir)/Makefile.am \
 	$(top_srcdir)/configure $(am__configure_deps) \
 	$(srcdir)/config.h.in $(top_srcdir)/man/sxacl.1.in \
 	$(top_srcdir)/man/sxacl-useradd.1.in \
+	$(top_srcdir)/man/sxacl-userclone.1.in \
 	$(top_srcdir)/man/sxacl-userdel.1.in \
 	$(top_srcdir)/man/sxacl-userlist.1.in \
 	$(top_srcdir)/man/sxacl-usergetkey.1.in \
@@ -134,7 +135,7 @@ am__CONFIG_DISTCLEAN_FILES = config.status config.cache config.log \
 mkinstalldirs = $(install_sh) -d
 CONFIG_HEADER = config.h
 CONFIG_CLEAN_FILES = man/sxacl.1 man/sxacl-useradd.1 \
-	man/sxacl-userdel.1 man/sxacl-userlist.1 \
+	man/sxacl-userclone.1 man/sxacl-userdel.1 man/sxacl-userlist.1 \
 	man/sxacl-usergetkey.1 man/sxacl-usernewkey.1 \
 	man/sxacl-volperm.1 man/sxacl-volshow.1 man/sxacl-whoami.1 \
 	man/sxcat.1 man/sxrm.1 man/sxls.1 man/sxmv.1 man/sxcp.1 \
@@ -152,6 +153,7 @@ am_src_tools_acl_sxacl_OBJECTS = src/tools/acl/sxacl.$(OBJEXT) \
 	src/tools/acl/cmd_volperm.$(OBJEXT) \
 	src/tools/acl/cmd_volshow.$(OBJEXT) \
 	src/tools/acl/cmd_useradd.$(OBJEXT) \
+	src/tools/acl/cmd_userclone.$(OBJEXT) \
 	src/tools/acl/cmd_userdel.$(OBJEXT) \
 	src/tools/acl/cmd_userlist.$(OBJEXT) \
 	src/tools/acl/cmd_usergetkey.$(OBJEXT) \
@@ -380,7 +382,6 @@ am__distuninstallcheck_listfiles = $(distuninstallcheck_listfiles) \
   | sed 's|^\./|$(prefix)/|' | grep -v '$(infodir)/dir$$'
 distcleancheck_listfiles = find . -type f -print
 ACLOCAL = @ACLOCAL@
-AES256_LIBS = @AES256_LIBS@
 AMTAR = @AMTAR@
 AM_CFLAGS = @AM_CFLAGS@
 AM_DEFAULT_VERBOSITY = @AM_DEFAULT_VERBOSITY@
@@ -430,6 +431,8 @@ NM = @NM@
 NMEDIT = @NMEDIT@
 OBJDUMP = @OBJDUMP@
 OBJEXT = @OBJEXT@
+OPENSSL_CFLAGS = @OPENSSL_CFLAGS@
+OPENSSL_LIBS = @OPENSSL_LIBS@
 OTOOL = @OTOOL@
 OTOOL64 = @OTOOL64@
 PACKAGE = @PACKAGE@
@@ -440,12 +443,17 @@ PACKAGE_TARNAME = @PACKAGE_TARNAME@
 PACKAGE_URL = @PACKAGE_URL@
 PACKAGE_VERSION = @PACKAGE_VERSION@
 PATH_SEPARATOR = @PATH_SEPARATOR@
+PKG_CONFIG = @PKG_CONFIG@
+PKG_CONFIG_LIBDIR = @PKG_CONFIG_LIBDIR@
+PKG_CONFIG_PATH = @PKG_CONFIG_PATH@
 RANLIB = @RANLIB@
 SED = @SED@
 SET_MAKE = @SET_MAKE@
 SHELL = @SHELL@
 STRIP = @STRIP@
 SX_FILTER_DIR = @SX_FILTER_DIR@
+VCRYPTO_CFLAGS = @VCRYPTO_CFLAGS@
+VCRYPTO_LIBS = @VCRYPTO_LIBS@
 VERSION = @VERSION@
 ZCOMP_LIBS = @ZCOMP_LIBS@
 abs_builddir = @abs_builddir@
@@ -502,9 +510,9 @@ top_builddir = @top_builddir@
 top_srcdir = @top_srcdir@
 ACLOCAL_AMFLAGS = -I m4
 SUBDIRS = src/filters/zcomp src/filters/attribs src/filters/aes256 src/filters/undelete
-AM_CPPFLAGS = -I $(top_srcdir)/../libsx/include -I $(top_srcdir)/../ -I $(top_srcdir)/src/common -DSX_FILTER_DIR=\"$(pkglibdir)\"
+AM_CPPFLAGS = -I $(top_srcdir)/../libsx/include -I ../libsx/include -I $(top_srcdir)/../ -I $(top_srcdir)/src/common -DSX_FILTER_DIR=\"$(pkglibdir)\"
 EXTRA_DIST = man/*.in
-man_MANS = man/sxacl.1 man/sxacl-useradd.1 man/sxacl-userdel.1 man/sxacl-userlist.1 man/sxacl-usergetkey.1 man/sxacl-usernewkey.1 man/sxacl-volperm.1 man/sxacl-volshow.1 man/sxacl-whoami.1 man/sxcat.1 man/sxrm.1 man/sxls.1 man/sxmv.1 man/sxcp.1 man/sxinit.1 man/sxreport-client.1 man/sxvol.1 man/sxvol-create.1 man/sxvol-modify.1 man/sxvol-remove.1 man/sxvol-filter.1 man/sxrev.1 man/sxrev-list.1 man/sxrev-copy.1 man/sxrev-delete.1
+man_MANS = man/sxacl.1 man/sxacl-useradd.1 man/sxacl-userclone.1 man/sxacl-userdel.1 man/sxacl-userlist.1 man/sxacl-usergetkey.1 man/sxacl-usernewkey.1 man/sxacl-volperm.1 man/sxacl-volshow.1 man/sxacl-whoami.1 man/sxcat.1 man/sxrm.1 man/sxls.1 man/sxmv.1 man/sxcp.1 man/sxinit.1 man/sxreport-client.1 man/sxvol.1 man/sxvol-create.1 man/sxvol-modify.1 man/sxvol-remove.1 man/sxvol-filter.1 man/sxrev.1 man/sxrev-list.1 man/sxrev-copy.1 man/sxrev-delete.1
 src_tools_init_sxinit_SOURCES = \
 	src/tools/init/sxinit.c \
 	src/tools/init/cmdline.c \
@@ -570,6 +578,7 @@ src_tools_acl_sxacl_SOURCES = \
 	src/tools/acl/cmd_volperm.c \
 	src/tools/acl/cmd_volshow.c \
 	src/tools/acl/cmd_useradd.c \
+	src/tools/acl/cmd_userclone.c \
 	src/tools/acl/cmd_userdel.c \
 	src/tools/acl/cmd_userlist.c \
 	src/tools/acl/cmd_usergetkey.c \
@@ -579,6 +588,7 @@ src_tools_acl_sxacl_SOURCES = \
 	src/tools/acl/cmd_volperm.h \
 	src/tools/acl/cmd_volshow.h \
 	src/tools/acl/cmd_useradd.h \
+	src/tools/acl/cmd_userclone.h \
 	src/tools/acl/cmd_userdel.h \
 	src/tools/acl/cmd_userlist.h \
 	src/tools/acl/cmd_usergetkey.h \
@@ -661,6 +671,8 @@ distclean-hdr:
 man/sxacl.1: $(top_builddir)/config.status $(top_srcdir)/man/sxacl.1.in
 	cd $(top_builddir) && $(SHELL) ./config.status $@
 man/sxacl-useradd.1: $(top_builddir)/config.status $(top_srcdir)/man/sxacl-useradd.1.in
+	cd $(top_builddir) && $(SHELL) ./config.status $@
+man/sxacl-userclone.1: $(top_builddir)/config.status $(top_srcdir)/man/sxacl-userclone.1.in
 	cd $(top_builddir) && $(SHELL) ./config.status $@
 man/sxacl-userdel.1: $(top_builddir)/config.status $(top_srcdir)/man/sxacl-userdel.1.in
 	cd $(top_builddir) && $(SHELL) ./config.status $@
@@ -790,6 +802,8 @@ src/tools/acl/cmd_volperm.$(OBJEXT): src/tools/acl/$(am__dirstamp) \
 src/tools/acl/cmd_volshow.$(OBJEXT): src/tools/acl/$(am__dirstamp) \
 	src/tools/acl/$(DEPDIR)/$(am__dirstamp)
 src/tools/acl/cmd_useradd.$(OBJEXT): src/tools/acl/$(am__dirstamp) \
+	src/tools/acl/$(DEPDIR)/$(am__dirstamp)
+src/tools/acl/cmd_userclone.$(OBJEXT): src/tools/acl/$(am__dirstamp) \
 	src/tools/acl/$(DEPDIR)/$(am__dirstamp)
 src/tools/acl/cmd_userdel.$(OBJEXT): src/tools/acl/$(am__dirstamp) \
 	src/tools/acl/$(DEPDIR)/$(am__dirstamp)
@@ -964,6 +978,7 @@ distclean-compile:
 
 @AMDEP_TRUE@@am__include@ @am__quote@src/tools/acl/$(DEPDIR)/cmd_main.Po@am__quote@
 @AMDEP_TRUE@@am__include@ @am__quote@src/tools/acl/$(DEPDIR)/cmd_useradd.Po@am__quote@
+@AMDEP_TRUE@@am__include@ @am__quote@src/tools/acl/$(DEPDIR)/cmd_userclone.Po@am__quote@
 @AMDEP_TRUE@@am__include@ @am__quote@src/tools/acl/$(DEPDIR)/cmd_userdel.Po@am__quote@
 @AMDEP_TRUE@@am__include@ @am__quote@src/tools/acl/$(DEPDIR)/cmd_usergetkey.Po@am__quote@
 @AMDEP_TRUE@@am__include@ @am__quote@src/tools/acl/$(DEPDIR)/cmd_userlist.Po@am__quote@

@@ -145,24 +145,88 @@ static sxi_query_t* sxi_query_add_meta(sxc_client_t *sx, sxi_query_t *query, con
     return query;
 }
 
-sxi_query_t *sxi_useradd_proto(sxc_client_t *sx, const char *username, const uint8_t *key, int admin) {
-    char *qname, hexkey[AUTH_KEY_LEN*2+1];
+sxi_query_t *sxi_useradd_proto(sxc_client_t *sx, const char *username, const uint8_t *uid, const uint8_t *key, int admin, const char *desc) {
+    char *qname, *dname = NULL, hexkey[AUTH_KEY_LEN*2+1];
     sxi_query_t *ret;
     unsigned n;
 
     qname = sxi_json_quote_string(username);
     if(!qname)
 	return NULL;
+    if (desc) {
+        dname = sxi_json_quote_string(desc);
+        if (!dname) {
+            free(qname);
+            return NULL;
+        }
+    }
 
-    n = sizeof("{\"userName\":,\"userType\":\"normal\",\"userKey\":\"\"}") + /* the json body with terminator */
+    n = sizeof("{\"userName\":,\"userType\":\"normal\",\"userKey\":\"\",\"userDesc\":") + /* the json body without terminator */
 	strlen(qname) + /* the json encoded username with quotes */
-	AUTH_KEY_LEN * 2 /* the hex encoded key without quotes */;
+	AUTH_KEY_LEN * 2/* the hex encoded key without quotes */;
     sxi_bin2hex(key, AUTH_KEY_LEN, hexkey);
     ret = sxi_query_create(sx, ".users", REQ_PUT);
     if (ret)
-        ret = sxi_query_append_fmt(sx, ret, n, "{\"userName\":%s,\"userType\":\"%s\",\"userKey\":\"%s\"}", qname, admin ? "admin" : "normal", hexkey);
-
+        ret = sxi_query_append_fmt(sx, ret, n, "{\"userName\":%s,\"userType\":\"%s\",\"userKey\":\"%s\"",
+                                   qname, admin ? "admin" : "normal", hexkey);
+    if (dname)
+        ret = sxi_query_append_fmt(sx, ret, sizeof(",\"userDesc\":") + strlen(dname), ",\"userDesc\":%s", dname);
+    if(ret && uid) { /* If UID has been added, then append its hex representation also */
+        char hexuid[AUTH_UID_LEN*2+1];
+        sxi_bin2hex(uid, AUTH_UID_LEN, hexuid);
+        ret = sxi_query_append_fmt(sx, ret, AUTH_UID_LEN * 2 + strlen(",\"userID\":\"\""), ",\"userID\":\"%s\"", hexuid);
+    }
+    if(ret)
+        ret = sxi_query_append_fmt(sx, ret, 1, "}");
     free(qname);
+    free(dname);
+    return ret;
+}
+
+/* username - new username, the clone name
+ * exsitingname - the cloned username
+ * desc - human readable decription of the user
+ * There is also no need to send admin flag like for useradd proto, clone has the same role as existing user */
+sxi_query_t *sxi_userclone_proto(sxc_client_t *sx, const char *existingname, const char *username, const uint8_t *uid, const uint8_t *key, const char *desc) {
+    char *ename, *uname, *dname, hexkey[AUTH_KEY_LEN*2+1];
+    sxi_query_t *ret;
+    unsigned n;
+
+    ename = sxi_json_quote_string(existingname);
+    if(!ename)
+        return NULL;
+    uname = sxi_json_quote_string(username);
+    if(!uname) {
+        free(ename);
+        return NULL;
+    }
+    dname = sxi_json_quote_string(desc);
+    if (!dname) {
+        free(ename);
+        free(uname);
+        return NULL;
+    }
+
+    n = sizeof("{\"userName\":,\"existingName\":,\"userKey\":\"\",\"userDesc\":") + /* the json body with terminator */
+        strlen(ename) + /* the json encoded exsitingname with quotes */
+        strlen(uname) + /* the json encoded username with quotes */
+        strlen(dname) +
+        AUTH_KEY_LEN * 2/* the hex encoded key without quotes */;
+    sxi_bin2hex(key, AUTH_KEY_LEN, hexkey);
+    ret = sxi_query_create(sx, ".users", REQ_PUT);
+    if (ret)
+        ret = sxi_query_append_fmt(sx, ret, n, "{\"userName\":%s,\"existingName\":%s,\"userKey\":\"%s\",\"userDesc\":%s",
+                                   uname, ename, hexkey, dname);
+    if(ret && uid) {
+        char hexuid[AUTH_UID_LEN*2+1];
+        sxi_bin2hex(uid, AUTH_UID_LEN, hexuid);
+        ret = sxi_query_append_fmt(sx, ret, strlen(",\"userID\":\"\"") + AUTH_UID_LEN * 2, ",\"userID\":\"%s\"", hexuid);
+    }
+    if(ret)
+        ret = sxi_query_append_fmt(sx, ret, 1, "}");
+    free(ename);
+    free(uname);
+    free(dname);
     return ret;
 }
 
@@ -192,7 +256,7 @@ sxi_query_t *sxi_usernewkey_proto(sxc_client_t *sx, const char *username, const 
     return ret;
 }
 
-sxi_query_t *sxi_useronoff_proto(sxc_client_t *sx, const char *username, int enable) {
+sxi_query_t *sxi_useronoff_proto(sxc_client_t *sx, const char *username, int enable, int all_clones) {
     sxi_query_t *ret = NULL;
     unsigned n;
     char *path = NULL;
@@ -205,12 +269,14 @@ sxi_query_t *sxi_useronoff_proto(sxc_client_t *sx, const char *username, int ena
             break;
         }
         n = lenof(".users/?o=disable") + strlen(path) + 1;
+        if(all_clones)
+            n += strlen("&all");
         query = malloc(n);
         if(!query) {
             sxi_setsyserr(sx, SXE_EMEM, "out of memory allocating user query");
             break;
         }
-        snprintf(query, n, ".users/%s?o=%s", path, enable ? "enable" : "disable");
+        snprintf(query, n, ".users/%s?o=%s%s", path, enable ? "enable" : "disable", all_clones ? "&all" : "");
         ret = sxi_query_create(sx, query, REQ_PUT);
     } while(0);
     free(path);
@@ -218,7 +284,7 @@ sxi_query_t *sxi_useronoff_proto(sxc_client_t *sx, const char *username, int ena
     return ret;
 }
 
-sxi_query_t *sxi_userdel_proto(sxc_client_t *sx, const char *username, const char *newowner) {
+sxi_query_t *sxi_userdel_proto(sxc_client_t *sx, const char *username, const char *newowner, int all_clones) {
     sxi_query_t *ret = NULL;
     unsigned n;
     char *oldusr = sxi_urlencode(sx, username, 0);
@@ -231,12 +297,14 @@ sxi_query_t *sxi_userdel_proto(sxc_client_t *sx, const char *username, const cha
             break;
         }
         n = lenof(".users/?chgto=") + strlen(oldusr) + strlen(newusr) + 1;
+        if(all_clones)
+            n += strlen("&all");
         query = malloc(n);
         if(!query) {
             sxi_setsyserr(sx, SXE_EMEM, "out of memory allocating user query");
             break;
         }
-        snprintf(query, n, ".users/%s?chgto=%s", oldusr, newusr);
+        snprintf(query, n, ".users/%s?chgto=%s%s", oldusr, newusr, (all_clones ? "&all" : ""));
         ret = sxi_query_create(sx, query, REQ_DELETE);
     } while(0);
     free(oldusr);
@@ -409,17 +477,23 @@ sxi_query_t *sxi_filedel_proto(sxc_client_t *sx, const char *volname, const char
     return ret;
 }
 
-static sxi_query_t *sxi_hashop_proto_list(sxc_client_t *sx, unsigned blocksize, const char *hashes, unsigned hashes_len, enum sxi_cluster_verb verb, const char *op, const char *id, uint64_t op_expires_at)
+static sxi_query_t *sxi_hashop_proto_list(sxc_client_t *sx, unsigned blocksize, const char *hashes, unsigned hashes_len, enum sxi_cluster_verb verb, const char *op, const char *reserve_id, const char *revision_id, unsigned replica, uint64_t op_expires_at)
 {
-    char url[DOWNLOAD_MAX_BLOCKS * (EXPIRE_TEXT_LEN + SXI_SHA1_TEXT_LEN) + sizeof(".data/1048576/?o=reserve&id=") + 64];
+    char url[DOWNLOAD_MAX_BLOCKS * (EXPIRE_TEXT_LEN + SXI_SHA1_TEXT_LEN) + sizeof(".data/1048576/?o=reserve&reserve_id=&revision_id=") + 104];
     char expires_str[24];
+    char replica_str[24];
     int rc;
 
+    if (!op)
+        return NULL;
     snprintf(expires_str, sizeof(expires_str), "%llu", (long long)op_expires_at);
-    rc = snprintf(url, sizeof(url), ".data/%u/%.*s?%s%s%s%s%s%s", blocksize, hashes_len, hashes,
-                  op ? "o=" : "", op ? op : "",
-                  id ? op ? "&id=" : "id=" : "", id ? id : "",
-                  op_expires_at ? "&op_expires_at=" : "", op_expires_at ? expires_str : "");
+    snprintf(replica_str, sizeof(replica_str), "%u", replica);
+    rc = snprintf(url, sizeof(url), ".data/%u/%.*s?o=%s%s%s%s%s%s%s%s%s", blocksize, hashes_len, hashes,
+                  op,
+                  reserve_id ? "&reserve_id=" : "", reserve_id ? reserve_id : "",
+                  revision_id ? "&revision_id=" : "", revision_id ? revision_id : "",
+                  op_expires_at ? "&op_expires_at=" : "", op_expires_at ? expires_str : "",
+                  replica ? "&replica=" : "", replica ? replica_str : "");
     if (rc < 0 || rc >= sizeof(url)) {
         sxi_seterr(sx, SXE_EARG, "Failed to build hashop url: URL too long");
         return NULL;
@@ -429,77 +503,46 @@ static sxi_query_t *sxi_hashop_proto_list(sxc_client_t *sx, unsigned blocksize, 
 
 sxi_query_t *sxi_hashop_proto_check(sxc_client_t *sx, unsigned blocksize, const char *hashes, unsigned hashes_len)
 {
-    return sxi_hashop_proto_list(sx, blocksize, hashes, hashes_len, REQ_GET, "check", NULL, 0);
+    return sxi_hashop_proto_list(sx, blocksize, hashes, hashes_len, REQ_GET, "check", NULL, NULL, 0, 0);
 }
 
-sxi_query_t *sxi_hashop_proto_reserve(sxc_client_t *sx, unsigned blocksize, const char *hashes, unsigned hashes_len, const char *id, uint64_t op_expires_at)
+sxi_query_t *sxi_hashop_proto_reserve(sxc_client_t *sx, unsigned blocksize, const char *hashes, unsigned hashes_len, const sx_hash_t *reserve_id, const sx_hash_t *revision_id, unsigned replica, uint64_t op_expires_at)
 {
-    if (!id) {
+    char reserve_idhex[SXI_SHA1_TEXT_LEN + 1];
+    char revision_idhex[SXI_SHA1_TEXT_LEN + 1];
+    if (!reserve_id || !revision_id) {
         sxi_seterr(sx, SXE_EARG, "Null id");
+        return NULL;
+    }
+    if (!replica) {
+        sxi_seterr(sx, SXE_EARG, "Replica cannot be zero");
         return NULL;
     }
     if (!op_expires_at) {
         sxi_seterr(sx, SXE_EARG, "Missing expires");
         return NULL;
     }
-    return sxi_hashop_proto_list(sx, blocksize, hashes, hashes_len, REQ_PUT, "reserve", id, op_expires_at);
+    sxi_bin2hex(reserve_id->b, sizeof(reserve_id->b), reserve_idhex);
+    sxi_bin2hex(revision_id->b, sizeof(revision_id->b), revision_idhex);
+    return sxi_hashop_proto_list(sx, blocksize, hashes, hashes_len, REQ_PUT, "reserve", reserve_idhex, revision_idhex, replica, op_expires_at);
 }
 
-int sxi_hashop_generate_id(sxc_client_t *sx, hashop_kind_t kind,
-                           const void *global, unsigned global_size,
-                           const void *local, unsigned local_size, sx_hash_t *id)
-{
-    sxi_md_ctx *hash_ctx;
-
-    if (!sx)
-        return 1;
-    if (!id) {
-        sxi_seterr(sx, SXE_EARG, "null arg");
-        return 1;
-    }
-    if (!global && !local) {
-        sxi_seterr(sx, SXE_EARG, "must be one of: local, global or both");
-        return 1;
-    }
-
-    hash_ctx = sxi_md_init();
-    if (!hash_ctx)
-        return 1;
-    if (!sxi_sha1_init(hash_ctx))
-        return 1;
-
-    if (!sxi_sha1_update(hash_ctx, &kind, sizeof(kind)) ||
-        (global && !sxi_sha1_update(hash_ctx, global, global_size)) ||
-        (local && !sxi_sha1_update(hash_ctx, local, local_size)) ||
-        !sxi_sha1_final(hash_ctx, id->b, NULL)) {
-        return 1;
-    }
-
-    sxi_md_cleanup(&hash_ctx);
-    return 0;
-}
-
-sxi_query_t *sxi_hashop_proto_inuse_begin_bin(sxc_client_t *sx, hashop_kind_t kind, const void *id, unsigned id_size, uint64_t op_expires_at)
-{
-    char idhex[SXI_SHA1_TEXT_LEN+1];
-    sx_hash_t hash;
-    sxi_hashop_generate_id(sx, kind, id, id_size, NULL, 0, &hash);
-
-    sxi_bin2hex(hash.b, sizeof(hash.b), idhex);
-    return sxi_hashop_proto_inuse_begin(sx, kind, idhex, op_expires_at);
-}
-
-sxi_query_t *sxi_hashop_proto_inuse_begin(sxc_client_t *sx, hashop_kind_t kind, const char *id, uint64_t op_expires_at)
+sxi_query_t *sxi_hashop_proto_inuse_begin(sxc_client_t *sx, const sx_hash_t *reserve_hash)
 {
     char url[128];
+    char reserve_idhex[SXI_SHA1_TEXT_LEN+1];
     sxi_query_t *ret;
 
-    if (!id) {
-        sxi_seterr(sx, SXE_EARG, "Null id");
-        return NULL;
+    if (reserve_hash) {
+        sxi_bin2hex(reserve_hash->b, sizeof(reserve_hash->b), reserve_idhex);
+        snprintf(url, sizeof(url), ".data/?reserve_id=%s", reserve_idhex);
+    } else {
+        snprintf(url, sizeof(url), ".data/");
     }
-    snprintf(url, sizeof(url), ".data/?id=%s&op_expires_at=%llu", id, (long long)op_expires_at);
+
     ret = sxi_query_create(sx, url, REQ_PUT);
+    /* tokenid should be a wrapper here, and parser should accept tokenid at any
+     * level and set it for all descendants... */
     ret = sxi_query_append_fmt(sx, ret, 1, "{");
     return ret;
 }
@@ -508,6 +551,7 @@ static sxi_query_t *sxi_hashop_proto_inuse_hash_helper(sxc_client_t *sx, sxi_que
 {
     unsigned i;
     char hexhash[SXI_SHA1_TEXT_LEN + 1];
+    char revision_id_hex[SXI_SHA1_TEXT_LEN + 1];
     if (!blockmeta || !blockmeta->entries) {
         sxi_seterr(sx, SXE_EARG, "Null/empty blockmeta");
         return NULL;
@@ -519,15 +563,23 @@ static sxi_query_t *sxi_hashop_proto_inuse_hash_helper(sxc_client_t *sx, sxi_que
     else
         query->comma = 1;
     sxi_bin2hex(blockmeta->hash.b, sizeof(blockmeta->hash.b), hexhash);
-    query = sxi_query_append_fmt(sx, query, sizeof(hexhash) + 8 + 7, "\"%s\":{\"b\":%u", hexhash, blockmeta->blocksize);
+    query = sxi_query_append_fmt(sx, query, sizeof(hexhash) + 8 + 8, "\"%s\":{\"%u\":[", hexhash, blockmeta->blocksize);
     for (i=0;i<blockmeta->count;i++) {
-        int count = blockmeta->entries[i].count;
-        query = sxi_query_append_fmt(sx, query, 1, ",");
+        const block_meta_entry_t *e = &blockmeta->entries[i];
+        int op = e->op;
+        if (i > 0)
+            query = sxi_query_append_fmt(sx, query, 1, ",");
         if (invert)
-            count = -count;
-        query = sxi_query_append_fmt(sx, query, 32, "\"%u\":%d", blockmeta->entries[i].replica, count);
+            op = -op;
+        sxi_bin2hex(e->revision_id.b, sizeof(e->revision_id.b), revision_id_hex);
+        if (op != 1 && op != -1) {
+            sxi_seterr(sx, SXE_EARG, "Bad hash op: %d", op);
+            return NULL;
+        }
+        SXDEBUG("sending replica %d", e->replica);
+        query = sxi_query_append_fmt(sx, query, 54, "{\"%c%s\":%u}", op == 1 ? '+' : '-', revision_id_hex, e->replica);
     }
-    return sxi_query_append_fmt(sx, query, 1, "}");
+    return sxi_query_append_fmt(sx, query, 2, "]}");
 }
 
 sxi_query_t *sxi_hashop_proto_inuse_hash(sxc_client_t *sx, sxi_query_t *query, const block_meta_t *blockmeta)
@@ -543,9 +595,32 @@ sxi_query_t *sxi_hashop_proto_decuse_hash(sxc_client_t *sx, sxi_query_t *query, 
 sxi_query_t *sxi_hashop_proto_inuse_end(sxc_client_t *sx, sxi_query_t *query)
 {
     sxi_query_t *ret = sxi_query_append_fmt(sx, query, 1, "}");
-    if (ret && ret->content)
+    if (ret && ret->content && query)
         SXDEBUG("hashop proto: %.*s", query->content_len, (const char*)query->content);
     return ret;
+}
+
+sxi_query_t *sxi_hashop_proto_revision(sxc_client_t *sx, unsigned blocksize, const sx_hash_t *revision_id, int op)
+{
+    char url[sizeof(".data/1048576/?o=revmod&revision_id=") + SXI_SHA1_TEXT_LEN + 1];
+    char idhex[SXI_SHA1_TEXT_LEN + 1];
+
+    if (!revision_id) {
+        sxi_seterr(sx, SXE_EARG, "Null revisionid");
+        return NULL;
+    }
+
+    sxi_bin2hex(revision_id->b, sizeof(revision_id->b), idhex);
+    snprintf(url, sizeof(url), ".data/%u/?o=revmod&revision_id=%s", blocksize, idhex);
+    switch (op) {
+        case 1:
+            return sxi_query_create(sx, url, REQ_PUT);
+        case -1:
+            return sxi_query_create(sx, url, REQ_DELETE);
+        default:
+            sxi_seterr(sx, SXE_EARG, "Bad revision op: %d", op);
+            return NULL;
+    }
 }
 
 sxi_query_t *sxi_nodeinit_proto(sxc_client_t *sx, const char *cluster_name, const char *node_uuid, uint16_t http_port, int ssl_flag, const char *ssl_file) {
@@ -728,7 +803,8 @@ sxi_query_t *sxi_volumeacl_proto(sxc_client_t *sx, const char *volname,
     ret = sxi_volumeacl_loop(sx, ret, "revoke-read", revoke_read, ctx);
     ret = sxi_volumeacl_loop(sx, ret, "revoke-write", revoke_write, ctx);
     ret = sxi_query_append_fmt(sx, ret, 1, "}");
-    SXDEBUG("acl query: '%.*s'", ret->content_len, (const char*)ret->content);
+    if (ret)
+        SXDEBUG("acl query: '%.*s'", ret->content_len, (const char*)ret->content);
     free(url);
     return ret;
 }
@@ -798,14 +874,14 @@ sxi_query_t *sxi_volsizes_proto_end(sxc_client_t *sx, sxi_query_t *query) {
     return sxi_query_append_fmt(sx, query, 2, "}");
 }
 
-sxi_query_t *sxi_volume_mod_proto(sxc_client_t *sx, const char *volume, const char *newowner, int64_t newsize) {
+sxi_query_t *sxi_volume_mod_proto(sxc_client_t *sx, const char *volume, const char *newowner, int64_t newsize, int max_revs) {
     sxi_query_t *query = NULL, *ret = NULL;
     char *enc_vol = NULL, *enc_owner = NULL, *path = NULL;
     unsigned int len;
     int comma = 0;
 
-    if(!volume || (!newowner && newsize < 0)) {
-        SXDEBUG("Called with NULL argument");
+    if(!volume || (!newowner && newsize < 0 && max_revs < 0)) {
+        SXDEBUG("Invalid argument");
         return NULL;
     }
 
@@ -852,7 +928,16 @@ sxi_query_t *sxi_volume_mod_proto(sxc_client_t *sx, const char *volume, const ch
     if(newsize > 0) {
         query = sxi_query_append_fmt(sx, query, strlen("\"size\":") + 21 + comma, "%s\"size\":%lld", (comma ? "," : ""), (long long)newsize);
         if(!query) {
-            SXDEBUG("Failed to append owner field to query JSON");
+            SXDEBUG("Failed to append size field to query JSON");
+            goto sxi_volume_mod_proto_err;
+        }
+        comma = 1;
+    }
+
+    if(max_revs > 0) {
+        query = sxi_query_append_fmt(sx, query, strlen("\"maxRevisions\":") + 21 + comma, "%s\"maxRevisions\":%d", (comma ? "," : ""), max_revs);
+        if(!query) {
+            SXDEBUG("Failed to append revs field to query JSON");
             goto sxi_volume_mod_proto_err;
         }
     }
@@ -871,4 +956,61 @@ sxi_volume_mod_proto_err:
     if(!ret) /* If failed, do not return incomplete query */
         sxi_query_free(query);
     return ret;
+}
+
+sxi_query_t *sxi_distlock_proto(sxc_client_t *sx, int lock, const char *lockid) {
+    sxi_query_t *query = NULL;
+
+    query = sxi_query_create(sx, ".distlock", REQ_PUT);
+    if(!query) {
+        SXDEBUG("Failed to create query");
+        sxi_seterr(sx, SXE_EMEM, "Failed to create .distlock query");
+        return NULL;
+    }
+
+    query = sxi_query_append_fmt(sx, query, strlen("{\"op\":\"unlock\""), "{\"op\":\"%s\"", lock ? "lock" : "unlock");
+    if(!query) {
+        SXDEBUG("Failed to append JSON content");
+        sxi_seterr(sx, SXE_EMEM, "Failed to create .distlock query");
+        return NULL;
+    }
+
+    if(lockid) {
+        query = sxi_query_append_fmt(sx, query, strlen(",\"lockID\":\"\"") + strlen(lockid), ",\"lockID\":\"%s\"", lockid);
+        if(!query) {
+            SXDEBUG("Failed to append JSON content");
+            sxi_seterr(sx, SXE_EMEM, "Failed to create .distlock query");
+            return NULL;
+        }
+    }
+
+    query = sxi_query_append_fmt(sx, query, 1, "}");
+    if(!query) {
+        SXDEBUG("Failed to append JSON content");
+        sxi_seterr(sx, SXE_EMEM, "Failed to create .distlock query");
+        return NULL;
+    }
+
+    return query;
+}
+
+sxi_query_t *sxi_cluster_mode_proto(sxc_client_t *sx, int readonly) {
+    sxi_query_t *query;
+
+    query = sxi_query_create(sx, ".mode", REQ_PUT);
+    if(!query) {
+        sxi_seterr(sx, SXE_EMEM, "Failed to allocate query");
+        return NULL;
+    }
+
+    query = sxi_query_append_fmt(sx, query, strlen("{\"mode\":\"ro\"}"), "{\"mode\":\"%s\"}", readonly ? "ro" : "rw");
+    if(!query) {
+        sxi_seterr(sx, SXE_EMEM, "Failed to allocate query");
+        return NULL;
+    }
+    return query;
+}
+
+sxi_query_t *sxi_cluster_upgrade_proto(sxc_client_t *sx) {
+    return sxi_query_create(sx, ".upgrade", REQ_PUT);
 }
