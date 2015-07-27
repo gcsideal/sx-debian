@@ -30,7 +30,7 @@
 
 #include <yajl/yajl_parse.h>
 #include "blob.h"
-#include "../../libsx/src/sxproto.h"
+#include "../../libsxclient/src/sxproto.h"
 
 typedef int64_t job_t;
 
@@ -60,7 +60,7 @@ typedef enum _jobtype_t {
     JOBTYPE_REBALANCE_CLEANUP,
     JOBTYPE_DELETE_USER,
     JOBTYPE_DELETE_VOLUME,
-    JOBTYPE_NEWKEY_USER,
+    JOBTYPE_MODIFY_USER,
     JOBTYPE_MODIFY_VOLUME,
     JOBTYPE_REPLACE,
     JOBTYPE_REPLACE_BLOCKS,
@@ -72,7 +72,11 @@ typedef enum _jobtype_t {
     JOBTYPE_IGNODES,
     JOBTYPE_BLOCKS_REVISION,
     JOBTYPE_FLUSH_FILE_LOCAL,
-    JOBTYPE_UPGRADE_1_0_TO_1_1,
+    JOBTYPE_UPGRADE_FROM_1_0_OR_1_1,
+    JOBTYPE_JOBPOLL,
+    JOBTYPE_MASSDELETE,
+    JOBTYPE_MASSRENAME,
+    JOBTYPE_CLUSTER_SETMETA,
 } jobtype_t;
 
 typedef enum {
@@ -98,10 +102,11 @@ typedef struct {
 extern const job_2pc_t acl_spec;
 extern const job_2pc_t user_spec;
 extern const job_2pc_t userdel_spec;
-extern const job_2pc_t user_newkey_spec;
+extern const job_2pc_t user_modify_spec;
 extern const job_2pc_t volmod_spec;
 extern const job_2pc_t cluster_mode_spec;
 extern const job_2pc_t revision_spec;
+extern const job_2pc_t cluster_setmeta_spec;
 
 void job_2pc_handle_request(sxc_client_t *sx, const job_2pc_t *spec, void *yctx);
 #endif

@@ -45,6 +45,10 @@ my %TOK=('noauth'  => undef,
 
 my $PUBLIC = everyone(200);
 my ($fails, $okies) = (0, 0);
+my @cleanupf;
+my @cleanupv;
+my %cleanupm;
+my $in_cleanup = 0;
 
 my $QUERYHOST = 'localhost';
 my $NODEHOST = '';
@@ -58,11 +62,13 @@ if(is_int($ARGV[0])) {
 }
 
 sub fail {
+    return if($in_cleanup);
     print 'FAIL ('.shift().")\n";
     $fails++;
 }
 
 sub ok {
+    return if($in_cleanup);
     my $msg = str(shift);
     print "ok $msg\n";
     $okies++
@@ -222,7 +228,7 @@ sub test_reply {
 	next unless $expect;
 
 	my ($exp_st, $exp_ct) = @$expect;
-	print "Checking $test ($_)... ";
+	print "Checking $test ($_)... " unless $in_cleanup;
 	my $auth = $TOK{$_};
 	my $req = HTTP::Request->new($verb, "http://$QUERYHOST/$q");
 	if(defined $content) {
@@ -310,7 +316,7 @@ sub job_submit {
 	return undef;
     }
     if($exp_st != 200) {
-	return -1;
+	return '';
     }
     if($repl->content_type ne 'application/json') {
 	fail "job request received an unexpected content type - got '".$repl->content_type."' expected: 'application/json'";
@@ -344,7 +350,7 @@ sub job_result {
 	    fail "job result received an unexpected content type - got '".$repl->content_type."' expected: 'application/json'";
 	    return undef;
 	}
-	if(!$json || !is_string($json->{'requestStatus'}) || !is_string($json->{'requestMessage'}) || !defined($json->{'requestId'}) || $json->{'requestId'} != $jobid) {
+	if(!$json || !is_string($json->{'requestStatus'}) || !is_string($json->{'requestMessage'}) || !defined($json->{'requestId'}) || $json->{'requestId'} ne $jobid) {
 	    fail "bad reply content to job result";
 	    return undef;
 	}
@@ -365,7 +371,7 @@ sub test_upload {
     my $expectrc = shift; #Expected return code for PUT operation
     my $len = length $file;
 
-    print "Checking $test ($who)... ";
+    print "Checking $test ($who)... " unless $in_cleanup;
     my $auth = $TOK{$who};
 
     # Get volume info
@@ -457,6 +463,10 @@ sub test_upload {
 	}
 	if(!($jsobj = get_json(str $repl->decoded_content))) {
 	    fail 'cannot request file upload - bad json';
+	    return;
+	}
+	if(defined($token) && $token ne $jsobj->{'uploadToken'}) {
+	    fail 'upload token has changed';
 	    return;
 	}
 	$token = $jsobj->{'uploadToken'};
@@ -608,6 +618,7 @@ sub test_upload {
     }
 
     my $mbps = $len / $timing / 1024 / 1024;
+    push @cleanupf, escape_uri($vol, $fname);
     ok "$mbps MB/s";
 }
 
@@ -632,11 +643,11 @@ sub test_job {
 	# {"requestId":"6","minPollInterval":100,"maxPollInterval":6000}
 	my $auth = $TOK{$_};
 
-	print "Checking $test ($_)... ";
+	print "Checking $test ($_)... " unless $in_cleanup;
 
 	my $jobid = job_submit $verb, $q, $content, $auth, $exp_st;
 	next unless defined($jobid);
-	if($jobid == -1) {
+	if($jobid eq '') {
 	    ok;
 	    next;
 	}
@@ -660,6 +671,14 @@ sub test_delete_job {
     return test_job 'DELETE', @_;
 }
 
+sub test_mkvol {
+    my $oldk = $okies;
+    test_put_job @_;
+    if(defined($_[2]) && $okies > $oldk) {
+	push @cleanupv, $_[2];
+    }
+}
+
 sub test_create_user {
     my $name = shift;
     my $binu = sha1($name);
@@ -670,6 +689,27 @@ sub test_create_user {
 
     $TOK{$name} = encode_base64($binu . $bink . chr(0) . chr(0));
 }
+
+sub cleanup {
+    $SIG{INT} = 'DEFAULT';
+    $in_cleanup = 1;
+    print "\nCleaning up...";
+    foreach my $del (@cleanupf) {
+	test_delete_job "file cleanup", {'admin'=>[200]}, $del;
+    }
+    foreach my $del (@cleanupv) {
+	test_delete_job "volume cleanup", {'admin'=>[200]}, $del;
+    }
+    # Cleanup cluster meta
+    if(%cleanupm && is_hash(\%cleanupm)) {
+        test_put_job "cluster meta cleanup", admin_only(200), ".clusterMeta", "{\"clusterMeta\":" . encode_json(\%cleanupm) . "}";
+    }
+    print " done\n";
+}
+
+
+$SIG{INT} = sub { cleanup; exit 1; };
+
 
 ### USER CREATION TESTS ###
 # Needed for below tests
@@ -683,7 +723,6 @@ test_head 'cluster (HEAD)', $PUBLIC, '/';
 test_delete 'cluster (bad method)', {'badauth'=>[401],$reader=>[405],$writer=>[405],'admin'=>[405]}, '';
 
 ### CLUSTER TESTS ###
-# FIXME : properly check nodes and volume lists once they are unstubbed #
 test_get 'list nodes', {'noauth'=>[200,'text/html'],'badauth'=>[401],$reader=>[200,'application/json'],$writer=>[200,'application/json'],'admin'=>[200,'application/json']}, '?nodeList';
 test_get 'list nodes (HEAD)', {'noauth'=>[200,'text/html'],'badauth'=>[401],$reader=>[200,'application/json'],$writer=>[200,'application/json'],'admin'=>[200,'application/json']}, '?nodeList';
 
@@ -697,50 +736,57 @@ my $volumesize = 0x40000000;
 my $tinyvolumesize = 1024*1024;
 my $bigvolumesize = $nodesize+1;
 
-test_put_job 'volume creation (no content)', admin_only(400), $vol;
-test_put_job 'volume creation (bad content)', admin_only(400), $vol, "{\"owner\":\"admin\",\"volumeSize\":$volumesize";
-test_put_job 'volume creation (bad volume size - too small)', admin_only(400), $vol, '{"owner":"admin","volumeSize":10}';
-test_put_job 'volume creation (bad volume size - too big)', admin_only(400), $vol, "{\"owner\":\"admin\",\"volumeSize\":$bigvolumesize}";
-test_put_job 'volume creation (no owner)', admin_only(400), $vol, '{"volumeSize":$volumesize}';
-test_put_job 'volume creation (reserved name)', admin_only(403), '.reserved', "{\"owner\":\"admin\",\"volumeSize\":$volumesize}";
-test_put_job "volume creation", admin_only(200), $vol, "{\"volumeSize\":$volumesize,\"owner\":\"admin\"}";
+test_mkvol 'volume creation (no content)', admin_only(400), $vol;
+test_mkvol 'volume creation (bad content)', admin_only(400), $vol, "{\"owner\":\"admin\",\"volumeSize\":$volumesize";
+test_mkvol 'volume creation (bad volume size - too small)', admin_only(400), $vol, '{"owner":"admin","volumeSize":10}';
+test_mkvol 'volume creation (bad volume size - too big)', admin_only(400), $vol, "{\"owner\":\"admin\",\"volumeSize\":$bigvolumesize}";
+test_mkvol 'volume creation (no owner)', admin_only(400), $vol, '{"volumeSize":$volumesize}';
+test_mkvol 'volume creation (reserved name)', admin_only(403), '.reserved', "{\"owner\":\"admin\",\"volumeSize\":$volumesize}";
+test_mkvol "volume creation", admin_only(200), $vol, "{\"volumeSize\":$volumesize,\"owner\":\"admin\"}";
 test_put_job 'granting rights on newly created volume', admin_only(200), $vol."?o=acl", "{\"grant-read\":[\"$reader\",\"$writer\"],\"grant-write\":[\"$writer\"] }";
-test_put_job 'creation of the same volume', admin_only(200), $vol, "{\"owner\":\"admin\",\"volumeSize\":$volumesize}", 1;
+test_mkvol 'creation of the same volume', admin_only(200), $vol, "{\"owner\":\"admin\",\"volumeSize\":$volumesize}", 1;
 test_get 'the newly created volume', authed_only(200, 'application/json'), $vol, undef, sub { my $json = get_json(shift) or return 0; return is_int($json->{'volumeSize'}) && $json->{'volumeSize'} == $volumesize && is_hash($json->{'fileList'}) && scalar keys %{$json->{'fileList'}} == 0 };
-test_put_job 'creation of another volume', admin_only(200), "another.$vol", "{\"volumeSize\":$volumesize,\"owner\":\"admin\"}";
+test_mkvol 'creation of another volume', admin_only(200), "another.$vol", "{\"volumeSize\":$volumesize,\"owner\":\"admin\"}";
 test_put_job 'granting rights on newly created volume', admin_only(200), "another.$vol?o=acl", "{\"grant-read\":[\"$reader\",\"$writer\"],\"grant-write\":[\"$writer\"] }";
 test_get 'the newly created volume', authed_only(200, 'application/json'), "another.$vol", undef, sub { my $json = get_json(shift) or return 0; return is_int($json->{'volumeSize'}) && $json->{'volumeSize'} == $volumesize && is_hash($json->{'fileList'}) && scalar keys %{$json->{'fileList'}} == 0 };
 test_get 'the old volume again', authed_only(200, 'application/json'), "another.$vol", undef, sub { my $json = get_json(shift) or return 0; return is_int($json->{'volumeSize'}) && $json->{'volumeSize'} == $volumesize && is_hash($json->{'fileList'}) && scalar keys %{$json->{'fileList'}} == 0 };
-test_put_job 'volume creation (negative replica)', admin_only(400), "large$vol", "{\"owner\":\"admin\",\"replicaCount\":-1,\"volumeSize\":$volumesize}";
-test_put_job 'volume creation (replica > nodes)', admin_only(400), "large$vol", "{\"owner\":\"admin\",\"replicaCount\":1000,\"volumeSize\":$tinyvolumesize}", 1;
-test_put_job 'volume creation (non default replica)', admin_only(200), "large$vol", "{\"owner\":\"admin\",\"replicaCount\":1,\"volumeSize\":$volumesize}";
+test_mkvol 'volume creation (negative replica)', admin_only(400), "large$vol", "{\"owner\":\"admin\",\"replicaCount\":-1,\"volumeSize\":$volumesize}";
+test_mkvol 'volume creation (replica > nodes)', admin_only(400), "large$vol", "{\"owner\":\"admin\",\"replicaCount\":1000,\"volumeSize\":$tinyvolumesize}", 1;
+test_mkvol 'volume creation (non default replica)', admin_only(200), "large$vol", "{\"owner\":\"admin\",\"replicaCount\":1,\"volumeSize\":$volumesize}";
 test_put_job 'granting rights on newly created volume', admin_only(200), "large$vol?o=acl", "{\"grant-read\":[\"$reader\",\"$writer\"],\"grant-write\":[\"$writer\"] }";
 
 my $nuke = chr(0x2622);
 my $utfvol = "$vol$nuke";
-test_put_job "volume creation (utf-8)", admin_only(200), escape_uri($utfvol), "{\"owner\":\"admin\",\"volumeSize\":$volumesize}";
+test_mkvol "volume creation (utf-8)", admin_only(200), escape_uri($utfvol), "{\"owner\":\"admin\",\"volumeSize\":$volumesize}";
 test_put_job 'granting rights on newly created volume', admin_only(200), escape_uri($utfvol)."?o=acl", "{\"grant-read\":[\"$reader\",\"$writer\"],\"grant-write\":[\"$writer\"] }";
 test_get 'the newly created volume', authed_only(200, 'application/json'), escape_uri($utfvol), undef, sub { my $json = get_json(shift) or return 0; return is_int($json->{'volumeSize'}) && $json->{'volumeSize'} == $volumesize && is_hash($json->{'fileList'}) && scalar keys %{$json->{'fileList'}} == 0 };
-test_put_job 'volume creation (with meta)', admin_only(200), "meta.$vol", "{\"owner\":\"admin\",\"volumeSize\":$volumesize,\"volumeMeta\":{\"one\":\"01\",\"two\":\"2222\",\"three\":\"333333\"}}";
+test_mkvol 'volume creation (with meta)', admin_only(200), "meta.$vol", "{\"owner\":\"admin\",\"volumeSize\":$volumesize,\"volumeMeta\":{\"one\":\"01\",\"two\":\"2222\",\"three\":\"333333\"}}";
 test_put_job 'granting rights on newly created volume', admin_only(200), "meta.$vol?o=acl", "{\"grant-read\":[\"$reader\",\"$writer\"],\"grant-write\":[\"$writer\"] }";
 test_get 'the newly created volume', authed_only(200, 'application/json'), "meta.$vol?o=locate&volumeMeta", undef, sub { my $json = get_json(shift) or return 0; return is_array($json->{'nodeList'}) && is_hash($json->{'volumeMeta'}) && (scalar keys %{$json->{'volumeMeta'}} == 3) && $json->{'volumeMeta'}->{'one'} eq '01' && $json->{'volumeMeta'}->{'two'} eq '2222' && $json->{'volumeMeta'}->{'three'} eq '333333' };
 test_get 'the newly created volume for meta ', {'badauth'=>[401],$reader=>[200,'application/json'],$writer=>[200,'application/json'],'admin'=>[200,'application/json']}, "?volumeList&volumeMeta", undef, sub { my $json = get_json(shift) or return 0; if(!(is_hash($json->{'volumeList'}) && is_hash($json->{'volumeList'}->{"meta.$vol"}))) { return 0; } my $meta = $json->{'volumeList'}->{"meta.$vol"}->{'volumeMeta'}; return is_hash($meta) && (scalar keys %{$meta} == 3) && $meta->{'one'} eq '01' && $meta->{'two'} eq '2222' && $meta->{'three'} eq '333333'; };
 
-test_put_job 'volume creation (with bad meta)', admin_only(400), "badmeta.$vol", "{\"owner\":\"admin\",\"volumeSize\":$volumesize,\"volumeMeta\":{\"badval\":\"0dd\"}}";
+test_mkvol 'volume creation (with bad meta)', admin_only(400), "badmeta.$vol", "{\"owner\":\"admin\",\"volumeSize\":$volumesize,\"volumeMeta\":{\"badval\":\"0dd\"}}";
+test_mkvol 'volume creation (max meta key size)', admin_only(200), "maxmetakey.$vol", "{\"owner\":\"admin\",\"volumeSize\":$tinyvolumesize,\"volumeMeta\":{\"".('A' x 256)."\":\"acab\"}}";
+test_mkvol 'volume creation (meta key too long)', admin_only(400), "badmeta2.$vol", "{\"owner\":\"admin\",\"volumeSize\":$tinyvolumesize,\"volumeMeta\":{\"".('A' x 257)."\":\"acab\"}}";
+test_mkvol 'volume creation (max meta value size)', admin_only(200), "maxmetaval.$vol", "{\"owner\":\"admin\",\"volumeSize\":$tinyvolumesize,\"volumeMeta\":{\"key\":\"".('a' x 2048)."\"}}";
+test_mkvol 'volume creation (meta value too long)', admin_only(400), "badmeta3.$vol", "{\"owner\":\"admin\",\"volumeSize\":$tinyvolumesize,\"volumeMeta\":{\"key\":\"".('a' x 2049)."\"}}";
+my $metaitems = join(',', map { qq{"$_":"acab"} } 0..127);
+test_mkvol 'volume creation (max meta items)', admin_only(200), "maxmetaitems.$vol", "{\"owner\":\"admin\",\"volumeSize\":$tinyvolumesize,\"volumeMeta\":{$metaitems}}";
+test_mkvol 'volume creation (too many meta items)', admin_only(400), "badmeta4.$vol", "{\"owner\":\"admin\",\"volumeSize\":$tinyvolumesize,\"volumeMeta\":{$metaitems,\"toomany\":\"acab\"}}";
+
 
 # Tiny volume will be used for volume size enforcement tests
-test_put_job "volume creation (tiny volume)", admin_only(200), "tiny$vol", "{\"volumeSize\":$tinyvolumesize,\"owner\":\"admin\"}";
-test_put_job 'granting rights on newly created volume', admin_only(200), "tiny$vol?o=acl", "{\"grant-read\":[\"$reader\",\"$writer\"],\"grant-write\":[\"$writer\"] }";
+test_mkvol "volume creation (tiny volume)", admin_only(200), "tiny$vol", "{\"volumeSize\":$tinyvolumesize,\"owner\":\"$writer\"}";
+test_put_job 'granting rights on newly created volume', {'badauth'=>[401],$reader=>[403],$writer=>[200],'admin'=>[200]}, "tiny$vol?o=acl", "{\"grant-read\":[\"$reader\"],\"grant-write\":[] }";
 test_get 'the newly created volume', authed_only(200, 'application/json'), "tiny$vol", undef, sub { my $json = get_json(shift) or return 0; return is_int($json->{'volumeSize'}) && $json->{'volumeSize'} == $tinyvolumesize && is_hash($json->{'fileList'}) && scalar keys %{$json->{'fileList'}} == 0 };
 
 # Misc volume used to test user deletion and revisions
-test_put_job "volume creation (misc volume)", admin_only(200), "misc$vol", "{\"volumeSize\":$tinyvolumesize,\"owner\":\"$delme\",\"replicaCount\":1,\"maxRevisions\":2}";
-#FIXME this tests is a workaround due to bb#555
-test_get 'checking volume ownership', admin_only(200, 'application/json'), "misc$vol?o=acl", undef, sub { my $json = get_json(shift);
+test_mkvol "volume creation (misc volume)", admin_only(200), "misc$vol", "{\"volumeSize\":$tinyvolumesize,\"owner\":\"$delme\",\"replicaCount\":1,\"maxRevisions\":2}";
+test_get 'checking volume ownership', admin_only(200, 'application/json'), "misc$vol?o=acl&manager", undef, sub { my $json = get_json(shift);
     my %is_priv   = map { $_, 1 } @{$json->{$delme}};
     return is_array($json->{$delme}) && $is_priv{'owner'}; };
 test_delete_job "user deletion", admin_only(200), ".users/$delme";
-test_get 'checking volume ownership', admin_only(200, 'application/json'), "misc$vol?o=acl", undef, sub { 
+test_get 'checking volume ownership', admin_only(200, 'application/json'), "misc$vol?o=acl&manager", undef, sub { 
     my $json = get_json(shift);
     my %is_priv = ();
     foreach (@{$json->{'admin'}}) { $is_priv{$_} = 1 };
@@ -792,7 +838,39 @@ test_upload 'file upload: (exceeding volume capacity)', $writer, random_data($ti
 # Check if quota will be enforced also for file with metadata (-meta value length: 10/2=5, +1 byte to exceed)
 test_upload 'file upload (exceeding volume capacity (meta))', $writer, random_data($tinyvolumesize-length('toobig')-length('somemeta')-4), "tiny$vol", 'toobig', undef, {'somemeta'=> "ffaabb0011"}, 413;
 # This should return 200
-test_upload 'file upload (exceeding volume capacity (meta))', $writer, random_data($tinyvolumesize-length('toobig')-length('somemeta')-5), "tiny$vol", 'toobig', undef, {'somemeta'=> "ffaabb0011"};
+test_upload 'file upload (with meta, should not exceed volume capacity)', $writer, random_data($tinyvolumesize-length('toobig')-length('somemeta')-5), "tiny$vol", 'toobig', undef, {'somemeta'=> "ffaabb0011"};
+# Checking volume owner quota handing
+test_delete_job "Wiping tiny$vol contents", {'badauth'=>[401],$reader=>[403],$writer=>[200]}, "tiny$vol/toobig";
+my $mediumvolumesize = $tinyvolumesize * 10;
+test_mkvol "volume creation (medium volume)", admin_only(200), "medium$vol", "{\"volumeSize\":$mediumvolumesize,\"owner\":\"$writer\"}";
+test_get 'the newly created volume', {'badauth'=>[401],$reader=>[403],$writer=>[200, 'application/json'],'admin'=>[200, 'application/json']}, "medium$vol", undef, sub { my $json = get_json(shift) or return 0; return is_int($json->{'volumeSize'}) && $json->{'volumeSize'} == $mediumvolumesize && is_hash($json->{'fileList'}) && scalar keys %{$json->{'fileList'}} == 0 };
+# Check if we can change $writer quota
+test_put_job "setting owner quota for $writer", admin_only(200), ".users/$writer", "{\"quota\":$tinyvolumesize}";
+# Check if quota has been set up properly
+test_get "$writer quota", admin_only(200,'application/json'), ".users/$writer?quota", undef, sub { my $json_raw = shift; my $json = get_json($json_raw) or return 0; return is_int($json->{'userQuota'}) && $json->{'userQuota'} == $tinyvolumesize; };
+# This should return 200
+test_upload 'file upload', $writer, random_data($tinyvolumesize-length('toobig')), "tiny$vol", 'toobig';
+# Check if volume usage is computed correctly
+test_get "$writer quota usage", {$writer=>[200,'application/json']}, ".self", undef, sub { my $json_raw = shift; my $json = get_json($json_raw) or return 0; return is_hash($json->{$writer}) && is_int($json->{$writer}->{'userQuota'}) && $json->{$writer}->{'userQuota'} == $tinyvolumesize && is_int($json->{$writer}->{'userQuotaUsed'}) && $json->{$writer}->{'userQuotaUsed'} == $tinyvolumesize; };
+# This file should not be allowed to be uploaded because $writer user quota will be exceeded (data on the other volume owned by $writer is present)
+test_upload 'file upload: (exceeding volume owner quota)', $writer, '', "medium$vol", 'empty', undef, {}, 413;
+test_delete_job "Wiping tiny$vol contents", {'badauth'=>[401],$reader=>[403],$writer=>[200]}, "tiny$vol/toobig";
+# This should return 200 now (file size is the length of file name)
+test_upload 'file upload', $writer, '', "medium$vol", 'empty';
+# This file should not be allowed to be uploaded because $writer user quota will be exceeded (data on the other volume owned by $writer is present)
+test_upload 'file upload (exceeding volume owner quota)', $writer, random_data($tinyvolumesize-length('toobig')), "tiny$vol", 'toobig', undef, {}, 413;
+# Check if we can disable $writer quota
+test_put_job "disabling owner quota for $writer", admin_only(200), ".users/$writer", "{\"quota\":0}";
+# Check if quota has been set up properly
+test_get "$writer quota", admin_only(200,'application/json'), ".users/$writer?quota", undef, sub { my $json_raw = shift; my $json = get_json($json_raw) or return 0; return is_int($json->{'userQuota'}) && $json->{'userQuota'} == 0; };
+# Check if volume usage is computed correctly
+test_get "$writer quota usage", {$writer=>[200,'application/json']}, ".self", undef, sub { my $json_raw = shift; my $json = get_json($json_raw) or return 0; return is_hash($json->{$writer}) && is_int($json->{$writer}->{'userQuota'}) && $json->{$writer}->{'userQuota'} == 0 && is_int($json->{$writer}->{'userQuotaUsed'}) && $json->{$writer}->{'userQuotaUsed'} == length('empty'); };
+# This should return 200 now
+test_upload 'file upload', $writer, random_data($tinyvolumesize-length('toobig')), "tiny$vol", 'toobig';
+# Check if volume usage is computed correctly
+test_get "$writer quota usage", {$writer=>[200,'application/json']}, ".self", undef, sub { my $json_raw = shift; my $json = get_json($json_raw) or return 0; return is_hash($json->{$writer}) && is_int($json->{$writer}->{'userQuota'}) && $json->{$writer}->{'userQuota'} == 0 && is_int($json->{$writer}->{'userQuotaUsed'}) && $json->{$writer}->{'userQuotaUsed'} == length('empty') + $tinyvolumesize; };
+test_put_job "setting invalid quota for $writer (negative)", {'badauth'=>[401],$reader=>[403],$writer=>[403],'admin'=>[400]}, ".users/$writer", "{\"quota\":-1}";
+test_put_job "setting invalid quota for $writer (too small)", {'badauth'=>[401],$reader=>[403],$writer=>[403],'admin'=>[400]}, ".users/$writer", "{\"quota\":1048575}"; # 1MB is the lowest accepted value
 
 
 test_get 'listing all files', authed_only(200, 'application/json'), $vol, undef, sub { my $json = get_json(shift) or return 0; return is_int($json->{'volumeSize'}) && $json->{'volumeSize'} == $volumesize && is_int($json->{'replicaCount'}) && $json->{'replicaCount'} == 1 && is_hash($json->{'fileList'}) && is_hash($json->{'fileList'}->{'/empty'}) && is_int($json->{'fileList'}->{'/empty'}->{'fileSize'}) && $json->{'fileList'}->{'/empty'}->{'fileSize'} == 0 && is_int($json->{'fileList'}->{'/empty'}->{'blockSize'}) && $json->{'fileList'}->{'/empty'}->{'blockSize'} == 4096 && is_int($json->{'fileList'}->{'/empty'}->{'createdAt'}) && is_string($json->{'fileList'}->{'/empty'}->{'fileRevision'}) };
@@ -1002,30 +1080,164 @@ test_get 'listing all \'tree/*/\' files', authed_only(200, 'application/json'), 
         return 0 unless is_hash($json->{'fileList'}->{'/tree/[]/?*\\'});
     };
 
+### Check mass delete operation ###
+test_delete_job "mass delete on $vol", {'badauth'=>[401],$reader=>[403],$writer=>[200]}, "$vol?filter=/tree/?/a";
+
+# List  'tree/*/' - Now it should not contain /tree/a/a and /tree/b/a files dropped in preceding query
+test_get 'listing all \'tree/*/\' files', authed_only(200, 'application/json'), "$vol?filter=tree/*/", undef,
+    sub {
+        my $json_raw = shift;
+        my $json = get_json($json_raw) or return 0;
+        return 0 unless is_int($json->{'volumeSize'}) && $json->{'volumeSize'} == $volumesize && is_int($json->{'replicaCount'}) &&
+            $json->{'replicaCount'} == 1 && is_hash($json->{'fileList'}) && scalar keys %{$json->{'fileList'}} == 7;
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/a/b'});
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/a/c'});
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/b/b'});
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/[]/a'});
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/[]/\a'});
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/[]/\a/'});
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/[]/?*\\'});
+    };
+
+# Delete /tree/a/b, /tree/a/c, /tree/b/b
+test_delete_job "mass delete on $vol", {'badauth'=>[401],$reader=>[403],'admin'=>[200]}, "$vol?filter=/tree/[ab]/*";
+# List  'tree/*/'
+test_get 'listing all \'tree/*/\' files', authed_only(200, 'application/json'), "$vol?filter=tree/*/", undef,
+    sub {
+        my $json_raw = shift;
+        my $json = get_json($json_raw) or return 0;
+        return 0 unless is_int($json->{'volumeSize'}) && $json->{'volumeSize'} == $volumesize && is_int($json->{'replicaCount'}) &&
+            $json->{'replicaCount'} == 1 && is_hash($json->{'fileList'}) && scalar keys %{$json->{'fileList'}} == 4;
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/[]/a'});
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/[]/\a'});
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/[]/\a/'});
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/[]/?*\\'});
+    };
+
+
+
+
+
+### Check mass rename operation ###
+# Check failing on existing dest case
+test_put_job "mass rename on $vol (invalid arguments)", {'badauth'=>[401],$reader=>[403],$writer=>[409]}, "$vol?source=tree/[]/&dest=tree/";
+# Rename /tree to /treee
+test_put_job "mass rename on $vol (rename /tree to /treee)", {'badauth'=>[401],$reader=>[403],$writer=>[200]}, "$vol?source=tree/&dest=treee/";
+# List  'treee/' -> check if /tree directory has been correctly renamed to /treee
+test_get 'listing all \'treee/\' files', authed_only(200, 'application/json'), "$vol?filter=treee/&recursive", undef,
+    sub {
+        my $json_raw = shift;
+        my $json = get_json($json_raw) or return 0;
+        return 0 unless is_int($json->{'volumeSize'}) && $json->{'volumeSize'} == $volumesize && is_int($json->{'replicaCount'}) &&
+            $json->{'replicaCount'} == 1 && is_hash($json->{'fileList'}) && scalar keys %{$json->{'fileList'}} == 6;
+        return 0 unless is_hash($json->{'fileList'}->{'/treee/b'});
+        return 0 unless is_hash($json->{'fileList'}->{'/treee/[]'});
+        return 0 unless is_hash($json->{'fileList'}->{'/treee/[]/a'});
+        return 0 unless is_hash($json->{'fileList'}->{'/treee/[]/\a'});
+        return 0 unless is_hash($json->{'fileList'}->{'/treee/[]/\a/a'});
+        return 0 unless is_hash($json->{'fileList'}->{'/treee/[]/?*\\'});
+    };
+
+test_get 'listing all \'tree/\' files', authed_only(200, 'application/json'), "$vol?filter=tree/*", undef,
+    sub {
+        my $json_raw = shift;
+        my $json = get_json($json_raw) or return 0;
+        return 0 unless is_int($json->{'volumeSize'}) && $json->{'volumeSize'} == $volumesize && is_int($json->{'replicaCount'}) &&
+            $json->{'replicaCount'} == 1 && is_hash($json->{'fileList'}) && scalar keys %{$json->{'fileList'}} == 0;
+    };
+
+# Rename /treee again to /tree
+test_put_job "mass rename on $vol (rename /treee to /tree)", {'badauth'=>[401],$reader=>[403],$writer=>[200]}, "$vol?source=treee/&dest=tree/";
+# List  'tree/' recursively
+test_get 'listing all \'tree/\' files', authed_only(200, 'application/json'), "$vol?filter=tree/&recursive", undef,
+    sub {
+        my $json_raw = shift;
+        my $json = get_json($json_raw) or return 0;
+        return 0 unless is_int($json->{'volumeSize'}) && $json->{'volumeSize'} == $volumesize && is_int($json->{'replicaCount'}) &&
+            $json->{'replicaCount'} == 1 && is_hash($json->{'fileList'}) && scalar keys %{$json->{'fileList'}} == 6;
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/b'});
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/[]'});
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/[]/a'});
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/[]/\a'});
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/[]/\a/a'});
+        return 0 unless is_hash($json->{'fileList'}->{'/tree/[]/?*\\'});
+    };
+test_get 'listing all \'treee/\' files', authed_only(200, 'application/json'), "$vol?filter=treee/*", undef,
+    sub {
+        my $json_raw = shift;
+        my $json = get_json($json_raw) or return 0;
+        return 0 unless is_int($json->{'volumeSize'}) && $json->{'volumeSize'} == $volumesize && is_int($json->{'replicaCount'}) &&
+            $json->{'replicaCount'} == 1 && is_hash($json->{'fileList'}) && scalar keys %{$json->{'fileList'}} == 0;
+    };
+
+my $randname = random_string(1020);
+test_upload 'file upload (long file name)', $writer, '', $vol, "abc/".$randname;
+test_get 'file with long name existence', authed_only(200, 'application/json'), "$vol?filter=abc/$randname", undef, sub { my $json_raw = shift; my $json = get_json($json_raw) or return 0; return 0 unless is_int($json->{'volumeSize'}) && $json->{'volumeSize'} == $volumesize && is_int($json->{'replicaCount'}) && $json->{'replicaCount'} == 1 && is_hash($json->{'fileList'}) && scalar keys %{$json->{'fileList'}} == 1; };
+# Rename /abc to /abcd should fail since there is a file with too long name 
+test_put_job "mass rename on $vol (rename /abc to /abcd)", {'badauth'=>[401],$reader=>[403],$writer=>[200]}, "$vol?source=abc/&dest=abcd/", undef, 'ERROR';
+# Check if the file still exists and pick also the current volume usage
+my $curvolsize;
+test_get 'file with long name existence (should exist after failed mass rename)', authed_only(200, 'application/json'), "$vol?filter=abc/$randname", undef, sub { my $json_raw = shift; my $json = get_json($json_raw) or return 0; return 0 unless is_int($json->{'volumeUsedSize'}) && is_int($json->{'volumeSize'}) && $json->{'volumeSize'} == $volumesize && is_int($json->{'replicaCount'}) && $json->{'replicaCount'} == 1 && is_hash($json->{'fileList'}) && scalar keys %{$json->{'fileList'}} == 1; $curvolsize = $json->{'volumeUsedSize'}; };
+# Now curvolsize should contain current volume usage
+# Rename /abc to /a
+test_put_job "mass rename on $vol (rename /abc to /a)", {'badauth'=>[401],$reader=>[403],$writer=>[200]}, "$vol?source=abc/&dest=a/";
+# Check the volume usage now (should be 2 bytes less)
+test_get "$vol volume usage", authed_only(200, 'application/json'), "$vol?filter=a/$randname", undef, sub { my $json_raw = shift; my $json = get_json($json_raw) or return 0; return 0 unless is_int($json->{'volumeUsedSize'}) && is_int($json->{'volumeSize'}) && $json->{'volumeSize'} == $volumesize && is_int($json->{'replicaCount'}) && $json->{'replicaCount'} == 1 && is_hash($json->{'fileList'}) && scalar keys %{$json->{'fileList'}} == 1; $curvolsize == $json->{'volumeUsedSize'} + 2; };
+
+
 
 
 ### Check volume modification request ###
 test_delete_job "Wiping tiny$vol contents", {'badauth'=>[401],$reader=>[403],$writer=>[200]}, "tiny$vol/toobig";
+# Check if volume usage is computed correctly
+test_get "$writer quota usage", {$writer=>[200,'application/json']}, ".self", undef, sub { my $json_raw = shift; my $json = get_json($json_raw) or return 0; return is_hash($json->{$writer}) && is_int($json->{$writer}->{'userQuota'}) && $json->{$writer}->{'userQuota'} == 0 && is_int($json->{$writer}->{'userQuotaUsed'}) && $json->{$writer}->{'userQuotaUsed'} == length('empty'); };
 test_upload 'file upload (add first revision)', $writer, random_data($tinyvolumesize/2-length('toobig')), "tiny$vol", 'toobig';
 test_upload 'file upload (overwrite existing revision)', $writer, random_data($tinyvolumesize/2-length('toobig')), "tiny$vol", 'toobig';
 test_get 'file revisions (should be 1)', authed_only(200, 'application/json'), "tiny$vol/toobig?fileRevisions", undef, sub { my $json = get_json(shift); return 0 unless is_hash($json->{'fileRevisions'}) && scalar keys %{$json->{'fileRevisions'}} == 1; };
-test_put_job "Increasing max revisions for tiny$vol", admin_only(200), "tiny$vol?o=mod", "{\"maxRevisions\":2}";
+# Check if volume usage is computed correctly
+test_get "$writer quota usage", {$writer=>[200,'application/json']}, ".self", undef, sub { my $json_raw = shift; my $json = get_json($json_raw) or return 0; return is_hash($json->{$writer}) && is_int($json->{$writer}->{'userQuota'}) && $json->{$writer}->{'userQuota'} == 0 && is_int($json->{$writer}->{'userQuotaUsed'}) && $json->{$writer}->{'userQuotaUsed'} == length('empty') + $tinyvolumesize/2; };
+test_put_job "Increasing max revisions for tiny$vol", {$writer=>[200]}, "tiny$vol?o=mod", "{\"maxRevisions\":2}";
 test_get "tiny$vol max revisions limit modification", {'badauth'=>[401],$reader=>[200,'application/json'],$writer=>[200,'application/json'],'admin'=>[200,'application/json']}, "?volumeList", undef, sub { my $json = get_json(shift); return 0 unless is_hash($json->{'volumeList'}) && is_hash($json->{'volumeList'}->{"tiny$vol"}) && is_int($json->{'volumeList'}->{"tiny$vol"}->{'maxRevisions'}) && $json->{'volumeList'}->{"tiny$vol"}->{'maxRevisions'} == 2; };
-test_put_job "Increasing max revisions for tiny$vol (too high)", admin_only(400), "tiny$vol?o=mod", "{\"maxRevisions\":100}"; # Revisions limit is too high
-test_put_job "Increasing max revisions for $vol", admin_only(400), "$vol?o=mod", "{\"maxRevisions\":5"; # Will exceed cluster capacity
+test_put_job "Increasing max revisions for tiny$vol (too high)", {$writer=>[400]}, "tiny$vol?o=mod", "{\"maxRevisions\":100}"; # Revisions limit is too high
+test_put_job "Increasing max revisions for $vol", {'admin'=>[400]}, "$vol?o=mod", "{\"maxRevisions\":5}"; # Will exceed cluster capacity
 test_upload 'file upload (add new revision)', $writer, random_data($tinyvolumesize/2-length('toobig')), "tiny$vol", 'toobig';
 test_get 'file revisions (should be 2)', authed_only(200, 'application/json'), "tiny$vol/toobig?fileRevisions", undef, sub { my $json = get_json(shift); return 0 unless is_hash($json->{'fileRevisions'}) && scalar keys %{$json->{'fileRevisions'}} == 2; };
-test_put_job "Decreasing max revisions for tiny$vol", admin_only(200), "tiny$vol?o=mod", "{\"maxRevisions\":1}"; # New revisions limit is lower than current one
+# Check if volume usage is computed correctly
+test_get "$writer quota usage", {$writer=>[200,'application/json']}, ".self", undef, sub { my $json_raw = shift; my $json = get_json($json_raw) or return 0; return is_hash($json->{$writer}) && is_int($json->{$writer}->{'userQuota'}) && $json->{$writer}->{'userQuota'} == 0 && is_int($json->{$writer}->{'userQuotaUsed'}) && $json->{$writer}->{'userQuotaUsed'} == length('empty') + $tinyvolumesize; };
+test_put_job "Decreasing max revisions for tiny$vol", {$writer=>[200]}, "tiny$vol?o=mod", "{\"maxRevisions\":1}"; # New revisions limit is lower than current one
 test_upload 'file upload (overwrite existing revision)', $writer, random_data($tinyvolumesize/2-length('toobig')), "tiny$vol", 'toobig'; # This will allow server to finish delete jobs
 test_get 'file revisions (should be 1)', authed_only(200, 'application/json'), "tiny$vol/toobig?fileRevisions", undef, sub { my $json = get_json(shift); return 0 unless is_hash($json->{'fileRevisions'}) && scalar keys %{$json->{'fileRevisions'}} == 1; };
+test_get "tiny$vol volume meta (empty)", {'admin'=>[200,'application/json'],'badauth'=>[401],$reader=>[200,'application/json'],$writer=>[200,'application/json']}, "?volumeList&customVolumeMeta", undef, sub { my $json = get_json(shift) or return 0; return is_hash($json->{"volumeList"}) && is_hash($json->{"volumeList"}->{"tiny$vol"}) && is_hash($json->{"volumeList"}->{"tiny$vol"}->{'customVolumeMeta'}) && keys %{$json->{"tiny$vol"}->{'customVolumeMeta'}} == 0 };
+test_put_job "custom tiny$vol volume meta setting", {'admin'=>[200,'application/json']}, "tiny$vol?o=mod", "{\"customVolumeMeta\":{\"customMetaKey1\":\"aabbcc\",\"customMetaKey2\":\"123456abcd\"}}";
+test_get "tiny$vol volume meta (two custom values)", {'admin'=>[200,'application/json'],'badauth'=>[401],$reader=>[200,'application/json'],$writer=>[200,'application/json']}, "?volumeList&customVolumeMeta", undef, sub { my $json = get_json(shift) or return 0; return is_hash($json->{"volumeList"}) && is_hash($json->{"volumeList"}->{"tiny$vol"}) && is_hash($json->{"volumeList"}->{"tiny$vol"}->{'customVolumeMeta'}) && keys %{$json->{"volumeList"}->{"tiny$vol"}->{'customVolumeMeta'}} == 2 && ($json->{"volumeList"}->{"tiny$vol"}->{'customVolumeMeta'}->{'customMetaKey1'} eq 'aabbcc') && ($json->{"volumeList"}->{"tiny$vol"}->{'customVolumeMeta'}->{'customMetaKey2'} eq '123456abcd'); };
+test_upload 'file upload (overwrite existing revision)', $writer, random_data($tinyvolumesize-length('toobig')), "tiny$vol", 'toobig'; # Should fit exactly into volume capacity
+# Check if volume usage is computed correctly
+test_get "$writer quota usage", {$writer=>[200,'application/json']}, ".self", undef, sub { my $json_raw = shift; my $json = get_json($json_raw) or return 0; return is_hash($json->{$writer}) && is_int($json->{$writer}->{'userQuota'}) && $json->{$writer}->{'userQuota'} == 0 && is_int($json->{$writer}->{'userQuotaUsed'}) && $json->{$writer}->{'userQuotaUsed'} == length('empty') + $tinyvolumesize; };
+# Try setting custom meta values on a volume with existing, non-custom meta
+test_put_job "custom meta.$vol volume meta setting", {'admin'=>[200,'application/json']}, "meta.$vol?o=mod", "{\"customVolumeMeta\":{\"customMetaKey1\":\"aabbccdefa\"}}";
+# Setting custom volume meta should not influence existing values
+test_get "meta.$vol volume meta (non-empty, one custom value)", {'badauth'=>[401],$reader=>[200,'application/json'],$writer=>[200,'application/json'],'admin'=>[200,'application/json']}, "?volumeList&volumeMeta&customVolumeMeta", undef, sub { my $json = get_json(shift) or return 0; if(!(is_hash($json->{'volumeList'}) && is_hash($json->{'volumeList'}->{"meta.$vol"}))) { return 0; } my $meta = $json->{'volumeList'}->{"meta.$vol"}->{'volumeMeta'}; my $cmeta = $json->{'volumeList'}->{"meta.$vol"}->{'customVolumeMeta'}; return is_hash($meta) && (scalar keys %{$meta} == 3) && (scalar keys %{$cmeta} == 1) && $meta->{'one'} eq '01' && $meta->{'two'} eq '2222' && $meta->{'three'} eq '333333' && ($cmeta->{'customMetaKey1'} eq 'aabbccdefa'); };
+# Take out previously assigned custom meta value
+test_put_job "custom meta.$vol volume meta setting", {'admin'=>[200,'application/json']}, "meta.$vol?o=mod", "{\"customVolumeMeta\":{}}";
+# Check if old meta values were preserved correctly
+test_get "meta.$vol volume meta (non-empty)", {'badauth'=>[401],$reader=>[200,'application/json'],$writer=>[200,'application/json'],'admin'=>[200,'application/json']}, "?volumeList&volumeMeta", undef, sub { my $json = get_json(shift) or return 0; if(!(is_hash($json->{'volumeList'}) && is_hash($json->{'volumeList'}->{"meta.$vol"}))) { return 0; } my $meta = $json->{'volumeList'}->{"meta.$vol"}->{'volumeMeta'}; my $cmeta = $json->{'volumeList'}->{"meta.$vol"}->{'customVolumeMeta'}; return is_hash($meta) && (scalar keys %{$meta} == 3) && (scalar keys %{$cmeta} == 0) && $meta->{'one'} eq '01' && $meta->{'two'} eq '2222' && $meta->{'three'} eq '333333'; };
+# Setting custom meta together with other values like volume size or owner should only be allowed for an admin user
+test_put_job "custom tiny$vol volume meta and size setting", {'badauth'=>[401],$reader=>[403],$writer=>[403]}, "tiny$vol?o=mod", "{\"customVolumeMeta\":{\"customMetaKey1\":\"aabbcc\",\"customMetaKey2\":\"123456abcd\"},\"size\":$tinyvolumesize}";
+test_put_job "custom tiny$vol volume meta and revisions limit setting", {'badauth'=>[401],$reader=>[403]}, "tiny$vol?o=mod", "{\"customVolumeMeta\":{\"customMetaKey1\":\"aabbcc\",\"customMetaKey2\":\"123456abcd\"},\"maxRevisions\":2}";
+test_put_job "custom tiny$vol volume meta and owner setting", {'badauth'=>[401],$reader=>[403],$writer=>[403]}, "tiny$vol?o=mod", "{\"customVolumeMeta\":{\"customMetaKey1\":\"aabbcc\",\"customMetaKey2\":\"123456abcd\"},\"owner\":\"$reader\"}";
+# Creating volume with meta key that uses the reserved prefix should fail
+test_mkvol "volume creation (tiny volume with invalid meta)", admin_only(400), "badtiny$vol", '{"volumeSize":$tinyvolumesize,"owner":"admin","volumeMeta":{"$custom$":"00"}}';
+test_put_job "owner quota change for $writer", admin_only(200), ".users/$writer", "{\"quota\":0}";
+
+my $oldsize = $tinyvolumesize;
 $tinyvolumesize = $tinyvolumesize + 2;
 test_put_job "Increasing tiny$vol volume size", admin_only(200), "tiny$vol?o=mod", "{\"size\":$tinyvolumesize}"; # Without this change call below should return 413
-test_upload 'bigger file upload (overwrite existing revision)', $writer, random_data($tinyvolumesize/2-length('toobig')+1), "tiny$vol", 'toobig';
+test_upload 'bigger file upload (overwrite existing revision)', $writer, random_data($oldsize-length('toobig')+1), "tiny$vol", 'toobig';
 test_put_job "tiny$vol ownership change (invalid owner)", admin_only(404), "tiny$vol?o=mod", "{\"owner\":\"somebadusername\"}";
 test_put_job "tiny$vol ownership change ($reader)", admin_only(200), "tiny$vol?o=mod", "{\"owner\":\"$reader\"}";
-test_get 'volume ownership', {$reader=>[200,'application/json']}, "tiny$vol?o=acl", undef, sub { my $json = get_json(shift); my %is_priv = map { $_, 1 } @{$json->{$reader}}; return is_array($json->{$reader}) && $is_priv{'owner'}; };
+test_get 'volume ownership', {$reader=>[200,'application/json']}, "tiny$vol?o=acl&manager", undef, sub { my $json = get_json(shift); my %is_priv = map { $_, 1 } @{$json->{$reader}}; return is_array($json->{$reader}) && $is_priv{'owner'}; };
 test_put_job "tiny$vol ownership change (admin)", admin_only(200), "tiny$vol?o=mod", "{\"owner\":\"admin\"}";
-test_get 'volume ownership', {'admin'=>[200,'application/json']}, "tiny$vol?o=acl", undef, sub { my $json = get_json(shift); my %is_priv = map { $_, 1 } @{$json->{'admin'}}; return is_array($json->{'admin'}) && $is_priv{'owner'}; };
+test_get 'volume ownership', {'admin'=>[200,'application/json']}, "tiny$vol?o=acl&manager", undef, sub { my $json = get_json(shift); my %is_priv = map { $_, 1 } @{$json->{'admin'}}; return is_array($json->{'admin'}) && $is_priv{'owner'}; };
 
 
 
@@ -1073,8 +1285,8 @@ my $wc = $wu.'.clone';
 my $rc = $ru.'.clone';
 my $wk = random_data(20);
 my $rk = random_data(20);
-my $rcid = ""; # ID of reader user clone that needs to be saved inside authorisation token 
-my $wcid = ""; # ID of writer user clone that needs to be saved inside authorisation token 
+my $rcid = ""; # ID of reader user clone that needs to be saved inside authorization token 
+my $wcid = ""; # ID of writer user clone that needs to be saved inside authorization token 
 my $content;
 
 test_create_user $ru;
@@ -1092,9 +1304,9 @@ fail 'Invalid user ID' unless $rcid ne "" && $wcid ne "";
 $TOK{$wc} = encode_base64(hex_to_bin($wcid) . $wk . chr(0) . chr(0));
 $TOK{$rc} = encode_base64(hex_to_bin($rcid) . $rk . chr(0) . chr(0));
 
-test_put_job "volume creation (clones' volume)", admin_only(200), "clones$vol", "{\"volumeSize\":$tinyvolumesize,\"owner\":\"$wu\"}";
+test_mkvol "volume creation (clones' volume)", admin_only(200), "clones$vol", "{\"volumeSize\":$tinyvolumesize,\"owner\":\"$wu\"}";
 test_put_job 'granting rights on newly created volume', {$wc=>[200],'badauth'=>[401],$rc=>[403],$wu=>[200],$ru=>[403],'admin'=>[200]}, "clones$vol?o=acl", "{\"grant-read\":[\"$ru\",\"$wu\"],\"grant-write\":[\"$wu\"] }";
-test_get 'the newly created volume ownership', {'badauth'=>[401],$wu=>[200,'application/json'],'admin'=>[200,'application/json'],$wc=>[200,'application/json']}, "clones$vol?o=acl", undef, sub { my $json = get_json(shift) or return 0; return is_array($json->{$wu}) && @{$json->{$wu}} == 3 && is_array($json->{$ru}) && @{$json->{$ru}} == 1 && is_array($json->{$wc}) && @{$json->{$wc}} == 3 };
+test_get 'the newly created volume ownership', {'badauth'=>[401],$wu=>[200,'application/json'],'admin'=>[200,'application/json'],$wc=>[200,'application/json']}, "clones$vol?o=acl&manager", undef, sub { my $json = get_json(shift) or return 0; return is_array($json->{$wu}) && @{$json->{$wu}} == 4 && is_array($json->{$ru}) && @{$json->{$ru}} == 1 && is_array($json->{$wc}) && @{$json->{$wc}} == 4 };
 
 test_upload 'file upload (empty file)', $wc, '', "clones$vol", 'empty.clone';
 test_get 'listing as cloned users too', {'badauth'=>[401],$ru=>[200,'application/json'],$wu=>[200,'application/json'],'admin'=>[200,'application/json'],$rc=>[200,'application/json'],$wc=>[200,'application/json']},
@@ -1105,9 +1317,9 @@ test_upload 'file upload (empty file) again', $wu, '', "clones$vol", 'empty.clon
 test_get 'listing as cloned users too', {'badauth'=>[401],$ru=>[200,'application/json'],$wu=>[200,'application/json'],'admin'=>[200,'application/json'],$rc=>[200,'application/json'],$wc=>[401]},
     "clones$vol?filter=empty.clone", undef, sub { my $json = get_json(shift) or return 0; return is_hash($json->{'fileList'}) && scalar keys %{$json->{'fileList'}} == 1 && is_hash($json->{'fileList'}->{'/empty.clone'}) };
 
-test_get 'if volume is still owned by $wu', {$wu=>[200, 'application/json'],'admin'=>[200, 'application/json']}, "clones$vol?o=acl", undef, sub { my $json = get_json(shift) or return 0; return is_array($json->{$wu}) && @{$json->{$wu}} == 3; };
+test_get 'if volume is still owned by $wu', {$wu=>[200, 'application/json'],'admin'=>[200, 'application/json']}, "clones$vol?o=acl&manager", undef, sub { my $json = get_json(shift) or return 0; return is_array($json->{$wu}) && @{$json->{$wu}} == 4; };
 test_delete_job "$wu deletion", {'admin'=>[200, 'application/json']}, ".users/$wu";
-test_get 'if volume is no longer owned by $wu', {'admin'=>[200, 'application/json']}, "clones$vol?o=acl", undef, sub { my $json = get_json(shift) or return 0; return !is_array($json->{$wu}) && is_array($json->{'admin'}) && @{$json->{'admin'}} == 3; };
+test_get 'if volume is no longer owned by $wu', {'admin'=>[200, 'application/json']}, "clones$vol?o=acl&manager", undef, sub { my $json = get_json(shift) or return 0; return !is_array($json->{$wu}) && is_array($json->{'admin'}) && @{$json->{'admin'}} == 4; };
 test_get 'listing as cloned users too', {'badauth'=>[401],$ru=>[200,'application/json'],$wu=>[401],'admin'=>[200,'application/json'],$rc=>[200,'application/json'],$wc=>[401]},
         "clones$vol?filter=empty.clone", undef, sub { my $json = get_json(shift) or return 0; return is_hash($json->{'fileList'}) && scalar keys %{$json->{'fileList'}} == 1 && is_hash($json->{'fileList'}->{'/empty.clone'}) };
 
@@ -1122,7 +1334,7 @@ test_get "listing clones of $ru", admin_only(404), ".users?clones=$ru";
 
 # Check if .status query returns node status
 test_get "node status", admin_only(200, 'application/json'), ".status", undef, sub { my $json = get_json(shift); return 0 unless is_string($json->{'osType'}) && is_string($json->{'osArch'}) && is_string($json->{'osRelease'})
-    && is_string($json->{'osVersion'}) && is_string($json->{'osEndianness'}) && is_string($json->{'libsxVersion'}) && is_string($json->{'hashFSVersion'}) && is_string($json->{'localTime'}) && is_string($json->{'utcTime'})
+    && is_string($json->{'osVersion'}) && is_string($json->{'osEndianness'}) && is_string($json->{'libsxclientVersion'}) && is_string($json->{'hashFSVersion'}) && is_string($json->{'localTime'}) && is_string($json->{'utcTime'})
     && is_string($json->{'address'}) && is_string($json->{'internalAddress'}) && is_string($json->{'UUID'}) && is_string($json->{'nodeDir'}) && is_int($json->{'storageAllocated'}) && is_int($json->{'storageUsed'}) && is_int($json->{'fsBlockSize'})
     && is_int($json->{'fsTotalBlocks'}) && is_int($json->{'fsAvailBlocks'}) && is_int($json->{'memTotal'}); };
 
@@ -1139,7 +1351,24 @@ test_upload 'file upload to read-only cluster', $writer, '', "large$vol", 'empty
 test_get 'listing all files (GET should work)', authed_only(200), $vol;
 test_put_job "switching cluster back to read-write mode", , {'admin'=>[200]}, ".mode", "{\"mode\":\"rw\"}";
 # PUT should work again
-test_upload 'file upload to read-only cluster', $writer, '', "large$vol", 'empty';
+test_upload 'file upload to read-write cluster', $writer, '', "large$vol", 'empty';
+
+
+# Check cluster meta operations
+test_get "cluster meta (empty)", {'badauth'=>[401],$reader=>[200,'application/json'],$writer=>[200,'application/json'],'admin'=>[200,'application/json']}, "?clusterMeta", undef, sub { my $json = get_json(shift) or return 0; return 0 unless is_hash($json->{'clusterMeta'}); %cleanupm = %{$json->{'clusterMeta'}}; return is_hash(\%cleanupm); };
+if(%cleanupm && is_hash(\%cleanupm)) {
+    test_put_job "cluster meta change (two meta entries)", admin_only(200), ".clusterMeta", "{\"clusterMeta\":{\"key1\":\"aabbcc\",\"key2\":\"0123456789\"}}";
+    test_get "cluster meta (two entries)", {'badauth'=>[401],$reader=>[200,'application/json'],$writer=>[200,'application/json'],'admin'=>[200,'application/json']}, "?clusterMeta", undef, sub { my $json = get_json(shift) or return 0; return is_hash($json->{'clusterMeta'}) && (scalar keys %{$json->{'clusterMeta'}} == 2) && $json->{'clusterMeta'}->{'key1'} eq 'aabbcc' && $json->{'clusterMeta'}->{'key2'} eq '0123456789' };
+    test_put_job "cluster meta change (one meta entry)", admin_only(200), ".clusterMeta", "{\"clusterMeta\":{\"key3\":\"1010\"}}";
+    test_get "cluster meta (one entry)", {'badauth'=>[401],$reader=>[200,'application/json'],$writer=>[200,'application/json'],'admin'=>[200,'application/json']}, "?clusterMeta", undef, sub { my $json = get_json(shift) or return 0; return is_hash($json->{'clusterMeta'}) && (scalar keys %{$json->{'clusterMeta'}} == 1) && $json->{'clusterMeta'}->{'key3'} eq '1010' };
+    test_put_job "cluster meta change (max meta entries)", admin_only(200), ".clusterMeta", "{\"clusterMeta\":{$metaitems}}";
+    test_get "cluster meta (max entries)", {'badauth'=>[401],$reader=>[200,'application/json'],$writer=>[200,'application/json'],'admin'=>[200,'application/json']}, "?clusterMeta", undef, sub { my $json = get_json(shift) or return 0; return is_hash($json->{'clusterMeta'}) && (scalar keys %{$json->{'clusterMeta'}} == 128) };
+    test_put_job "cluster meta change (too many meta entries)", admin_only(400), ".clusterMeta", "{\"clusterMeta\":{$metaitems},\"toomany\":\"acab\"}";
+} else {
+    printf "Skipped cluster meta tests\n";
+}
+
+cleanup;
 
 print "\nTests performed: ".($okies+$fails)." - $fails failed, $okies succeeded\n";
 exit ($fails > 0);

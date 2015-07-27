@@ -41,11 +41,11 @@
 #include <unistd.h>
 #include <errno.h>
 
-#include "../libsx/src/clustcfg.h"
-#include "../libsx/src/jobpoll.h"
-#include "../libsx/src/vcrypto.h"
-#include "../libsx/src/misc.h"
-#include "../libsx/src/hostlist.h"
+#include "../libsxclient/src/clustcfg.h"
+#include "../libsxclient/src/jobpoll.h"
+#include "../libsxclient/src/vcrypto.h"
+#include "../libsxclient/src/misc.h"
+#include "../libsxclient/src/hostlist.h"
 
 #include "cmd_main.h"
 #include "cmd_node.h"
@@ -891,11 +891,11 @@ static int replace_nodes(sxc_client_t *sx, struct cluster_args_info *args) {
 		continue;
 	    cn = sx_nodelist_get(curnodes, j);
 	    if(!strcmp(sx_node_addr(cn), addr) || !strcmp(sx_node_internal_addr(cn), addr)) {
-		CRIT("IP address '%s' is already owned by node %s", addr, sx_node_uuid_str(cn));
+		CRIT("IP address '%s' is already assigned to node %s", addr, sx_node_uuid_str(cn));
 		break;
 	    }
 	    if(!strcmp(sx_node_addr(cn), int_addr) || !strcmp(sx_node_internal_addr(cn), int_addr)) {
-		CRIT("IP address '%s' is already owned by node %s", int_addr, sx_node_uuid_str(cn));
+		CRIT("IP address '%s' is already assigned to node %s", int_addr, sx_node_uuid_str(cn));
 		break;
 	    }
 	}
@@ -905,11 +905,11 @@ static int replace_nodes(sxc_client_t *sx, struct cluster_args_info *args) {
 	for(j = 0; j < sx_nodelist_count(rplnodes); j++) {
 	    cn = sx_nodelist_get(rplnodes, j);
 	    if(!strcmp(sx_node_addr(cn), addr) || !strcmp(sx_node_internal_addr(cn), addr)) {
-		CRIT("Same IP address '%s' specified for multiple nodes", addr);
+		CRIT("Same IP address '%s' specified for multiple replacement nodes", addr);
 		break;
 	    }
 	    if(!strcmp(sx_node_addr(cn), int_addr) || !strcmp(sx_node_internal_addr(cn), int_addr)) {
-		CRIT("Same IP address '%s' specified for multiple nodes", int_addr);
+		CRIT("Same IP address '%s' specified for multiple replacement nodes", int_addr);
 		break;
 	    }
 	}
@@ -976,6 +976,40 @@ static int replace_nodes(sxc_client_t *sx, struct cluster_args_info *args) {
     if(sxc_cluster_fetchnodes(clust) ||
        sxc_cluster_save(clust, args->config_dir_arg))
 	WARN("Cannot update local cluster configuration: %s", sxc_geterrmsg(sx));
+
+    for(i = 0; i < sx_nodelist_count(rplnodes); i++) {
+	const sx_node_t *rn = sx_nodelist_get(rplnodes, i);
+	const sx_node_t *cn = sx_nodelist_lookup(curnodes, sx_node_uuid(rn));
+	const char *addr;
+	sxi_hostlist_t deadnode;
+
+	if(!cn)
+	    continue;
+	sxi_hostlist_init(&deadnode);
+
+	addr = sx_node_addr(cn);
+	if(strcmp(sx_node_addr(rn), addr) &&
+	   sxi_hostlist_add_host(sx, &deadnode, addr))  {
+	    WARN("Cannot check replaced nodes status");
+	    break;
+	}
+
+	addr = sx_node_internal_addr(cn);
+	if(strcmp(sx_node_internal_addr(rn), addr) &&
+	   sxi_hostlist_add_host(sx, &deadnode, addr))  {
+	    sxi_hostlist_empty(&deadnode);
+	    WARN("Cannot check replaced nodes status");
+	    break;
+	}
+
+	if(sxi_hostlist_get_count(&deadnode) > 0) {
+	    clst_destroy(clst);
+	    clst = clst_query(conns, &deadnode);
+	    if(clst)
+		WARN("The replaced node %s appears to be still running on the old address. Please make sure it is properly shut down!", sx_node_uuid_str(rn));
+	}
+	sxi_hostlist_empty(&deadnode);
+    }
 
     ret = 0;
 
@@ -1097,6 +1131,22 @@ static int setfaulty_nodes(sxc_client_t *sx, struct cluster_args_info *args) {
 	WARN("Cannot update local cluster configuration: %s", sxc_geterrmsg(sx));
 
     ret = 0;
+
+    for(i = 0; i < nnodes; i++) {
+	sxi_hostlist_t deadnode;
+	sxi_hostlist_init(&deadnode);
+	if(sxi_hostlist_add_host(sx, &deadnode, sx_node_addr(nodes[i])) ||
+	   sxi_hostlist_add_host(sx, &deadnode, sx_node_internal_addr(nodes[i]))) {
+	    sxi_hostlist_empty(&deadnode);
+	    WARN("Cannot check faulty nodes status");
+	    break;
+	}
+	clst_destroy(clst);
+	clst = clst_query(conns, &deadnode);
+	sxi_hostlist_empty(&deadnode);
+	if(clst)
+	    WARN("Faulty node %s appears to be still running. Please make sure it is properly shut down!", sx_node_uuid_str(nodes[i]));
+    }
 
  setfaulty_err:
     for(i = 0; i < nnodes; i++)
@@ -1405,7 +1455,7 @@ static int resize_cluster(sxc_client_t *sx, struct cluster_args_info *args) {
     if(!clust)
 	return 1;
 
-    if(strlen(s) < 3 || (*s != '+' && *s != '-') || (newsize = sxi_parse_size(&s[1])) <= 0) {
+    if(strlen(s) < 3 || (*s != '+' && *s != '-') || (newsize = sxi_parse_size(sx, &s[1], 0)) <= 0) {
 	CRIT("Invalid resize argument: must be in format <+/->SIZE[MODIFIER], eg. +1T");
 	goto resize_cluster_err;
     }
@@ -1557,7 +1607,7 @@ static void print_status(sxc_client_t *sx, int http_code, const sxi_node_status_
 
     printf("Node %s status:\n", status->uuid);
     printf("    Versions:\n");
-    printf("        SX: %s\n", status->libsx_version);
+    printf("        SX: %s\n", status->libsxclient_version);
     printf("        HashFS: %s\n", status->hashfs_version);
     printf("    System:\n");
     printf("        Name: %s\n", status->os_name);
@@ -1617,7 +1667,7 @@ static int cluster_status(sxc_client_t *sx, struct cluster_args_info *args) {
 enum mismatch {
     NONE=0,
     MISMATCH_STORAGE_VERSION,
-    MISMATCH_LIBSX_VERSION,
+    MISMATCH_LIBSXCLIENT_VERSION,
     MISMATCH_OLD_VERSION,
     MISMATCH_NOREPLY,
     MISMATCH_OFFLINE,
@@ -1643,14 +1693,14 @@ static void check_status(sxc_client_t *sx, int http_code, const sxi_node_status_
         fprintf(stderr, "ERROR: %s\n", sxc_geterrmsg(sx));
         return;
     }
-    printf("\t%s: %s (%s)\n", status->addr, status->hashfs_version, status->libsx_version);
+    printf("\t%s: %s (%s)\n", status->addr, status->hashfs_version, status->libsxclient_version);
     if (!has_last_status) {
         memcpy(&last_status, status, sizeof(last_status));
         has_last_status = 1;
     } else if (strcmp(last_status.hashfs_version, status->hashfs_version))
         check_upgrade_mismatch |= 1 << MISMATCH_STORAGE_VERSION;
-    else if (strcmp(last_status.libsx_version, status->libsx_version))
-        check_upgrade_mismatch |= 1 << MISMATCH_LIBSX_VERSION;
+    else if (strcmp(last_status.libsxclient_version, status->libsxclient_version))
+        check_upgrade_mismatch |= 1 << MISMATCH_LIBSXCLIENT_VERSION;
     if (!strcmp(status->heal_status, "DONE"))
         upgrade_complete++;
 }
@@ -1678,8 +1728,8 @@ static int cluster_upgrade(sxc_client_t *sx, struct cluster_args_info *args) {
             fprintf(stderr,"\tSome nodes are still running version 1.0\n");
         if (check_upgrade_mismatch & (1 << MISMATCH_STORAGE_VERSION))
             fprintf(stderr,"\tSome nodes are still running an old server version\n");
-        if (check_upgrade_mismatch & (1 << MISMATCH_LIBSX_VERSION))
-            fprintf(stderr,"\tlibsx versions don't match\n");
+        if (check_upgrade_mismatch & (1 << MISMATCH_LIBSXCLIENT_VERSION))
+            fprintf(stderr,"\tlibsxclient versions don't match\n");
         ret = 1;
     } else {
         if (upgrade_complete == upgrade_nodes) {
@@ -1790,7 +1840,7 @@ static int upgrade_node(sxc_client_t *sx, const char *path)
     sx_nodelist_t *local = sx_nodelist_new();
     if (local &&
         !sx_nodelist_add(local, sx_node_dup(sx_hashfs_self(h)))) {
-        rc = sx_hashfs_job_new(h, 0, &job_id, JOBTYPE_UPGRADE_1_0_TO_1_1, JOB_NO_EXPIRY, "UPGRADE", &job_id, sizeof(job_id), local);
+        rc = sx_hashfs_job_new(h, 0, &job_id, JOBTYPE_UPGRADE_FROM_1_0_OR_1_1, JOB_NO_EXPIRY, "UPGRADE", &job_id, sizeof(job_id), local);
         if (rc) {
             if (rc == FAIL_LOCKED)
                 job_id = 0;
@@ -1816,17 +1866,183 @@ static int upgrade_job_node(sxc_client_t *sx, const char *path)
         return 1;
     rc_ty s;
     do {
-        if ((s = sx_hashfs_upgrade_1_0_prepare(hashfs))) {
+        if ((s = sx_hashfs_upgrade_1_0_or_1_1_prepare(hashfs))) {
             WARN("Failed to prepare upgrade job: %s", rc2str(s));
             break;
         }
-        if ((s = sx_hashfs_upgrade_1_0_local(hashfs))) {
+        if ((s = sx_hashfs_upgrade_1_0_or_1_1_local(hashfs))) {
             WARN("Failed to run upgrade job: %s", rc2str(s));
             break;
         }
     } while(0);
     sx_hashfs_close(hashfs);
     return s == OK ? 0 : 1;
+}
+
+static int get_cluster_meta(sxc_client_t *sx, struct cluster_args_info *args) {
+    sxc_cluster_t *cluster;
+    sxc_meta_t *meta;
+    unsigned int i, count;
+
+    cluster = cluster_load(sx, args, 1);
+    if(!cluster || !args->get_meta_arg)
+        return 1;
+
+    meta = sxc_clustermeta_new(cluster);
+    if(!meta) {
+        fprintf(stderr, "ERROR: %s\n", sxc_geterrmsg(sx));
+        sxc_cluster_free(cluster);
+        return 1;
+    }
+
+    count = sxc_meta_count(meta);
+    if(!strcmp(args->get_meta_arg, "ALL")) {
+        for(i = 0; i < count; i++) {
+            const char *metakey = NULL;
+            const void *metaval = NULL;
+            char metaval_str[SXLIMIT_META_MAX_VALUE_LEN+1];
+            unsigned int l;
+
+            if(sxc_meta_getkeyval(meta, i, &metakey, &metaval, &l) || !metakey || !metaval || l > SXLIMIT_META_MAX_VALUE_LEN) {
+                fprintf(stderr, "ERROR: Failed to get cluster meta\n");
+                sxc_cluster_free(cluster);
+                sxc_meta_free(meta);
+                return 1;
+            }
+
+            memcpy(metaval_str, metaval, l);
+            metaval_str[l] = '\0';
+            printf("%s=%s\n", metakey, metaval_str);
+        }
+    } else {
+        const void *metaval = NULL;
+        char metaval_str[SXLIMIT_META_MAX_VALUE_LEN+1];
+        unsigned int l;
+
+        if(sxc_meta_getval(meta, args->get_meta_arg, &metaval, &l) || !metaval || l > SXLIMIT_META_MAX_VALUE_LEN) {
+            fprintf(stderr, "ERROR: Cluster meta key '%s' does not exist\n", args->get_meta_arg);
+            sxc_cluster_free(cluster);
+            sxc_meta_free(meta);
+            return 1;
+        }
+
+        memcpy(metaval_str, metaval, l);
+        metaval_str[l] = '\0';
+        printf("%s=%s\n", args->get_meta_arg, metaval_str);
+    }
+
+    sxc_meta_free(meta);
+    sxc_cluster_free(cluster);
+    return 0;
+}
+
+static int set_cluster_meta(sxc_client_t *sx, struct cluster_args_info *args) {
+    sxc_cluster_t *cluster;
+    int ret;
+    sxc_meta_t *meta;
+    unsigned int i;
+
+    if(!args || !args->set_meta_given) {
+        fprintf(stderr, "ERROR: Invalid argument\n");
+        return 1;
+    }
+
+    cluster = cluster_load(sx, args, 1);
+    if(!cluster)
+        return 1;
+
+    meta = sxc_clustermeta_new(cluster);
+    if(!meta) {
+        sxc_cluster_free(cluster);
+        fprintf(stderr, "ERROR: %s\n", sxc_geterrmsg(sx));
+        return 1;
+    }
+
+    for(i = 0; i < args->set_meta_given; i++) {
+        char metakey[SXLIMIT_META_MAX_KEY_LEN+1];
+        size_t off;
+        const char *val, *str = args->set_meta_arg[i];
+        unsigned int value_len;
+
+        /* Look for '='' char to separate key and value */
+        val = strchr(str, '=');
+        if(!val) {
+            fprintf(stderr, "ERROR: Meta entries must be in 'key=value' format\n");
+            sxc_cluster_free(cluster);
+            sxc_meta_free(meta);
+            return 1;
+        }
+
+        off = val - str;
+        if(off > SXLIMIT_META_MAX_KEY_LEN) {
+            fprintf(stderr, "ERROR: Meta key too long\n");
+            sxc_cluster_free(cluster);
+            sxc_meta_free(meta);
+            return 1;
+        }
+
+        memcpy(metakey, str, off);
+        metakey[off] = '\0';
+        val++;
+        value_len = strlen(val);
+
+        if(value_len > SXLIMIT_META_MAX_VALUE_LEN) {
+            fprintf(stderr, "ERROR: Meta value too long\n");
+            sxc_cluster_free(cluster);
+            sxc_meta_free(meta);
+            return 1;
+        }
+
+        if(sxc_meta_setval(meta, metakey, val, value_len)) {
+            fprintf(stderr, "ERROR: %s\n", sxc_geterrmsg(sx));
+            sxc_cluster_free(cluster);
+            sxc_meta_free(meta);
+            return 1;
+        }
+    }
+
+    ret = sxi_cluster_set_meta(cluster, meta);
+    sxc_cluster_free(cluster);
+    sxc_meta_free(meta);
+    if(ret)
+        fprintf(stderr, "ERROR: %s\n", sxc_geterrmsg(sx));
+    else
+        printf("Successfully updated cluster metadata\n");
+    return ret;
+}
+
+static int del_cluster_meta(sxc_client_t *sx, struct cluster_args_info *args) {
+    sxc_cluster_t *cluster;
+    sxc_meta_t *meta;
+    int ret;
+
+    cluster = cluster_load(sx, args, 1);
+    if(!cluster)
+        return 1;
+
+    meta = sxc_clustermeta_new(cluster);
+    if(!meta) {
+        fprintf(stderr, "ERROR: %s\n", sxc_geterrmsg(sx));
+        sxc_cluster_free(cluster);
+        return 1;
+    }
+
+    if(sxc_meta_getval(meta, args->delete_meta_arg, NULL, NULL)) {
+        fprintf(stderr, "ERROR: Cluster meta key '%s' does not exist\n", args->delete_meta_arg);
+        sxc_meta_free(meta);
+        sxc_cluster_free(cluster);
+        return 1;
+    }
+
+    sxc_meta_delval(meta, args->delete_meta_arg);
+    ret = sxi_cluster_set_meta(cluster, meta);
+    sxc_cluster_free(cluster);
+    sxc_meta_free(meta);
+    if(ret)
+        fprintf(stderr, "ERROR: %s\n", sxc_geterrmsg(sx));
+    else
+        printf("Successfully removed cluster meta key '%s'\n", args->delete_meta_arg);
+    return ret;
 }
 
 int main(int argc, char **argv) {
@@ -1936,6 +2152,12 @@ int main(int argc, char **argv) {
             ret = cluster_set_mode(sx, &cluster_args);
         else if(cluster_args.upgrade_given && cluster_args.inputs_num == 1)
             ret = cluster_upgrade(sx, &cluster_args);
+        else if(cluster_args.set_meta_given && cluster_args.inputs_num == 1)
+            ret = set_cluster_meta(sx, &cluster_args);
+        else if(cluster_args.get_meta_given && cluster_args.inputs_num == 1)
+            ret = get_cluster_meta(sx, &cluster_args);
+        else if(cluster_args.delete_meta_given && cluster_args.inputs_num == 1)
+            ret = del_cluster_meta(sx, &cluster_args);
 	else
 	    cluster_cmdline_parser_print_help();
     cluster_out:

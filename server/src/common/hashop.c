@@ -26,9 +26,9 @@
  */
 
 #include "hashfs.h"
-#include "../libsx/src/clustcfg.h"
-#include "../libsx/src/curlevents.h"
-#include "../libsx/src/yajlwrap.h"
+#include "../libsxclient/src/clustcfg.h"
+#include "../libsxclient/src/curlevents.h"
+#include "../libsxclient/src/yajlwrap.h"
 #include <string.h>
 #include <stdint.h>
 #include <errno.h>
@@ -226,6 +226,9 @@ static const yajl_callbacks presence_parser = {
 
 static int presence_setup_cb(curlev_context_t *cbdata, const char *host) {
     struct hashop_ctx *yactx = sxi_cbdata_get_hashop_ctx(cbdata);
+
+    if(!yactx)
+	return 1;
 
     if(yactx->yh)
 	yajl_free(yactx->yh);

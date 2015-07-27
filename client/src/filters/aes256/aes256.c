@@ -1,5 +1,5 @@
 /*
- *  Copyright (C) 2012-2014 Skylable Ltd. <info-copyright@skylable.com>
+ *  Copyright (C) 2012-2015 Skylable Ltd. <info-copyright@skylable.com>
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License version 2 as
@@ -41,13 +41,13 @@
 #include <openssl/hmac.h>
 #include <errno.h>
 
-#include "libsx/src/misc.h"
+#include "libsxclient/src/misc.h"
 #include "sx.h"
 
 /* logger prefixes with aes256: already */
-#define NOTICE(...)	{ sxc_filter_msg(handle, SX_LOG_NOTICE, __VA_ARGS__); }
-#define WARN(...)	{ sxc_filter_msg(handle, SX_LOG_WARNING, __VA_ARGS__); }
-#define ERROR(...)	{ sxc_filter_msg(handle, SX_LOG_ERR, __VA_ARGS__); }
+#define NOTICE(...)	sxc_filter_msg(handle, SX_LOG_NOTICE, __VA_ARGS__)
+#define WARN(...)	sxc_filter_msg(handle, SX_LOG_WARNING, __VA_ARGS__)
+#define ERROR(...)	sxc_filter_msg(handle, SX_LOG_ERR, __VA_ARGS__)
 
 #define FILTER_BLOCK_SIZE 16384
 #define BCRYPT_AES_ITERATIONS_LOG2 14
@@ -215,18 +215,18 @@ static int keyfp(const sxf_handle_t *handle, const unsigned char *key, const uns
     return -1;
 }
 
-static int aes256_configure(const sxf_handle_t *handle, const char *cfgstr, const char *cfgdir, void **cfgdata, unsigned int *cfgdata_len)
+static int aes256_configure(const sxf_handle_t *handle, const char *cfgstr, const char *cfgdir, void **cfgdata, unsigned int *cfgdata_len, sxc_meta_t *custom_meta)
 {
 	unsigned char key[KEY_SIZE], salt[SALT_SIZE];
 	char *keyfile;
-	int fd, user_salt = 0, nogenkey = 0, paranoid = 0;
+	int fd, user_salt = 0, nogenkey = 1, paranoid = 0;
 	const char *pt;
 
     if(cfgstr) {
 	if(strstr(cfgstr, "paranoid") && strstr(cfgstr, "salt:")) {
 	    ERROR("User provided salt cannot be used in paranoid mode");
 	    return -1;
-	} else if(strncmp(cfgstr, "paranoid", 8) && strncmp(cfgstr, "salt:", 5) && strncmp(cfgstr, "nogenkey", 8)) {
+	} else if(strncmp(cfgstr, "paranoid", 8) && strncmp(cfgstr, "salt:", 5) && strncmp(cfgstr, "nogenkey", 8) && strncmp(cfgstr, "setkey", 6)) {
 	    ERROR("Invalid configuration '%s'", cfgstr);
 	    return -1;
 	}
@@ -241,8 +241,8 @@ static int aes256_configure(const sxf_handle_t *handle, const char *cfgstr, cons
 	    }
 	    user_salt = 1;
 	}
-	if(strstr(cfgstr, "nogenkey"))
-	    nogenkey = 1;
+	if(strstr(cfgstr, "setkey"))
+	    nogenkey = 0;
 	if(strstr(cfgstr, "paranoid"))
 	    paranoid = 1;
     }
@@ -306,9 +306,18 @@ static int aes256_configure(const sxf_handle_t *handle, const char *cfgstr, cons
 	memcpy(*cfgdata, salt, SALT_SIZE);
 	if(keyfp(handle, key, NULL, (unsigned char *) *cfgdata + SALT_SIZE)) {
 	    free(*cfgdata);
+	    *cfgdata = NULL;
 	    return -1;
 	}
 	*cfgdata_len = SALT_SIZE + FP_SIZE;
+
+	if(sxc_meta_setval(custom_meta, "aes256_fp", *cfgdata, *cfgdata_len)) {
+	    ERROR("Failed to set custom meta");
+	    free(*cfgdata);
+	    *cfgdata = NULL;
+	    *cfgdata_len = 0;
+	    return -1;
+	}
     }
 
     return 0;
@@ -323,7 +332,7 @@ static int aes256_shutdown(const sxf_handle_t *handle, void *ctx)
     return 0;
 }
 
-static int aes256_data_prepare(const sxf_handle_t *handle, void **ctx, const char *filename, const char *cfgdir, const void *cfgdata, unsigned int cfgdata_len, sxf_mode_t mode)
+static int aes256_data_prepare(const sxf_handle_t *handle, void **ctx, const char *filename, const char *cfgdir, const void *cfgdata, unsigned int cfgdata_len, sxc_meta_t *custom_meta, sxf_mode_t mode)
 {
 	struct aes256_ctx *actx;
 	int keyread = 0, ret;
@@ -336,6 +345,15 @@ static int aes256_data_prepare(const sxf_handle_t *handle, void **ctx, const cha
     if((runtime_ver & 0xff0000000) != (compile_ver & 0xff0000000)) {
 	ERROR("OpenSSL library version mismatch: compiled: %x, runtime: %d", compile_ver, runtime_ver);
 	return -1;
+    }
+
+    if(!cfgdata || cfgdata_len == SALT_SIZE + 1) {
+	const void *mdata;
+	unsigned int mdata_len;
+        if(!sxc_meta_getval(custom_meta, "aes256_fp", &mdata, &mdata_len)) {
+	    cfgdata = mdata;
+	    cfgdata_len = mdata_len;
+	}
     }
 
     mlock(key, sizeof(key));
@@ -369,13 +387,16 @@ static int aes256_data_prepare(const sxf_handle_t *handle, void **ctx, const cha
 	fd = open(keyfile, O_RDONLY);
 	if(fd == -1) {
 	    if(errno == ENOENT) {
-		NOTICE("The key file doesn't exist and will be created now");
+		if(have_fp)
+		    NOTICE("The local key file doesn't exist and will be created now");
+		else
+		    NOTICE("First upload to the encrypted volume, set the volume password now");
 	    } else {
 		WARN("Can't open key file %s -- attempt to recreate it", keyfile);
 	    }
 	} else {
 	    if(read(fd, key, sizeof(key)) != sizeof(key))
-		WARN("Can't read key file %s -- new key file will be created", keyfile)
+		WARN("Can't read key file %s -- new key file will be created", keyfile);
 	    else
 		keyread = 1;
 	    close(fd);
@@ -386,9 +407,23 @@ static int aes256_data_prepare(const sxf_handle_t *handle, void **ctx, const cha
 		free(keyfile);
 		return -1;
 	    }
-	    if(have_fp && keyfp(handle, key, fp, NULL)) {
-		free(keyfile);
-		return -1;
+	    if(have_fp) {
+		if(keyfp(handle, key, fp, NULL)) {
+		    free(keyfile);
+		    return -1;
+		}
+	    } else {
+		unsigned char mdata[SALT_SIZE + FP_SIZE];
+		memcpy(mdata, salt, SALT_SIZE);
+		if(keyfp(handle, key, NULL, mdata + SALT_SIZE)) {
+		    free(keyfile);
+		    return -1;
+		}
+		if(sxc_meta_setval(custom_meta, "aes256_fp", mdata, sizeof(mdata))) {
+		    ERROR("Failed to set custom meta");
+		    free(keyfile);
+		    return -1;
+		}
 	    }
 	    fd = open(keyfile, O_WRONLY | O_CREAT | O_TRUNC, 0600);
 	    if(fd == -1) {
@@ -682,16 +717,15 @@ sxc_filter_t sxc_filter={
 /* const char *shortname */	    "aes256",
 /* const char *shortdesc */	    "Encrypt data using AES-256-CBC-HMAC-512 mode.",
 /* const char *summary */	    "The filter automatically encrypts and decrypts all data using OpenSSL's AES-256 in CBC-HMAC-512 mode.",
-/* const char *options */	    "\n\tnogenkey (don't generate a key file when creating a volume)\n\tparanoid (don't use key files at all - always ask for a password)\n\tsalt:HEX (force given salt, HEX must be 32 chars long)",
+/* const char *options */	    "\n\tsetkey (set a permanent key when creating a volume)\n\tparanoid (don't use key files at all - always ask for a password)\n\tsalt:HEX (force given salt, HEX must be 32 chars long)",
 /* const char *uuid */		    "35a5404d-1513-4009-904c-6ee5b0cd8634",
 /* sxf_type_t type */		    SXF_TYPE_CRYPT,
-/* int version[2] */		    {1, 5},
+/* int version[2] */		    {1, 6},
 /* int (*init)(const sxf_handle_t *handle, void **ctx) */	    aes256_init,
 /* int (*shutdown)(const sxf_handle_t *handle, void *ctx) */    aes256_shutdown,
-/* int (*parse_cfgstr)(const char *cfgstr, void **cfgdata, unsigned int *cfgdata_len) */
-/* int (*configure)(const char *cfgstr, const char *cfgdir, void **cfgdata, unsigned int *cfgdata_len) */
+/* int (*configure)(const sxf_handle_t *handle, const char *cfgstr, const char *cfgdir, void **cfgdata, unsigned int *cfgdata_len, sxc_meta_t *custom_meta) */
 				    aes256_configure,
-/* int (*data_prepare)(const sxf_handle_t *handle, void **ctx, const char *filename, const char *cfgdir, const void *cfgdata, unsigned int cfgdata_len, sxf_mode_t mode) */
+/* int (*data_prepare)(const sxf_handle_t *handle, void **ctx, const char *filename, const char *cfgdir, const void *cfgdata, unsigned int cfgdata_len, sxc_meta_t *custom_meta, sxf_mode_t mode) */
 				    aes256_data_prepare,
 /* ssize_t (*data_process)(const sxf_handle_t *handle, void *ctx, const void *in, size_t insize, void *out, size_t outsize, sxf_mode_t mode, sxf_action_t *action) */
 				    aes256_data_process,

@@ -55,9 +55,19 @@
 	    DEBUG("FCGX_PutChar() failed");	\
     } while(0)
 
+static inline int FMT_PRINTF(2,3) FCGX_FPrintF_chk(FCGX_Stream *stream, const char *fmt, ...)
+{
+    int rc;
+    va_list ap;
+    va_start(ap, fmt);
+    rc = FCGX_VFPrintF(stream, fmt, ap);
+    va_end(ap);
+    return rc;
+}
+
 #define CGI_PRINTF(...)				\
     do {					\
-	if(FCGX_FPrintF(fcgi_out, __VA_ARGS__) < 0)	\
+	if(FCGX_FPrintF_chk(fcgi_out, __VA_ARGS__) < 0)	\
 	    DEBUG("FCGX_FPrintF() failed");	\
     } while(0)
 
@@ -81,6 +91,7 @@ extern verb_t verb;
 extern uint8_t hashbuf[UPLOAD_CHUNK_SIZE];
 extern uint8_t user[AUTH_UID_LEN];
 extern sx_uid_t uid, common_id;
+extern int64_t user_quota;
 
 void send_server_info(void);
 void handle_request(void);

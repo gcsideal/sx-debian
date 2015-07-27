@@ -32,13 +32,13 @@
 #include <strings.h>
 #include <stdlib.h>
 
-#include "../libsx/src/vcrypto.h"
+#include "../libsxclient/src/vcrypto.h"
 
 #include "fcgi-utils.h"
 #include "fcgi-actions.h"
 #include "utils.h"
 #include "hashfs.h"
-#include "../libsx/src/misc.h"
+#include "../libsxclient/src/misc.h"
 #include "version.h"
 
 #define MAX_CLOCK_DRIFT 10
@@ -199,6 +199,7 @@ int is_http_10(void) {
 
 uint8_t user[AUTH_UID_LEN], rhmac[20];
 sx_uid_t uid;
+int64_t user_quota;
 static sx_priv_t role;
 
 static enum authed_t { AUTH_NOTAUTH, AUTH_BODYCHECK, AUTH_BODYCHECKING, AUTH_OK } authed;
@@ -264,7 +265,7 @@ void send_authreq(void) {
     quit_errmsg(401, "Invalid credentials");
 }
 
-static char *inplace_urldecode(char *s, char forbid, char dedup, int *has_forbidden) {
+static char *inplace_urldecode(char *s, char forbid, char dedup, int *has_forbidden, int plusdec) {
     enum { COPY, PCT } mode = COPY;
     char *src = s, *dst = s, c;
     int v;
@@ -286,7 +287,9 @@ static char *inplace_urldecode(char *s, char forbid, char dedup, int *has_forbid
 		mode = PCT;
 		break;
 	    }
-	    if(dst != src - 1)
+	    if(plusdec && c == '+')
+		*dst = ' ';
+	    else if(dst != src - 1)
 		*dst = c;
 	    dst++;
 	    if(dedup && c == dedup) {
@@ -466,7 +469,7 @@ void handle_request(void) {
 		    } while(*nextarg == '&');
 		}
 		if(*argp) {
-		    if(!(args[nargs] = inplace_urldecode(argp, 0, 0, NULL)))
+		    if(!(args[nargs] = inplace_urldecode(argp, 0, 0, NULL, 1)))
 			quit_errmsg(400, "Invalid URL encoding");
 		    if(utf8_validate_len(args[nargs]) < 0)
 			quit_errmsg(400, "Parameters with invalid utf-8 encoding");
@@ -495,7 +498,7 @@ void handle_request(void) {
     volume = *reqbuf ? reqbuf : NULL;
 
     int forbidden = 0;
-    if((volume && !inplace_urldecode(volume, '/', 0, &forbidden)) || (path && !inplace_urldecode(path, '/', '/', &forbidden))) {
+    if((volume && !inplace_urldecode(volume, '/', 0, &forbidden, 0)) || (path && !inplace_urldecode(path, '/', '/', &forbidden, 0))) {
         if (forbidden)
             quit_errmsg(400, "Volume or path with forbidden %2f or %00");
         else
@@ -562,7 +565,7 @@ void handle_request(void) {
     memcpy(user, buf, sizeof(user));
     memcpy(rhmac, buf+20, sizeof(rhmac));
 
-    if(sx_hashfs_get_user_info(hashfs, user, &uid, key, &role, NULL) != OK) /* no such user */ {
+    if(sx_hashfs_get_user_info(hashfs, user, &uid, key, &role, NULL, &user_quota) != OK) /* no such user */ {
 	DEBUG("No such user: %s", param+4);
 	send_authreq();
 	return;
@@ -660,7 +663,7 @@ int get_priv(int volume_priv) {
 	/* Non volume check, use the base role */
         mypriv = 0;
         if (role >= PRIV_ADMIN)
-            mypriv |= PRIV_READ | PRIV_WRITE | PRIV_ACL | PRIV_ADMIN;/* admin has all below */
+            mypriv |= PRIV_READ | PRIV_WRITE | PRIV_MANAGER | PRIV_OWNER | PRIV_ADMIN;/* admin has all below */
         if (role >= PRIV_CLUSTER)
             mypriv |= PRIV_CLUSTER;
     }
@@ -668,7 +671,7 @@ int get_priv(int volume_priv) {
 }
 
 int has_priv(sx_priv_t reqpriv) {
-    return get_priv(!(reqpriv & ~(PRIV_READ | PRIV_WRITE | PRIV_ACL))) & reqpriv;
+    return get_priv(!(reqpriv & ~(PRIV_READ | PRIV_WRITE | PRIV_MANAGER | PRIV_OWNER))) & reqpriv;
 }
 
 int is_reserved(void) {
@@ -855,7 +858,12 @@ void send_nodes_randomised(const sx_nodelist_t *nodes) {
 }
 
 void send_job_info(job_t job) {
-    CGI_PUTS("Content-Type: application/json\r\n\r\n{\"requestId\":\"");
+    sx_uuid_t node;
+    rc_ty s = sx_hashfs_self_uuid(hashfs, &node);
+
+    if(s)
+	quit_errmsg(rc2http(s), msg_get_reason());
+    CGI_PRINTF("Content-Type: application/json\r\n\r\n{\"requestId\":\"%s:", node.string);
     CGI_PUTLL(job);
     CGI_PUTS("\",\"minPollInterval\":100,\"maxPollInterval\":6000}");
 }

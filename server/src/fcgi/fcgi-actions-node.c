@@ -996,7 +996,7 @@ void fcgi_node_init(void) {
     {
         "users":{
             "admin":{"key":"xxxxx","admin":true}
-            "luser":{"key":"yyyyy","admin":false}
+            "luser":{"key":"yyyyy","admin":false,"quota":12345,"desc":"luser description"}
         }
     }
 
@@ -1015,14 +1015,18 @@ void fcgi_node_init(void) {
 
     {
         "misc":{
-            "mode":"ro"
+            "mode":"ro",
+            "clusterMeta":{"key1":"val1","key2":"val2"},
+            "clusterMetaLastModified":123123123
         }
     }
 */
 
 struct cb_sync_ctx {
-    enum cb_sync_state { CB_SYNC_START, CB_SYNC_MAIN, CB_SYNC_USERS, CB_SYNC_VOLUMES, CB_SYNC_PERMS, CB_SYNC_MISC, CB_SYNC_INMISC, CB_SYNC_MODE, CB_SYNC_INUSERS, CB_SYNC_INVOLUMES, CB_SYNC_INPERMS, CB_SYNC_USR, CB_SYNC_VOL, CB_SYNC_PRM, CB_SYNC_USRDESC, CB_SYNC_USRID, CB_SYNC_VOLKEY, CB_SYNC_PRMKEY, CB_SYNC_USRAUTH, CB_SYNC_USRKEY, CB_SYNC_USRROLE, CB_SYNC_VOLOWNR, CB_SYNC_VOLREP, CB_SYNC_VOLREVS, CB_SYNC_VOLSIZ, CB_SYNC_VOLMETA, CB_SYNC_VOLMETAKEY, CB_SYNC_VOLMETAVAL, CB_SYNC_PRMVAL, CB_SYNC_OUTRO, CB_SYNC_COMPLETE } state;
+    enum cb_sync_state { CB_SYNC_START, CB_SYNC_MAIN, CB_SYNC_USERS, CB_SYNC_VOLUMES, CB_SYNC_PERMS, CB_SYNC_MISC, CB_SYNC_INMISC, CB_SYNC_MODE, CB_SYNC_CLUSTERMETA_TS, CB_SYNC_CLUSTERMETA, CB_SYNC_CLUSTERMETA_KEY, CB_SYNC_CLUSTERMETA_VAL, CB_SYNC_INUSERS, CB_SYNC_INVOLUMES, CB_SYNC_INPERMS, CB_SYNC_USR, CB_SYNC_VOL, CB_SYNC_PRM, CB_SYNC_USRDESC, CB_SYNC_USRID, CB_SYNC_USRQUOTA, CB_SYNC_VOLKEY, CB_SYNC_PRMKEY, CB_SYNC_USRAUTH, CB_SYNC_USRKEY, CB_SYNC_USRROLE, CB_SYNC_VOLOWNR, CB_SYNC_VOLREP, CB_SYNC_VOLREVS, CB_SYNC_VOLSIZ, CB_SYNC_VOLMETA, CB_SYNC_VOLMETAKEY, CB_SYNC_VOLMETAVAL, CB_SYNC_PRMVAL, CB_SYNC_OUTRO, CB_SYNC_COMPLETE } state;
     int64_t size;
+    int64_t quota; /* Quota for volumes owned by the user */
+    time_t cluster_meta_ts;
     char name[MAX(SXLIMIT_MAX_VOLNAME_LEN, SXLIMIT_MAX_USERNAME_LEN) + 1];
     char mkey[SXLIMIT_META_MAX_KEY_LEN+1];
     char desc[SXLIMIT_META_MAX_VALUE_LEN+1];
@@ -1062,25 +1066,9 @@ static int cb_sync_string(void *ctx, const unsigned char *s, size_t l) {
 	    return 0;
 	if(hex2bin(s, l, usr, sizeof(usr)))
 	    return 0;
-	if(sx_hashfs_get_user_info(hashfs, usr, &c->uid, NULL, NULL, NULL))
+	if(sx_hashfs_get_user_info(hashfs, usr, &c->uid, NULL, NULL, NULL, NULL))
 	    return 0;
 	c->state = CB_SYNC_VOLKEY;
-    } else if(c->state == CB_SYNC_PRMVAL) {
-	sx_priv_t priv = 0;
-	if(l < 1 || l >2)
-	    return 0;
-	if(l == lenof("rw") && !strncmp("rw", s, lenof("rw")))
-	    priv = PRIV_READ | PRIV_WRITE;
-	else if(*s == 'r')
-	    priv = PRIV_READ;
-	else if(*s == 'w')
-	    priv = PRIV_WRITE;
-	else
-	    return 0;
-	sx_hashfs_revoke(hashfs, c->uid, c->name, PRIV_READ | PRIV_WRITE);
-	if(sx_hashfs_grant(hashfs, c->uid, c->name, priv))
-	    return 0;
-	c->state = CB_SYNC_PRMKEY;
     } else if(c->state == CB_SYNC_VOLMETAVAL) {
 	uint8_t val[SXLIMIT_META_MAX_VALUE_LEN];
 	if(!l || (l & 1) || l > sizeof(val) * 2)
@@ -1096,6 +1084,15 @@ static int cb_sync_string(void *ctx, const unsigned char *s, size_t l) {
         if(sx_hashfs_cluster_set_mode(hashfs, !strncmp(s, "ro", l) ? 1 : 0))
             return 0;
         c->state = CB_SYNC_INMISC;
+    } else if(c->state == CB_SYNC_CLUSTERMETA_VAL) {
+        uint8_t val[SXLIMIT_META_MAX_VALUE_LEN];
+        if(!l || (l & 1) || l > sizeof(val) * 2)
+            return 0;
+        if(hex2bin((const char*)s, l, val, sizeof(val)))
+            return 0;
+        if(sx_hashfs_clustermeta_set_addmeta(hashfs, c->mkey, val, l/2))
+            return 0;
+        c->state = CB_SYNC_CLUSTERMETA_KEY;
     } else
 	return 0;
     return 1;
@@ -1117,7 +1114,7 @@ static int cb_sync_number(void *ctx, const char *s, size_t l) {
     char number[24], *eon;
     int64_t n;
 
-    if(c->state != CB_SYNC_VOLREP && c->state != CB_SYNC_VOLSIZ && c->state != CB_SYNC_VOLREVS)
+    if(c->state != CB_SYNC_VOLREP && c->state != CB_SYNC_VOLSIZ && c->state != CB_SYNC_VOLREVS && c->state != CB_SYNC_USRQUOTA && c->state != CB_SYNC_CLUSTERMETA_TS && c->state != CB_SYNC_PRMVAL)
 	return 0;
 
     if(l<1 || l>20)
@@ -1125,19 +1122,41 @@ static int cb_sync_number(void *ctx, const char *s, size_t l) {
     memcpy(number, s, l);
     number[l] = '\0';
     n = strtoll(number, &eon, 10);
-    if(*eon || n <= 0)
+    if(*eon || n < 0)
 	return 0;
+    /* User quota can be 0 */
+    if(c->state != CB_SYNC_USRQUOTA && n == 0)
+        return 0;
 
     if(c->state == CB_SYNC_VOLSIZ)
 	c->size = n;
+    else if(c->state == CB_SYNC_USRQUOTA)
+        c->quota = n;
+    else if(c->state == CB_SYNC_CLUSTERMETA_TS)
+        c->cluster_meta_ts = (time_t)n;
     else if(n > 0xffffffff)
 	return 0;
-    else if(c->state == CB_SYNC_VOLREP)
+    else if (c->state == CB_SYNC_PRMVAL) {
+        sx_hashfs_revoke(hashfs, c->uid, c->name, ALL_USER_PRIVS);
+        if ((n & ~ALL_USER_PRIVS)) {
+            WARN("Bad privilege in sync: %d", (int)n);
+            return 0;
+        }
+        if(sx_hashfs_grant(hashfs, c->uid, c->name, n))
+            return 0;
+    } else if(c->state == CB_SYNC_VOLREP)
 	c->replica = (unsigned int)n;
-    else 
+    else
 	c->revs = (unsigned int)n;
 
-    c->state = CB_SYNC_VOLKEY;
+    if(c->state == CB_SYNC_USRQUOTA)
+        c->state = CB_SYNC_USRKEY;
+    else if(c->state == CB_SYNC_CLUSTERMETA_TS)
+        c->state = CB_SYNC_INMISC;
+    else if(c->state == CB_SYNC_PRMVAL)
+        c->state = CB_SYNC_PRMKEY;
+    else
+        c->state = CB_SYNC_VOLKEY;
 
     return 1;
 }
@@ -1166,6 +1185,8 @@ static int cb_sync_start_map(void *ctx) {
 
     else if(c->state == CB_SYNC_VOLMETA)
 	c->state = CB_SYNC_VOLMETAKEY;
+    else if(c->state == CB_SYNC_CLUSTERMETA)
+        c->state = CB_SYNC_CLUSTERMETA_KEY;
 
     else
 	return 0;
@@ -1216,6 +1237,8 @@ static int cb_sync_map_key(void *ctx, const unsigned char *s, size_t l) {
 	    c->state = CB_SYNC_USRROLE;
         else if(l == lenof("desc") && !strncmp("desc", s, lenof("desc")))
             c->state = CB_SYNC_USRDESC;
+        else if(l == lenof("quota") && !strncmp("quota", s, lenof("quota")))
+            c->state = CB_SYNC_USRQUOTA;
 	else
 	    return 0;
     } else if(c->state == CB_SYNC_VOLKEY) {
@@ -1237,7 +1260,7 @@ static int cb_sync_map_key(void *ctx, const unsigned char *s, size_t l) {
 	    return 0;
 	if(hex2bin(s, l, usr, sizeof(usr)))
 	    return 0;
-	if(sx_hashfs_get_user_info(hashfs, usr, &c->uid, NULL, NULL, NULL))
+	if(sx_hashfs_get_user_info(hashfs, usr, &c->uid, NULL, NULL, NULL, NULL))
 	    return 0;
 	c->state = CB_SYNC_PRMVAL;
     } else if(c->state == CB_SYNC_VOLMETAKEY) {
@@ -1246,9 +1269,20 @@ static int cb_sync_map_key(void *ctx, const unsigned char *s, size_t l) {
 	memcpy(c->mkey, s, l);
 	c->mkey[l] = '\0';
 	c->state = CB_SYNC_VOLMETAVAL;
+    } else if(c->state == CB_SYNC_CLUSTERMETA_KEY) {
+        if(l >= sizeof(c->mkey))
+            return 0;
+        memcpy(c->mkey, s, l);
+        c->mkey[l] = '\0';
+        c->state = CB_SYNC_CLUSTERMETA_VAL;
     } else if(c->state == CB_SYNC_INMISC) {
         if(l == lenof("mode") && !strncmp("mode", s, lenof("mode")))
             c->state = CB_SYNC_MODE;
+        else if(l == lenof("clusterMeta") && !strncmp("clusterMeta", s, lenof("clusterMeta"))) {
+            sx_hashfs_clustermeta_set_begin(hashfs);
+            c->state = CB_SYNC_CLUSTERMETA;
+        } else if(l == lenof("clusterMetaLastModified") && !strncmp("clusterMetaLastModified", s, lenof("clusterMetaLastModified")))
+            c->state = CB_SYNC_CLUSTERMETA_TS;
         else
             return 0;
     } else
@@ -1259,11 +1293,12 @@ static int cb_sync_map_key(void *ctx, const unsigned char *s, size_t l) {
 
 static int cb_sync_end_map(void *ctx) {
     struct cb_sync_ctx *c = (struct cb_sync_ctx *)ctx;
-
+    rc_ty s;
     if(c->state == CB_SYNC_USRKEY) {
 	if(!c->have_key || c->admin < 0 || !c->have_user)
 	    return 0;
-	if(sx_hashfs_create_user(hashfs, c->name, c->user, sizeof(c->user), c->key, sizeof(c->key), c->admin != 0, c->desc))
+	s = sx_hashfs_create_user(hashfs, c->name, c->user, sizeof(c->user), c->key, sizeof(c->key), c->admin != 0, c->desc, c->quota);
+	if(s != OK && s != EEXIST)
 	    return 0;
 	if(sx_hashfs_user_onoff(hashfs, c->name, 1, 0))
 	    return 0;
@@ -1273,7 +1308,8 @@ static int cb_sync_end_map(void *ctx) {
 	    return 0;
 	if(!c->revs)
 	    c->revs = 1;
-	if(sx_hashfs_volume_new_finish(hashfs, c->name, c->size, c->replica, c->revs, c->uid))
+	s = sx_hashfs_volume_new_finish(hashfs, c->name, c->size, c->replica, c->revs, c->uid, 0);
+	if(s != OK && s != EEXIST)
 	    return 0;
 	if(sx_hashfs_volume_enable(hashfs, c->name))
 	    return 0;
@@ -1282,11 +1318,16 @@ static int cb_sync_end_map(void *ctx) {
 	c->state = CB_SYNC_INPERMS;
     } else if(c->state == CB_SYNC_INUSERS ||
 	      c->state == CB_SYNC_INVOLUMES ||
-	      c->state == CB_SYNC_INPERMS ||
-              c->state == CB_SYNC_INMISC) {
+	      c->state == CB_SYNC_INPERMS) {
 	c->state = CB_SYNC_OUTRO;
+    } else if(c->state == CB_SYNC_INMISC) {
+        if(sx_hashfs_clustermeta_set_finish(hashfs, c->cluster_meta_ts, 0))
+            return 0;
+        c->state = CB_SYNC_OUTRO;
     } else if(c->state == CB_SYNC_VOLMETAKEY) {
 	c->state = CB_SYNC_VOLKEY;	
+    } else if(c->state == CB_SYNC_CLUSTERMETA_KEY) {
+        c->state = CB_SYNC_INMISC;
     } else if(c->state == CB_SYNC_OUTRO) {
 	c->state = CB_SYNC_COMPLETE;
     } else
@@ -1321,21 +1362,31 @@ void fcgi_sync_globs(void) {
     if(!yh)
 	quit_errmsg(500, "Cannot allocate json parser");
 
-    /* MODHDIST: transaction starts here */
+    if(sx_hashfs_syncglobs_begin(hashfs)) {
+        yajl_free(yh);
+	quit_errmsg(503, "Failed to prepare object synchronization");
+    }
+
     int len;
     while((len = get_body_chunk(hashbuf, sizeof(hashbuf))) > 0)
 	if(yajl_parse(yh, hashbuf, len) != yajl_status_ok) break;
 
     if(len || yajl_complete_parse(yh) != yajl_status_ok || yctx.state != CB_SYNC_COMPLETE) {
 	yajl_free(yh);
-	/* MODHDIST: rollback here */
+	sx_hashfs_syncglobs_abort(hashfs);
 	quit_errmsg(400, "Invalid request content");
     }
     yajl_free(yh);
 
     auth_complete();
-    /* MODHDIST: commit if authed, rollback if unauthed */
-    quit_unless_authed();
+    if(!is_authed()) {
+	sx_hashfs_syncglobs_abort(hashfs);
+	send_authreq();
+	return;
+    }
+
+    if(sx_hashfs_syncglobs_end(hashfs))
+	quit_errmsg(503, "Failed to finalize object synchronization");
 
     CGI_PUTS("\r\n");
 }

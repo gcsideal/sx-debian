@@ -46,7 +46,7 @@ rm -f "$prefix/sbin/sxhttpd"
 # SXHTTPD has to be overriden when using built-in, but not when using external
 # nginx, so just sed
 test -x "$built_nginx" && ln -s "$built_nginx" "$prefix/sbin/sxhttpd" && \
-    sed -i -e "s|if !.*-c|if ! $prefix/sbin/sxhttpd -c|" "$prefix/sbin/sxserver"
+    sed -i -e "s|if !.*[$]|if ! $prefix/sbin/sxhttpd $|" "$prefix/sbin/sxserver"
 
 cp "$prefix/etc/sxserver/sxhttpd.conf.default" "$prefix/etc/sxserver/sxhttpd.conf"
 
@@ -92,6 +92,7 @@ cleanup () {
     rm -rf $prefix
 }
 export SX_FCGI_OPTS="--config-file=$prefix/etc/sxserver/sxfcgi.conf"
+export SX_HTTPD_OPTS="-c $prefix/etc/sxserver/sxhttpd.conf"
 "$prefix/sbin/sxserver" start
 
 trap cleanup EXIT INT

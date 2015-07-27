@@ -2,7 +2,7 @@
 # Process this file with autoconf to produce a configure script.
 
 AC_PREREQ([2.68])
-AC_INIT([sx], [1.1], [https://bugzilla.skylable.com])
+AC_INIT([sx], [1.2], [https://bugzilla.skylable.com])
 AC_CONFIG_AUX_DIR([build-aux])
 AC_CONFIG_MACRO_DIR([m4])
 dnl for cmdline.c
@@ -127,7 +127,7 @@ else
 fi
 AC_MSG_CHECKING([for working resolver in lib$checkingin])
 AC_LINK_IFELSE([AC_LANG_PROGRAM([
-#include "$srcdir/../libsx/include/default.h"
+#include "$srcdir/../libsxclient/include/default.h"
 #include <sys/types.h>
 #include <netinet/in.h>
 #include <arpa/nameser.h>
