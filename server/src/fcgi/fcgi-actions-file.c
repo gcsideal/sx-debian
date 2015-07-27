@@ -28,54 +28,13 @@
 #include "default.h"
 #include <string.h>
 #include <stdlib.h>
+#include <arpa/inet.h>
 #include <yajl/yajl_parse.h>
 
 #include "fcgi-actions-file.h"
 #include "fcgi-utils.h"
 #include "utils.h"
 #include "blob.h"
-
-static int can_handle_cached_objects(const sx_hash_t *etag, unsigned int created_at, char type) {
-    char tagbuf[3 + sizeof(*etag) * 2 + 1];
-    const char *cond;
-    int is_cached = 0, skip_modsince = 0;
-
-    tagbuf[0] = '"';
-    tagbuf[1] = type;
-    bin2hex(etag, sizeof(*etag), tagbuf + 2, sizeof(tagbuf) - 2);
-    tagbuf[sizeof(tagbuf) - 2] = '"';
-    tagbuf[sizeof(tagbuf) - 1] = '\0';
-    CGI_PRINTF("ETag: %s\r\nCache-control: public, must-revalidate\r\nLast-Modified: ", tagbuf);
-    send_httpdate(created_at);
-    CGI_PUTS("\r\n");
-    if((cond = FCGX_GetParam("HTTP_IF_NONE_MATCH", envp))) {
-	if(!strcmp(tagbuf, cond))
-	    is_cached = 1;
-	else
-	    skip_modsince = 1;
-    }
-
-    /* FIXME:
-     * Our file mtime has got subsecond precision, but last-modified/if-modified
-     * semantics only allow precision up to the second.
-     * If we only provide an ETag we effectively kill caching on most proxies.
-     * If we also provide Last-Modified, we risk caches serving stale content.
-     * WAT DO? */
-    if(!skip_modsince && (cond = FCGX_GetParam("HTTP_IF_MODIFIED_SINCE", envp))) {
-	time_t modsince;
-	if(!httpdate_to_time_t(cond, &modsince) && modsince >= created_at)
-	    is_cached = 1;
-	else
-	    is_cached = 0;
-    }
-
-    if(is_cached) {
-	CGI_PUTS("Status: 304\r\n\r\n");
-	return 1;
-    }
-
-    return 0;
-}
 
 void fcgi_send_file_meta(void) {
     const char *metakey;
@@ -90,7 +49,7 @@ void fcgi_send_file_meta(void) {
     if(s != OK)
 	quit_errnum(s == ENOENT ? 404 : 500);
 
-    if(can_handle_cached_objects(&etag, created_at, 'M'))
+    if(is_object_fresh(&etag, 'M', created_at))
 	return;
 
     CGI_PUTS("Content-type: application/json\r\n\r\n{\"fileMeta\":{");
@@ -112,28 +71,51 @@ void fcgi_send_file_meta(void) {
     CGI_PUTS("}");
 }
 
+void fcgi_send_file_revisions(void) {
+    const sx_hashfs_volume_t *vol;
+    const sx_hashfs_file_t *file;
+    int comma = 0;
+    rc_ty s;
+
+    s = sx_hashfs_volume_by_name(hashfs, volume, &vol);
+    if(s != OK)
+	quit_errmsg(rc2http(s), msg_get_reason());
+
+    s = sx_hashfs_revision_first(hashfs, vol, path, &file, 0);
+    if(s != OK)
+	quit_errmsg(rc2http(s), msg_get_reason());
+
+    CGI_PUTS("Content-type: application/json\r\n\r\n{\"fileRevisions\":{");
+    do {
+	CGI_PRINTF("%s\"%s\":{\"blockSize\":%d,\"fileSize\":", comma ? "," : "", file->revision, file->block_size);
+	CGI_PUTLL(file->file_size);
+	CGI_PRINTF(",\"createdAt\":%u}", file->created_at);
+	comma = 1;
+	s = sx_hashfs_revision_next(hashfs, 0);
+    } while(s == OK);
+    if(s == ITER_NO_MORE)
+	CGI_PUTS("}}");
+}
+
 void fcgi_send_file(void) {
+    sx_hashfs_file_t filedata;
     const sx_hash_t *hash;
     sx_nodelist_t *nodes;
-    unsigned int blocksize;
-    unsigned int created_at;
     sx_hash_t etag;
-    int64_t filesize;
     int comma = 0;
-    rc_ty s = sx_hashfs_getfile_begin(hashfs, volume, path, get_arg("rev"), &filesize, &blocksize, &created_at, &etag);
+    rc_ty s = sx_hashfs_getfile_begin(hashfs, volume, path, get_arg("rev"), &filedata, &etag);
 
     if(s != OK)
 	quit_errnum(s == ENOENT ? 404 : 500);
 
-    if(can_handle_cached_objects(&etag, created_at, 'F')) {
+    if(is_object_fresh(&etag, 'F', filedata.created_at)) {
 	sx_hashfs_getfile_end(hashfs);
 	return;
     }
 
-    /* FIXME: should stuff created_at into the json ? */
-    CGI_PRINTF("Content-type: application/json\r\n\r\n{\"blockSize\":%d,\"fileSize\":", blocksize);
-    CGI_PUTLL(filesize);
-    CGI_PUTS(",\"fileData\":[");
+    CGI_PRINTF("Content-type: application/json\r\n\r\n{\"blockSize\":%d,\"fileSize\":", filedata.block_size);
+    CGI_PUTLL(filedata.file_size);
+    CGI_PRINTF(",\"createdAt\":%u,\"fileRevision\":\"%s\",\"fileData\":[", filedata.created_at, filedata.revision);
 
     while((s = sx_hashfs_getfile_block(hashfs, &hash, &nodes)) == OK) {
 	if(comma)
@@ -143,6 +125,8 @@ void fcgi_send_file(void) {
 	CGI_PUTC('{');
 	send_qstring_hash(hash);
 	CGI_PUTC(':');
+	/* Nodes are in NL_PREVNEXT order and MUST NOT be randomized
+	 * (see comments in sx_hashfs_getfile_block) */
 	send_nodes(nodes);
 	CGI_PUTC('}');
 
@@ -172,7 +156,7 @@ static int hash_presence_callback(const char *hexhash, unsigned int index, int c
     if (code != 200) {
 	if (code < 0)
 	    WARN("Failed to query hash %.*s: %s", 40, hexhash, sx_hashfs_geterrmsg(h));
-	if (hex2bin(hexhash, HASH_TEXT_LEN, hash.b, sizeof(hash.b))) {
+	if (hex2bin(hexhash, SXI_SHA1_TEXT_LEN, hash.b, sizeof(hash.b))) {
 	    WARN("hex2bin failed on %.*s", 40, hexhash);
 	    return -1;
 	}
@@ -188,6 +172,8 @@ static int hash_presence_callback(const char *hexhash, unsigned int index, int c
         DEBUG("Requesting from user: #%.*s#", 40, hexhash);
 	send_qstring_hash(&hash);
 	CGI_PUTC(':');
+	/* Although there is no danger in doing so, nodes SHOULD NOT be randomized:
+	 * hdist already does a pretty good job here */
 	send_nodes(nodes);
 	sx_nodelist_delete(nodes);
     }
@@ -276,10 +262,10 @@ static int cb_newfile_string(void *ctx, const unsigned char *s, size_t l) {
 
     if(c->state == CB_NEWFILE_HASH) {
 	sx_hash_t hash;
-	if(l != HASH_TEXT_LEN)
+	if(l != SXI_SHA1_TEXT_LEN)
 	    return 0;
 
-	if(hex2bin(s, HASH_TEXT_LEN, hash.b, sizeof(hash.b)))
+	if(hex2bin(s, SXI_SHA1_TEXT_LEN, hash.b, sizeof(hash.b)))
 	    return 0;
 
 	rc_ty rc = sx_hashfs_putfile_putblock(hashfs, &hash);
@@ -390,7 +376,7 @@ void fcgi_create_file(void) {
 
     if(len || yajl_complete_parse(yh) != yajl_status_ok || yctx.state != CB_NEWFILE_COMPLETE) {
 	yajl_free(yh);
-	sx_hashfs_putfile_end(hashfs);
+	sx_hashfs_createfile_end(hashfs);
 	quit_errmsg(400, "Invalid request content");
     }
 
@@ -399,23 +385,13 @@ void fcgi_create_file(void) {
     quit_unless_authed();
 
     s = sx_hashfs_createfile_commit(hashfs, volume, path, get_arg("rev"), yctx.filesize);
-    switch (s) {
-    case OK:
-	break;
-    case ENOENT:
-	quit_errnum(404);
-    case EINVAL:
-	quit_errnum(400);
-    default:
-	WARN("sx_hashfs_createfile_commit failed: %d", s);
-	quit_errmsg(500, "Cannot initialize file upload");
-    }
+    if(s != OK)
+	quit_errmsg(rc2http(s), msg_get_reason());
 
     CGI_PUTS("\r\n");
 }
 
-
-static void create_or_extend_tempfile(int extending) {
+static void create_or_extend_tempfile(const sx_hashfs_volume_t *vol, const char *filename, int extending) {
     hash_presence_ctx_t ctx;
     const char *token;
     int len;
@@ -445,13 +421,11 @@ static void create_or_extend_tempfile(int extending) {
     auth_complete();
     quit_unless_authed();
 
-    /* FIXME: extend should reuse old token, not get a new one because the
-     * expiry time will be wrong... */
     s = sx_hashfs_putfile_gettoken(hashfs, user, yctx.filesize, &token, hash_presence_callback, &ctx);
     if (s != OK) {
 	sx_hashfs_putfile_end(hashfs);
-	if (s == ENOSPC)
-	    quit_errmsg(507, "Out of space");
+	if(s == ENOSPC)
+	    quit_errmsg(413, msg_get_reason());
 	WARN("store_filehash_end failed: %d", s);
 	if(!*msg_get_reason())
 	    msg_set_reason("Cannot obtain upload token: %s", rc2str(s));
@@ -459,7 +433,7 @@ static void create_or_extend_tempfile(int extending) {
     }
 
     CGI_PRINTF("Content-type: application/json\r\n\r\n{\"uploadToken\":");
-    json_send_qstring(token);
+    json_send_qstring(extending ? path : token);
     CGI_PUTS(",\"uploadData\":{");
     ctx.h = hashfs;
     ctx.comma = 0;
@@ -475,17 +449,18 @@ static void create_or_extend_tempfile(int extending) {
 }
 
 void fcgi_create_tempfile(void) {
-    rc_ty s = sx_hashfs_putfile_begin(hashfs, uid, volume, path);
+    const sx_hashfs_volume_t *vol;
+    rc_ty s = sx_hashfs_putfile_begin(hashfs, uid, volume, path, &vol);
     if(s != OK)
 	quit_errmsg(rc2http(s), msg_get_reason());
-    create_or_extend_tempfile(0);
+    create_or_extend_tempfile(vol, path, 0);
 }
 
 void fcgi_extend_tempfile(void) {
     rc_ty s = sx_hashfs_putfile_extend_begin(hashfs, uid, user, path);
     if(s != OK)
 	quit_errmsg(rc2http(s), msg_get_reason());
-    create_or_extend_tempfile(1);
+    create_or_extend_tempfile(NULL, NULL, 1);
 }
 
 void fcgi_flush_tempfile(void) {
@@ -522,52 +497,116 @@ void fcgi_delete_file(void) {
 	CGI_PUTS("\r\n");
     } else {
 	/* Request comes in from the user: create job */
-	sx_nodelist_t *targets;
-
-	s = sx_hashfs_volnodes(hashfs, NL_NEXTPREV, vol, 0, &targets, NULL);
-	if(s == OK) {
-	    sx_blob_t *b = sx_blob_new();
-	    const void *job_data;
-	    unsigned int job_datalen;
-	    job_t job;
-
-	    if(b && !sx_blob_add_string(b, volume) && !sx_blob_add_string(b, path)) {
-		if(!rev || !*rev) {
-		    const sx_hashfs_file_t *file;
-		    s = sx_hashfs_revision_first(hashfs, vol, path, &file);
-		    while(s == OK) {
-			if(sx_blob_add_string(b, file->revision))
-			    s = ENOMEM;
-			else
-			    s = sx_hashfs_revision_next(hashfs);
-		    }
-		    if(s == ITER_NO_MORE)
-			s = OK;
-		} else if(sx_blob_add_string(b, rev))
-		    s = ENOMEM;
-
-		if(s == OK) {
-		    if(!sx_blob_add_string(b, "")) {
-			unsigned int job_timeout = 15 * sx_nodelist_count(targets);
-			sx_blob_to_data(b, &job_data, &job_datalen);
-			s = sx_hashfs_job_new(hashfs, uid, &job, JOBTYPE_DELETE_FILE, job_timeout, NULL, job_data, job_datalen, targets);
-		    } else
-			s = ENOMEM;
-		}
-	    } else
-		s = ENOMEM;
-
-	    sx_nodelist_delete(targets);
-	    sx_blob_free(b);
-
-	    if(s == OK) {
-		send_job_info(job);
-		return;
-	    }
-	}
-	if(s == ENOMEM)
-	    quit_errmsg(503, "Cannot allocate job data");
-	else
+	job_t job;
+	s = sx_hashfs_filedelete_job(hashfs, uid, vol, path, rev, &job);
+	if(s != OK)
 	    quit_errmsg(rc2http(s), msg_get_reason());
+	send_job_info(job);
     }
+}
+
+struct rplfiles {
+    sx_blob_t *b;
+    sx_hashfs_file_t lastfile;
+    unsigned int bytes_sent;
+};
+
+static void send_rplfiles_header(struct rplfiles *ctx) {
+    unsigned int header_len, hlenton;
+    const void *header;
+
+    sx_blob_to_data(ctx->b, &header, &header_len);
+    hlenton = htonl(header_len);
+    if(!ctx->bytes_sent)
+	CGI_PUTS("\r\n");
+    CGI_PUTD(&hlenton, sizeof(hlenton));
+    CGI_PUTD(header, header_len);
+    ctx->bytes_sent += sizeof(hlenton) + header_len;
+}
+
+static int rplfiles_cb(const sx_hashfs_volume_t *volume, const sx_hashfs_file_t *file, const sx_hash_t *contents, unsigned int nblocks, void *ctx) {
+    unsigned int bodylen = sizeof(*contents) * nblocks, mval_len;
+    struct rplfiles *c = (struct rplfiles *)ctx;
+    const char *mkey;
+    const void *mval;
+    rc_ty s;
+
+    if(c->bytes_sent >= REPLACEMENT_BATCH_SIZE)
+	return 0;
+    sx_blob_reset(c->b);
+    if(sx_blob_add_string(c->b, "$FILE$") ||
+       sx_blob_add_int32(c->b, nblocks) ||
+       sx_blob_add_string(c->b, file->name) ||
+       sx_blob_add_string(c->b, file->revision) ||
+       sx_blob_add_int64(c->b, file->file_size))
+	return 0;
+    if(sx_hashfs_getfilemeta_begin(hashfs, volume->name, file->name, file->revision, NULL, NULL))
+	return 0;
+    while((s = sx_hashfs_getfilemeta_next(hashfs, &mkey, &mval, &mval_len)) == OK) {
+	if(sx_blob_add_string(c->b, "$META$") ||
+	   sx_blob_add_string(c->b, mkey) ||
+	   sx_blob_add_blob(c->b, mval, mval_len))
+	    break;
+    }
+    if(s != ITER_NO_MORE)
+	return 0;
+    if(sx_blob_add_string(c->b, "$ENDMETA$"))
+	return 0;
+
+    send_rplfiles_header(c);
+    CGI_PUTD(contents, bodylen);
+    c->bytes_sent += bodylen;
+    return 1;
+}
+
+void fcgi_send_replacement_files(void) {
+    const char *startname, *startrev = NULL;
+    const sx_hashfs_volume_t *vol;
+    struct rplfiles ctx;
+    rc_ty s;
+
+    if(!has_arg("maxrev"))
+	quit_errmsg(400, "Parameter maxrev is required");
+
+    startname = strchr(path, '/');
+    if(!startname) {
+	s = sx_hashfs_volume_by_name(hashfs, path, &vol);
+    } else {
+	unsigned int vnamelen = startname - path;
+	char *vname = malloc(vnamelen + 1);
+	if(!vname)
+	    quit_errmsg(503, "Out of memory");
+	memcpy(vname, path, vnamelen);
+	vname[vnamelen] = '\0';
+	s = sx_hashfs_volume_by_name(hashfs, vname, &vol);
+	free(vname);
+	startname++;
+	if(strlen(startname))
+	    startrev = get_arg("startrev");
+	else
+	    startname = NULL;
+    }
+    if(s != OK)
+	quit_errmsg(rc2http(s), msg_get_reason());
+
+    if(!sx_hashfs_is_or_was_my_volume(hashfs, vol))
+	quit_errnum(404);
+
+    ctx.bytes_sent = 0;
+    ctx.b = sx_blob_new();
+    if(!ctx.b)
+	quit_errmsg(503, "Out of memory");
+
+    s = sx_hashfs_file_find(hashfs, vol, startname, startrev, get_arg("maxrev"), rplfiles_cb, &ctx);
+    if(s == ITER_NO_MORE) {
+	sx_blob_reset(ctx.b);
+	if(!sx_blob_add_string(ctx.b, "$THEEND$"))
+	    send_rplfiles_header(&ctx);
+	sx_blob_free(ctx.b);
+	return;
+    }
+
+    sx_blob_free(ctx.b);
+    if(s != FAIL_ETOOMANY && !ctx.bytes_sent)
+	quit_errmsg(rc2http(s), msg_get_reason());
 }

@@ -40,25 +40,35 @@
 #define CGI_PUTD(data, len)			\
     do {					\
 	if(FCGX_PutStr((const char *)(data), len, fcgi_out) < 0)	\
-	    WARN("FCGX_PutStr() failed: %s", strerror(FCGX_GetError(fcgi_out)));	\
+	    DEBUG("FCGX_PutStr() failed: %s", strerror(FCGX_GetError(fcgi_out)));	\
     } while(0)
 
 #define CGI_PUTS(s)				\
     do {					\
 	if(FCGX_PutS(s, fcgi_out) < 0)		\
-	    WARN("FCGX_PutS() failed");		\
+	    DEBUG("FCGX_PutS() failed");		\
     } while(0)
 
 #define CGI_PUTC(c)				\
     do {					\
 	if(FCGX_PutChar(c, fcgi_out) < 0)		\
-	    WARN("FCGX_PutChar() failed");	\
+	    DEBUG("FCGX_PutChar() failed");	\
     } while(0)
+
+static inline int FMT_PRINTF(2,3) FCGX_FPrintF_chk(FCGX_Stream *stream, const char *fmt, ...)
+{
+    int rc;
+    va_list ap;
+    va_start(ap, fmt);
+    rc = FCGX_VFPrintF(stream, fmt, ap);
+    va_end(ap);
+    return rc;
+}
 
 #define CGI_PRINTF(...)				\
     do {					\
-	if(FCGX_FPrintF(fcgi_out, __VA_ARGS__) < 0)	\
-	    WARN("FCGX_FPrintF() failed");	\
+	if(FCGX_FPrintF_chk(fcgi_out, __VA_ARGS__) < 0)	\
+	    DEBUG("FCGX_FPrintF() failed");	\
     } while(0)
 
 #define CGI_PUTLL(ll)				\
@@ -72,13 +82,16 @@
 
 #define SERVER_NAME "sx"
 #define MAX_ARGS 256
+#define REPLACEMENT_BATCH_SIZE (64*1024*1024)
+
 extern char *volume, *path, *args[MAX_ARGS];
 extern unsigned int nargs;
 typedef enum { VERB_UNSUP, VERB_GET, VERB_HEAD, VERB_POST, VERB_PUT, VERB_DELETE, VERB_OPTIONS } verb_t;
 extern verb_t verb;
 extern uint8_t hashbuf[UPLOAD_CHUNK_SIZE];
 extern uint8_t user[AUTH_UID_LEN];
-extern sx_uid_t uid;
+extern sx_uid_t uid, common_id;
+extern int64_t user_quota;
 
 void send_server_info(void);
 void handle_request(void);
@@ -96,8 +109,10 @@ int volume_exists(void);
 int arg_num(const char *arg);
 #define has_arg(a) (arg_num(a) >= 0)
 const char *get_arg(const char *arg);
+int get_arg_uint(const char *arg);
 int arg_is(const char *arg, const char *ref);
 void json_send_qstring(const char *s);
+int json_qstring(char *buf, unsigned int buflen, const char *s);
 void send_httpdate(time_t t);
 void send_qstring_hash(const sx_hash_t *h);
 int is_http_10(void);
@@ -110,10 +125,12 @@ void send_keepalive(void);
 void send_nodes(const sx_nodelist_t *nodes);
 void send_nodes_randomised(const sx_nodelist_t *nodes);
 void send_job_info(job_t job);
+#define NO_LAST_MODIFIED 0xffffffff
+int is_object_fresh(const sx_hash_t *etag, char type, unsigned int last_modified);
 
 #define quit_errmsg(errnum, message) do { send_error(errnum, message); return; } while(0)
 #define quit_errnum(errnum) do { send_error(errnum, NULL); return; } while(0)
-#define quit_itererr(message, rc) do { send_partial_error(message, rc); return; } while(0)
+#define quit_itererr(message, http) do { send_partial_error(message, http); return; } while(0)
 #define quit_home() do { send_home(); return; } while(0)
 #define quit_unless_authed() do { if(!is_authed()) { send_authreq(); return; } } while(0)
 #define quit_unless_has(priv) do { if(!has_priv(priv)) { quit_errmsg(403, "Permission denied: not enough privileges"); return; } } while(0)

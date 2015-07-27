@@ -38,8 +38,6 @@
 #include <string.h>
 #include <unistd.h>
 #include <yajl/yajl_version.h>
-#include <openssl/crypto.h>
-#include <openssl/ssl.h>
 #include <errno.h>
 
 #include "config.h"
@@ -49,9 +47,10 @@
 #include "hashfs.h"
 #include "init.h"
 #include "../../fcgi/cfgfile.h"
-#include "../../../libsx/src/sxreport.h"
-#include "../../../libsx/src/sxlog.h"
-#include "../../../libsx/src/misc.h"
+#include "../../../libsxclient/src/sxreport.h"
+#include "../../../libsxclient/src/sxlog.h"
+#include "../../../libsxclient/src/misc.h"
+#include "../../../libsxclient/src/vcrypto.h"
 
 static struct gengetopt_args_info fcgi_args;
 static int fcgi_args_parsed;
@@ -120,7 +119,7 @@ static void print_fs(const char *dir)
                     if (*mountpoint && strlen(mountpoint) > 1 &&
                         !strncmp(mountpoint,dir,strlen(mountpoint)) &&
                         strlen(mountpoint) > strlen(best)) {
-                        strncpy(best, line, sizeof(best));
+                        sxi_strlcpy(best, line, sizeof(best));
                     }
                 }
             }
@@ -166,13 +165,16 @@ static void print_hashfs(sxc_client_t *sx, const char *path)
 	return;
     }
     const sx_node_t *self= sx_hashfs_self(h);
-    INFO("Current node space usage: %lld (%.2f%%)", size,
-           100.0 * size / sx_node_capacity(self));
+    if (self)
+        INFO("Current node space usage: %lld (%.2f%%)", size,
+               100.0 * size / sx_node_capacity(self));
+    else
+        INFO("This is a bare node");
 
     INFO("HashFS Version: %s", sx_hashfs_version(h));
 
     sx_hashfs_stats(h);
-    sx_hashfs_analyze(h);
+    sx_hashfs_analyze(h, 1);
     sx_hashfs_close(h);
 }
 
@@ -245,17 +247,8 @@ static void print_cpuinfo()
 
 static void print_ssl_cert_info(sxc_client_t *sx, const char *file)
 {
-    unsigned int n = sizeof(n);
-
-    FILE *f = fopen(file,"r");
-    if(!f)
-	return;
-    X509 *x = PEM_read_X509(f, NULL, NULL, NULL);
-    fclose(f);
-    if (!x)
-        return;
     INFO("SSL server certificate:");
-    sxi_print_certificate_info(sx, x);
+    sxi_vcrypt_print_cert_info(sx, file, 0);
 }
 
 static void print_ssl_key_info(const char *file)
@@ -263,42 +256,6 @@ static void print_ssl_key_info(const char *file)
     if (!access(file, F_OK))
         WARN("SSL certificate key not readable");
     /* TODO: check that the private key belongs to the x509 cert */
-}
-
-static void print_cipherlist(SSL *ssl)
-{
-    struct sxi_fmt fmt;
-    unsigned i = 0;
-    const char *cipher;
-
-    sxi_fmt_start(&fmt);
-    sxi_fmt_msg(&fmt, "SSL cipherlist (expanded) ");
-    while((cipher = SSL_get_cipher_list(ssl, i++))) {
-        sxi_fmt_msg(&fmt, ":%s", cipher);
-    }
-    INFO("%s", fmt.buf);
-}
-
-static void print_ssl_ciphers_info(const char *list)
-{
-    SSL_CTX *ctx;
-    OpenSSL_add_ssl_algorithms();
-    ctx = SSL_CTX_new(SSLv23_server_method());
-    if (!ctx)
-        return;
-    SSL_CTX_set_options(ctx, SSL_OP_NO_SSLv2);
-    if (!SSL_CTX_set_cipher_list(ctx, list)) {
-        SSLERR();
-        return;
-    }
-    SSL *ssl=SSL_new(ctx);
-    if (ssl) {
-        /* note: this prints some ciphers that the server won't actually use
-         * without additional configuration like SRP, PSK, etc. */
-        print_cipherlist(ssl);
-        SSL_free(ssl);
-    }
-    SSL_CTX_free(ctx);
 }
 
 static int parse_key_value(char *line, const char **key, const char **value)
@@ -339,7 +296,7 @@ static void print_sxhttpd_conf(sxc_client_t *sx, const char *dir, const char *fi
         if (!strcmp(key, "ssl_certificate_key"))
             print_ssl_key_info(value);
         if (!strcmp(key, "ssl_ciphers"))
-            print_ssl_ciphers_info(value);
+            sxi_vcrypt_print_cipherlist(sx, value);
     }
     fclose(f);
 }
@@ -439,7 +396,7 @@ static void print_cluster(sxc_client_t *sx)
 
     const sx_node_t *self= sx_hashfs_self(h);
 
-    nodes = sx_hashfs_nodelist(h, NL_NEXT);
+    nodes = sx_hashfs_all_nodes(h, NL_NEXT);
     if(nodes && sx_nodelist_count(nodes)) {
 	unsigned int i, nnodes = sx_nodelist_count(nodes);
 	INFO("List of nodes:");
@@ -473,18 +430,27 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    if(geteuid()) {
-	printf("This program must be run by root\n");
-        main_cmdline_parser_free(&args);
-        return 1;
-    }
-
     params = cmdline_parser_params_create();
     if (!params) {
         fprintf(stderr,"ERROR: Cannot allocate config parser\n");
         main_cmdline_parser_free(&args);
         return 1;
     }
+
+    if(args.get_mem_given) {
+	int64_t mem = 0;
+	int ret = 1;
+	sxc_client_t *sx = sx_init(NULL, NULL, NULL, 0, argc, argv);
+	if(sx) {
+	    ret = sxi_report_mem(sx, &mem) ? 1 : 0;
+	    sx_done(&sx);
+	} 
+	printf("%llu\n", (unsigned long long) mem);
+	return ret;
+    }
+
+    if(geteuid())
+	fprintf(stderr, "WARNING: In most cases this program should be run by root to access all necessary files\n");
 
     if (args.output_given)
         snprintf(name, sizeof(name), "%s", args.output_arg);
@@ -505,7 +471,9 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    sx = server_init(sxc_file_logger(&flogger, argv[0], name, 0), NULL, NULL, 0, argc, argv);
+    sx = sx_init(sxc_file_logger(&flogger, argv[0], name, 0), NULL, NULL, 0, argc, argv);
+    if(!sx)
+	return 1;
     sxc_set_verbose(sx, 1);
     params->initialize = 1;
     cmdline_parser_init(&fcgi_args);/* without this it'll crash */
@@ -516,12 +484,11 @@ int main(int argc, char **argv) {
         fcgi_args_parsed = 1;
 
     if (!args.all_given && !args.append_given && !args.info_given &&
-        !args.logs_given && !args.cluster_given && !args.storage_given &&
-        !args.sxproxy_given)
+        !args.logs_given && !args.cluster_given && !args.storage_given)
         args.all_given = 1;
 
     if (args.all_given)
-        args.info_given = args.logs_given = args.cluster_given = args.storage_given = args.sxproxy_given = 1;
+        args.info_given = args.logs_given = args.cluster_given = args.storage_given = 1;
 
     if (args.info_given) {
         print_info(sx, sysconfdir);
@@ -552,22 +519,40 @@ int main(int argc, char **argv) {
         logfile_in = fopen(name, "r");
 	if(!logfile_in) {
             WARN("Cannot open input file '%s': %s", name, strerror(errno));
+	    sx_done(&sx);
             return 1;
         }
-	strncpy(oname, name, sizeof(oname));
+	sxi_strlcpy(oname, name, sizeof(oname));
 	snprintf(name, sizeof(name), "sxreport-server-%ld-anon.log", t);
         out = fopen(name, "w");
         if (!out) {
+	    fclose(logfile_in);
             WARN("Cannot open anonymized output file '%s': %s",
                  name, strerror(errno));
+	    sx_done(&sx);
             return 1;
         }
-        fclose(logfile);
+        if(fclose(logfile)) {
+	    fclose(logfile_in);
+	    fclose(out);
+            WARN("Cannot close output file '%s': %s",
+                 oname, strerror(errno));
+	    sx_done(&sx);
+            return 1;
+        }
         logfile = out;
         anonymize_filter(sx, fcgi_args.data_dir_arg, logfile_in, out);
-        fclose(out);
+        if(fclose(out)) {
+	    fclose(logfile_in);
+            WARN("Cannot close output file '%s': %s",
+                 name, strerror(errno));
+	    sx_done(&sx);
+            return 1;
+        }
         fclose(logfile_in);
 	unlink(oname);
+	if(args.output_given && !rename(name, oname))
+	    sxi_strlcpy(name, oname, sizeof(name));
     }
     if (fcgi_args_parsed)
         cmdline_parser_free(&fcgi_args);
@@ -575,6 +560,6 @@ int main(int argc, char **argv) {
     printf("%s stored in %s\n", args.anonymize_given ? "Anonymized report" : "Report", name);
     printf("You can attach it to a bugreport at %s\n", PACKAGE_BUGREPORT);
     main_cmdline_parser_free(&args);
-    server_done(&sx);
+    sx_done(&sx);
     return 0;
 }

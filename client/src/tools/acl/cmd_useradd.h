@@ -40,6 +40,7 @@ enum enum_role { role__NULL = -1, role_arg_admin = 0, role_arg_normal };
 struct useradd_args_info
 {
   const char *help_help; /**< @brief Print help and exit help description.  */
+  const char *full_help_help; /**< @brief Print help, including hidden options, and exit help description.  */
   const char *version_help; /**< @brief Print version and exit help description.  */
   enum enum_role role_arg;	/**< @brief User type (default='normal').  */
   char * role_orig;	/**< @brief User type original value given at command line.  */
@@ -47,17 +48,40 @@ struct useradd_args_info
   char * auth_file_arg;	/**< @brief Store authentication token in given file (instead of stdout).  */
   char * auth_file_orig;	/**< @brief Store authentication token in given file (instead of stdout) original value given at command line.  */
   const char *auth_file_help; /**< @brief Store authentication token in given file (instead of stdout) help description.  */
+  char * pass_file_arg;	/**< @brief File containing user password (instead of stdin).  */
+  char * pass_file_orig;	/**< @brief File containing user password (instead of stdin) original value given at command line.  */
+  const char *pass_file_help; /**< @brief File containing user password (instead of stdin) help description.  */
+  char * description_arg;	/**< @brief Set the description of this user (default='').  */
+  char * description_orig;	/**< @brief Set the description of this user original value given at command line.  */
+  const char *description_help; /**< @brief Set the description of this user help description.  */
+  char * quota_arg;	/**< @brief Set total quota for all volumes owned by this user (allows K,M,G,T suffixes).  */
+  char * quota_orig;	/**< @brief Set total quota for all volumes owned by this user (allows K,M,G,T suffixes) original value given at command line.  */
+  const char *quota_help; /**< @brief Set total quota for all volumes owned by this user (allows K,M,G,T suffixes) help description.  */
   char * config_dir_arg;	/**< @brief Path to SX configuration directory.  */
   char * config_dir_orig;	/**< @brief Path to SX configuration directory original value given at command line.  */
   const char *config_dir_help; /**< @brief Path to SX configuration directory help description.  */
+  char * force_key_arg;	/**< @brief Create user with an old authentication token.  */
+  char * force_key_orig;	/**< @brief Create user with an old authentication token original value given at command line.  */
+  const char *force_key_help; /**< @brief Create user with an old authentication token help description.  */
+  int generate_key_flag;	/**< @brief Generate a random key (default=off).  */
+  const char *generate_key_help; /**< @brief Generate a random key help description.  */
+  int batch_mode_flag;	/**< @brief Disable additional information and only print the automatically generated key (default=off).  */
+  const char *batch_mode_help; /**< @brief Disable additional information and only print the automatically generated key help description.  */
   int debug_flag;	/**< @brief Enable debug messages (default=off).  */
   const char *debug_help; /**< @brief Enable debug messages help description.  */
   
   unsigned int help_given ;	/**< @brief Whether help was given.  */
+  unsigned int full_help_given ;	/**< @brief Whether full-help was given.  */
   unsigned int version_given ;	/**< @brief Whether version was given.  */
   unsigned int role_given ;	/**< @brief Whether role was given.  */
   unsigned int auth_file_given ;	/**< @brief Whether auth-file was given.  */
+  unsigned int pass_file_given ;	/**< @brief Whether pass-file was given.  */
+  unsigned int description_given ;	/**< @brief Whether description was given.  */
+  unsigned int quota_given ;	/**< @brief Whether quota was given.  */
   unsigned int config_dir_given ;	/**< @brief Whether config-dir was given.  */
+  unsigned int force_key_given ;	/**< @brief Whether force-key was given.  */
+  unsigned int generate_key_given ;	/**< @brief Whether generate-key was given.  */
+  unsigned int batch_mode_given ;	/**< @brief Whether batch-mode was given.  */
   unsigned int debug_given ;	/**< @brief Whether debug was given.  */
 
   char **inputs ; /**< @brief unamed options (options without names) */
@@ -82,6 +106,8 @@ extern const char *useradd_args_info_usage;
 extern const char *useradd_args_info_description;
 /** @brief all the lines making the help output */
 extern const char *useradd_args_info_help[];
+/** @brief all the lines making the full help output (including hidden options) */
+extern const char *useradd_args_info_full_help[];
 
 /**
  * The command line parser
@@ -143,6 +169,10 @@ int useradd_cmdline_parser_file_save(const char *filename,
  * Print the help
  */
 void useradd_cmdline_parser_print_help(void);
+/**
+ * Print the full help (including hidden options)
+ */
+void useradd_cmdline_parser_print_full_help(void);
 /**
  * Print the version
  */

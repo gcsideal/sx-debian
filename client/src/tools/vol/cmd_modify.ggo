@@ -1,0 +1,22 @@
+package "sxvol"
+args "--unamed-opts --no-handle-version --no-handle-error --file-name=cmd_modify --func-name=modify_cmdline_parser --arg-struct-name=modify_args_info"
+usage "sxvol modify <OPTIONS> sx://[profile@]cluster/volume"
+
+text "\nVolume modification options:\n"
+
+option  "owner"     o "Change the volume owner" string optional typestr="NAME"
+
+option  "size"      s "Set a new size of the volume (allows K,M,G,T suffixes)" string optional typestr="SIZE"
+
+option  "max-revisions"      m "Set a new revisions limit for files in the volume" int optional
+
+option  "reset-custom-meta"    - "Reset custom metadata assigned to the volume" flag off
+
+text "\nAdditional options:\n"
+
+option  "reset-local-config"    - "Reset local configuration of the volume" flag off
+
+option  "debug"                 D "Enable debug messages" flag off
+
+option  "config-dir"            c "Path to SX configuration directory"
+        string typestr="PATH" optional hidden

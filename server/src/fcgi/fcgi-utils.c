@@ -32,14 +32,14 @@
 #include <strings.h>
 #include <stdlib.h>
 
-#include <openssl/evp.h>
-#include <openssl/hmac.h>
+#include "../libsxclient/src/vcrypto.h"
 
 #include "fcgi-utils.h"
 #include "fcgi-actions.h"
 #include "utils.h"
 #include "hashfs.h"
-#include "../libsx/src/misc.h"
+#include "../libsxclient/src/misc.h"
+#include "version.h"
 
 #define MAX_CLOCK_DRIFT 10
 
@@ -47,7 +47,7 @@ uint8_t hashbuf[UPLOAD_CHUNK_SIZE];
 time_t last_flush;
 void send_server_info(void) {
     last_flush = time(NULL);
-    CGI_PRINTF("Server: Skylable SX\r\nSX-Cluster: %s (%s)\r\nVary: Accept-Encoding\r\n", src_version(), sx_hashfs_uuid(hashfs)->string);
+    CGI_PRINTF("Server: Skylable SX\r\nSX-Cluster: %s (%s)%s\r\nSX-API-Version: %u\r\nVary: Accept-Encoding\r\n", src_version(), sx_hashfs_uuid(hashfs)->string, sx_hashfs_uses_secure_proto(hashfs) ? " ssl" : "", SRC_API_VERSION);
 }
 
 static const char *http_err_str(int http_status) {
@@ -107,49 +107,40 @@ static const char *http_err_str(int http_status) {
     return "Unknown error";
 }
 
-#define LOGO1 "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAALMAAABbCAYAAAA4A7QcAAAWu0lEQVR42u2di1Nb153HMZZjiF3QOkzH66ETufVmGdbjUUoycWcbLx1nmnbjtN7ZbsbjSWye4ikQWIDfAWwntpvETkyzmU3XUG/adcNMnMaAJBBIIMDYxJadOC+ThM0mjmcnbbHDH6D9/Y7OuTr36l4hwZUQ+JyZMwI97uPcz/3d3/md3/melBRR5r8UdBuh5kM1LZpzKuoxpxQ78uE1rucUCASkKsp8Q1zYcwIueICrk/C+eUGdR7Fja0qJ40RKqdMDNZBiUamlzin4jgeqDb5vFjAvsrKkuOdtuLABuMChCv/D+7dTCpPcShc7TBTgKQJrmSuQUg61olej0s/xe0G4/bCNAgHzYiiF5DEcCLNk+D9AvdziPJWk7oMRjq9ZAhghrQRYq/qCtRqq1S2v1fR9/LySwk3AJuc7SSy7gHnhlsyq3iZiiXmrFrrAgRWVvWNJaI3NSyzO/wlC3BsEk8FbA7W2P1htisrer6Hf48EOnXM7bN8oYF6A5cHm4WJihfFClvMwuwjMmdV940l1wCXgEljosfIQS/AOBFLqaK1XqewzGwc2/h6hppYabpSrxH0RMC+ssu01/4ORYP5h68ivkwpkPM4K6k7wEDN4d3mC1a5R2ef1Hgo1BZtZamqll5Q5b8fSQRQwJ0GBxk/LOzTSEXQzqKtBO0cZVvfE6eGvcpMSZIRPCTEB1htIaVDURpX38HsMbgY13hh4g1CgU8tc16J1OQTMyQO0afvrV/cjvAhxelXfrdyDw53ej//yE/jMkAQgm1PLXXcIyNUKkBnEPLiNg6HaxFXpfQ5whJq31AxovGGCFtorYF54QGdBfQhqPtSNUNclBchQiIXEaAVvkSVrrIC4KYbKwG5QWGmFhQZ3q1nALMrcC4JU7gr5yDzIs4VYE2ivHGjqQ6eW996Bp4NJwCzKXNwLIwEJLSTr7NXpCLISagY0uhzoQ7NOITwVllW4zgiYRZl1MZS76uXuBeda6AlyGNCeoPW3KdyNCNZZwCxKZJgrer+UrDJzL1hnT2+QJaCpy6F0N6DzCR1ju4BZlNn4ymbJV0arrHQvmuIFM2+dPTLrfE9V33UBsygxl8xadxMJxSXSKmtZ55pQqA5uMqOAWZSYysoat5O4GFIojvOVm+INM2edFa7GCmvfZgGzKDGVDFv/pYS7GFF0BOGJcVTALEpsBaMYaA3DwnGD8YeZuRpSmI7mbgDM2bu9JwXMosRWKufJX1bzm20hvzl796CAWZQYCx9bTqS/LGAWRfei6mIkAcx7BMyixOZi5Btq+6fnzcUQllmUOZcy11YIf3kkq8y7GPMBszJPA/z4R46OWQTMomiXUick3rsmVRPv45mLEUs0g4bmtr1+7UEBsyjhJTifb1KSBpBNhRpQyVlOFMiKODMdNEmvcd/CmTkC5mgL6lQUEUEWD63tSa9dETvE+USvgkyD4iQC2OzqsOlQXv1TPmeRbPTAs76zWqckYFaWop4CmRgL1a4g7+FniwNijzR5lskE8DoXDGY2y7rek1igG7UHTAo63n9SwBwdyPkh/QqnXL/CQqHG7yzEgtP2UY/CogExL9hS45ZrXiQaaA2rnNXg8QOoKwXMUZTlZa6usIvNq+7AZ8ssTt8CtMbNZNo+Ux1SA1kBdHr9wK1NL7/bdvGLO1vWHhp1yP1nT/yADptt0i+F5J4+/V5JpNMUMHNlqcX5raTQw19oJk5CdSwWmEsxqepSKEGm763ZO+SzvvmxjU6ozcYJte+8/83DBhuNOdfFEWjevVBY5TW7B31wLEYBc/ThqXCVHqtcmGRBwIw6E6XOc6GnjArIXDVU903nHhrpPDP29TYAYb0SGgT6qdPv7ZHcD+Z26Al0o4p7QcNxeHyO69/8aKbTFjBzhWhWaMFcFZxUiXoWSW6NtxI1Ti1rzNX0WvetvOfHOkY/m/oZlTVIiwBKVu6h0U552E4HoLVmZlP3wmB1T7d0f1oYjeSCgJkrDx0efTGiZQaYN7SO/DZprXGJ45xMkZP3+6tCAoUI8RO/uXKUuhKmaLU5EPi1B3yOyHFor7r4i5YQTIOKZgbnJz9+6vKRSJ2++MKMKunY4w/VBSOWjT5iRi1YZzVrBv9DsvrEHy5+vSEJQQ63xjzItOKAAwfx6lm2UQ4BWkvVyK6Q5FKrDSoQ1ytcC7DI9FhXx3BsOsCM8v7FjnawDFMaGsNT5PM4LwOgR/F+8pef5DaPdBqqeqd5gWxDZe9001ufbE8WhSHa7miN21UFvnWGWAn0phfH2ySga9Vi0hRs1aomntgvqRil2/pvUddidYzHNQeYg415QqZgWeHSUEmXwD5Bfpe81tlA/ccfW89+ZMOKclnmQyOnDWWuoSSyxuYlpY6rkZTqDVV903pCrHyKHXF8XpKxyzMhj03zUraeUN3F/a0laws3B3ZEfRNTj0XrWugDMwBJGrOMiwAoA/BKlXQKNdXeNSa7lcZePevZE/eiOEkGTWDJBGjD21K0QgEyQpz33AXWsVsdx/ZZidp4eMOgNdUWGh/gan+4LjMwgq4LjabMWl9vdjAjyAhkmSI5RXkitRHEpMsWBtC8xV7b6HEsK3HM76AJuhXMlZNAdklPwbX7hxynR7/6VSwdOx3aZjVaf7TUaFnT6wBs5Ygiq1ynOqvJ69/00ngbhTgnUjQlbjADyG9LIKv6TQqVdKa7Gy4m7V1I0Y5/OXV5B6z+FEjZ2Z146xx06fxhouQVwYqdU+oSzRmKOVpqtKwbL07e3mJ98yPb9vb39ucdHevAiuDiewg9VTo104GZNJ32HyPMOKrEBKeVPdp6FcV0pUI6r71LRtWcWxeQdTamW5y30ksdv08wyGapc10mX/cEO6abXrjURqVwjUnUVgbqpmXRp4SJgmucjT8cF5hBidE3o06vmkK6hpj0suq+9+Gi5MNjM38hAP1Ak/dsys6uQMqOLlOCQN4KfZPbkmvBgbym0eujfnF2iigxwowKjGW0s2dVxBjVFNMbI4hJK9ewqJCtC+chAwC4LBfGUJMoVl3w+tUnEea04p7DiejoSWmo3BIRIGY4vf0/r+2nQ88GgfEsYP6O1V0qs8rRTqmZYchScjsqFaE8FqdmOcW4qmcxAA7War7Ce/iINBR1T0P9Ms4W2RYOshOssYdZ4yyB7xxg/u6ugRckX7k2xlm7M1loGdAc1PxKnkq4i6FDVNTTnGjLbdo10AOdQOgIdpnjBHK7DGSooJM8/cSpy0eFNdYJ5lX1/Z1ylZsYhUFYrirLjKpXiXTIgFaBuix8BVMK9iSd6hR3sB9uHt6DMKeXOtviCjKFOaOGrDj1q3jGjO86mL+32/u7OcPMW2e+Q6i0zryF5oHWglo+vWmSWOzC+Ayf/+yFS5sxRHdPieMr3UEu5qZrQcUVp2ikIk3nfbEcGtNdCfP9ewZf0cUy2+WWOWvvkD/v+MWOvGMXSTwS0xKD9UJHbstIZ5Z9wI8Vw1AhmF2SH6kJdRBsmIyq76hd0G/umaYxZ3M8QIah8+knXiFuxTodAc6HfZyTWf7gk23B5M7oBvMjz1+wzElMT8MqP3ry3YNcLFJZ19HgOtYfY7D9SM9nJdb//tCWd2S0AztEJMfYotphZEAHyCxrHaG+r7rvCsK8osz5nA6QNfOTaA0W53TLOxOFurkV2FlGiJUjh8o+SbC9Cu4KmI+7Pv+BrAMYi8yp0ipz6X5tg//7QKyWkQbfTbRDtPHMhZvbtr9+bf/aPYOO9EqAWwm0DOq5j+Dl7Bl8DbYTuNfivDBH0ArIcVGYM6x9E6OfkmiFbgMLUkKSVrI+c+nYtLBih23Rw0zyE2DsX1UdsiGK0JxKWG7twWGHHr1z9CnpaFMOyRPo/qwk96CvM72i95YK0AGw0u1gWWcd3nukdcSCMJM621LIgQx1bZPXofuKrJilaOG0MdioLUtBqFGZGmYhQOcvapixwCN+s+qacHaNpWYjxZfhpoBx+s3xigezPAHrHz60ISgqQE8BjLMaTs8"
-#define LOGO2 "/NpYPvw+QWjALS1/YbU4tdtxhMOPx0RtRP5BRXoCBrLZoe4RF2JeVu3yLHmayaDmkF8pW66yLsAi4XXtKDHbyEpEUQ12SnDOjN7fltY50GEqd0xLQBOruc7FaaeIGUJgzK11HYzog2NeSop7bbP8MZL3PG55Kdik9V22qk5QgrwA6mDODN5l5UcNMf2SS3A3eQisbiW8sBchr9/vwApoSfLLoipjQJ81rGengLDQCPQWQxXTx0stdt/D395a5YvKblxR1X5VAhrTSeIBMjq+qb1RaykHmFnpU8mbk1wdvgswaWG1qscNMf5iT2zrSGfb4snGzCPjHGJdchL+L1wWM8tgxo8t0ZvSrbWvq+30c0OgyRN2b/5vqvsv426Uljm9jsMrtZF9xBhkLLGQzHhZ9kuXReDV1KvAm+Fu756W7Amb643XWP35kw9m+Mp2yWpXE/Org1Hb8vq6x07lb6vXW339gI1Y2BPSJaH4PN8KfOOtuigLkgmCnMf4gE5htSphV8mgiLFGW3aS+EM6ihJnzRzcipDjLAGcP8GEfnCOGU2K2n35vP52LZkzCRjD6bvz1sTV1YKWDMAeIBZ2hfL/J28Zgzqzq/beIX97ZbUot7LmD21/bEH+QI8LcEB3MP9g31HpXwayAmg1w5HP1IdpLz0ryhkDXY/2m5y+0SUDvjAx09q6BkyxCssradzzSdwHka7jNLGufP1Eu1g8Pj/46bIXVGNyMf/13/+N3JcyLpZBZx+c/LeGGqzWBfuQIjIhSmDOq+1wR3Itm3FZGhWvC/cGfH03UucAo6UbNDqA9cgcQ0wfiNSNEwJzYRlnZ8vaNQglojU6huXnkl2yUEUbuLmmAbMJt4Laa3vw4obobJIx6BMKoswjNzaS4KWBeyECrDIHnHPBtkXJBNAQVlxb3DOLvn3r1yp75sHQYtcmo65+IZdBk04tkTqFRwLwYgS7umV5STAY5ZBGLnIMAM5+5V+qUA0DzLvJahjvms8+AKk1kXIDX0NMYzn6ijYjGZC/Q6yVgnhHoP00UGkoc06DfPMh/9otXr2yQpvvD64oad2hovsRhTC1x3smo6p1I9OCQRuc2ByNOqHOsTDRCyVgcxDozdnPbQp4AIGCOEuinXvPvoSmUNt4n5TXdclpGtrDPYJpTK+Yk/2bgiyeT6DyMNMswH7UrEG7Ut6CptfOmtyFgTnxDZWH+dGpF7x3oINkA3nNg1fy8+nxqtfsL8n5FbzN+7x+Pj72SrIBwabSGRXSNBMxRlTKncZV9oFN1ZSal70lzhI31/W+CJTeJxhMwJ0+xgOpSuWtKlg+sKgzYHyZDtqTSdZt3TUQRMM8nyM0yNf2wNfIG5DKtNoV8QijhvV00poB5/kopWFQ1kCOmu4aLZ3OL+wigBczzUIhApCsKgUgNVXheE4TN4AjOsRMuh4A5gQV0o1PLXF9I2tNaa3doCkUqgOaGiVPLXXeIZp8oAuZEFIgPtxK3INqpYRGVT8NncMD8ujOilRMF8w7QUNvR1Qy1gPytZ9nRlU/qTk4SFv9/Buv5fF32gdt5hu4ntA+jtJ+nz0c8J0OF68swSYX6GEBu8GrKKkjuRkmUqwaw4w5W/S06Xt+deD26aY3DPrC9nz4/Y7vP7loTVvNl9Znz9Bx2drXTTDGW04taxPr5eTuD202zOIKSsDirg+ynK5Beoo+I97LCbh/RUA6eA5l9DQlDL9NzCawocTwXodNnlqxyJP1p+Dvv5GXMucjH1xm1qZm7QRfHBOtcFNVTAo+bXgv4+x3dn0JFPUOSZEJopo0f2k+3RCNDQdcQQBcgr7off/eQkteg3DBKTdGTwmlEmFeA/1vf+GCjbnun899IYntQmpb8j7m+eiWtv9w7+c8k2w2OnSYI2diFyqomyfGa1meFte85VaGbsM6eJ5DdOkqmFZFXNastU3DirDNsH8QQz0ZzLqlFVI6gSJI10DWbLbOydxy3jTPWicYI3deKcqduEhCZZc5xNCLkVeeSWeEaZ0yxa5xd138y5f5dAz9nJ7Ph2eHf4iwRnPSp65As1YlYVevuJIrwkAuMjYjiJzr6TmmYcimTE8ALBslCCHqk34YrnXJWWRGxyG6hMOMrC83Z1WD2Bt0U5jvD9r9T238xirbaKml90ArnUK8rDFUAM1yD+2zuKzitjQnm5Owb3KLbPsoBOLCa5FVvmKuCN2NWjdvPzW4ypeTshRPgpKLgdWqZxXlGV2HvYk60jwoE7jt34xm9cwQwlwInjfLCL4+/dOnITDcmgQxhVpuZYZevKJrdMkJhhldluK5BsSIp852pq7G8uu/mTOeQVu7qJjc7yI2Rdb3h73vKXNd1haG6bxyvw9Jy17cwsDNJrglo3f3i1OUN+lpPgLkiTjDD9V1a6vwWXj1UU9BMsqpyD/g6JY02epfCo9qrY/xWLqINMD96bCw3Hr3bd67+38MMZpQUiCa9MbOuf1wmP7YrWpj5+HMEmNF1oVGNGayyid34DxzwnX3oCKzrzfTzdNSgzrQCzBZOnZ+KTxIjppsrE3QFyGs8YFbwen+D5+fMoq27+PntLShCiHcobbyA3jCjgDZrxNRS57V4rAlIrD11Mf5uz+CrUTUOD3NdJJgH5DDzo4J2z4ww4xy7SMcBfRY7a6u0qt4P76nsvc5ghs/a9IYZ1wy3ngUZs72DDu6mMekGM85gR/9cb5jxyUIFJ1GGDeu+tz65HztnKH06CRC3mltGfkk6BEE/bVpvmP+hefg/cp8d7mQNB9b/7bgEH4u4DmcUBWZkvBGdZQ7BvP7YRXvWfp8/64DPb2jwTssUg5QhOupmkJsmUi+9xPGl8inG2opo1OkJM2x3pbXvE5w5s6qu302VQAPftbl/qifMy0udN8HdaCYTfHd25etmmeFY0ypcXwPYR+H/oyvKXZtxvtrveFVKVv9+7+AfdfWZ4YJkN3pP4lMgy9bvl8QMC6MTX4k5egI1u74/KpjNh0cbQz5zf1Q+M12hlGhI33dg+IomzFx4Lqd5+DXNg0AhRnodUDkftaiJHvXh0Q7pSVnQvVU3y8YtOcFuGJhtPqHXPEDmZnChP+gMOo/qCTPfNyLafzDFfnPuvqFOpqGGoTnUZNNTgQh7nVm1/f71B312/N/94Z8fJe9Z3X4Q7h7Te2AAQ3FY1+8bskfz/dL/uv6wqtaECsz37h68ANa2War1nublTYM3w8J0ytAc3Cw/fXl8m9YxrK51V2J7YLscOHfjn9ga3rh+N2urVVW9x/VoH+gkv4HXA40Kq5uOXWzTM7oEojdvoF4Iqex67B2067btmmBbsbYh15rKVa2jykNMwEVXuDgV/NXMr+XeM+s9M0O5v2jCelkNA/7IcWYuQ66eSwPlw3N2FReDJh2l17hvRbJ6vKXn20PRViad2medov3ZEsAGHa+B2j5WJ/u2F0UhmhGqsWYVoJVVObiikp/x2Ml3D4lW1r+IRCP1RjGSWcwyJaCB8HXBNavCenOpoBl1AxPCcgiYE1oc17/5EU7Bl9wNNSUgu9Iiq+hS20JrheP2mt66sV20roA50Q1jaOn6tJAArVQCUvrIypkm/BQqbrbJ46+8e2Sh6bcJmBdP46yUgFab/yeBPRACWEXyCn9PdamFeyFgnl+gceH1NXvAh65SyAvYVKpCdiCr0eM/PUqWCjaK1hQwJ4XLQRT2wbqicHqYbgar1hDECD+1xuaFrhQkYF6kUQ7MuUZJK1wJgCyNDBVXC8BVA/BvfJ9KXq0X1nj+YP5/oY1ZCUBBrN0AAAAASUVORK5CYII="
+#define HTML_1 "<!DOCTYPE html>\n<html>\n<head>\n<meta http-equiv=\"Content-Type\" content=\"text/html; charset=utf-8\" />\n<title>Skylable - SX Node</title>\n<meta name=\"Description\" content=\"SX Node\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />\n\n<style type=\"text/css\">\n\n        /*IPHONE STYLES*/\n        @media only screen and (max-width: 1110px) {\n\n        .see {\n        position:static!important;\n        text-align: right;\n        margin-left:4px;\n       }  \n\n        }\n\n\n        /*IPHONE STYLES*/\n        @media only screen and (max-width: 920px) {\n         body {\n            display: inline!important;\n         }\n\n         .main {\n          width: 99%%!important;\n          text-align: center;\n          margin: auto;\n         }\n\n         .pp {\n            width: 91%%!important;\n         }\n\n         .pp p {\n            width: 98%%!important;\n         }\n\n        }\n        @media only screen and (max-width: 480px) {\n         body {\n            display: inline!important;\n         }\n\n         .main {\n          width: 99%%!important;\n          text-align: center;\n          margin: auto;\n         }\n\n         .pp {\n            width: 91%%!important;\n         }\n\n         .pp p {\n            width: 98%%!important;\n         }\n\n        }\n        @media only screen and (max-width: 380px) {\n         body {\n            display: inline!important;\n         }            \n         .main {\n          width: 99%%!important;\n          text-align: center;\n          margin: auto;\n         }\n         .pp {\n            width: 91%%!important;\n         }    \n\n         .pp p {\n            width: 98%%!important;\n         }    \n     }\n\nbody, html {\n    margin: 0;\n    padding: 0;\n}\n\nbody {\n    height: 100%%;\n    -moz-background-size: cover;\n    -webkit-background-size: cover;\n    -o-background-size: cover;\n    background-size: cover;\n    display: table;\n    margin:auto;\n    font-family: \"Tahoma\", sans-serif;\n    font-weight: 200;\n    vertical-align: middle;\n}\n\na {\n    color: #0077c1;\n    text-decoration: none;\n}\n\n.main {\n    width:680px;\n    height:%dpx;\n    margin-top: 20%%;\n    margin-bottom: 20%%;\n    text-align: center;\n    background: rgba(255,255,255,0.7);\n    -webkit-box-shadow: 0px 0px 14px 0px rgba(50, 50, 50, 0.8);\n    -moz-box-shadow:    0px 0px 14px 0px rgba(50, 50, 50, 0.8);\n    box-shadow:         0px 0px 14px 0px rgba(50, 50, 50, 0.8);\n}\n\n.main img {\n    margin-top: 40px;\n}\n\nh1 {\n    font-size: 42px;\n    font-weight: 400;\n}\n\n.blue {\n    color: #0077c1;\n}\n\n.pp {\n    background: #fff;\n    margin-top: 30px;\n    margin-left: auto;\n    margin-right: auto;\n    margin-bottom: 40px;\n    width:70%%;\n    padding: 5px;\n    -webkit-box-shadow: 0px 0px 14px 0px rgba(50, 50, 50, 0.8);\n    -moz-box-shadow:    0px 0px 14px 0px rgba(50, 50, 50, 0.8);\n    box-shadow:         0px 0px 14px 0px rgba(50, 50, 50, 0.8);}\n\np {\n    font-size: 16px;\n    border-bottom: 1px solid #cfcfcf;\n    width: 90%%;\n    margin: 5px auto;\n    padding-bottom: 5px;\n}\n\np span {\n    color: #0077c1;\n    font-size: 24px;\n}\n\n.learn {\n    border-radius: 10px;\n    background: #3096d6; /* Old browsers */\n    background: -moz-linear-gradient(top,  #3096d6 0%%, #1f72c0 100%%); /* FF3.6+ */\n    background: -webkit-gradient(linear, left top, left bottom, color-stop(0%%,#3096d6), color-stop(100%%,#1f72c0)); /* Chrome,Safari4+ */\n    background: -webkit-linear-gradient(top,  #3096d6 0%%,#1f72c0 100%%); /* Chrome10+,Safari5.1+ */\n    background: -o-linear-gradient(top,  #3096d6 0%%,#1f72c0 100%%); /* Opera 11.10+ */\n    background: -ms-linear-gradient(top,  #3096d6 0%%,#1f72c0 100%%); /* IE10+ */\n    background: linear-gradient(to bottom,  #3096d6 0%%,#1f72c0 100%%); /* W3C */\n"
+#define HTML_2 "    filter: progid:DXImageTransform.Microsoft.gradient( startColorstr='#3096d6', endColorstr='#1f72c0',GradientType=0 ); /* IE6-9 */\n    padding-top: 15px;\n    padding-bottom: 15px;\n    padding-left: 20px;\n    padding-right: 20px;\n    color: #fff;\n    text-decoration: none;\n    font-family: 'Arial', sans-serif;\n    margin-top: 110px;\n}\n\n.learn:hover {\n    background: #1f72c0; /* Old browsers */\n    background: -moz-linear-gradient(top, #1f72c0 0%, #3096d6 100%); /* FF3.6+ */\n    background: -webkit-gradient(linear, left top, left bottom, color-stop(0%,#1f72c0), color-stop(100%,#3096d6)); /* Chrome,Safari4+ */\n    background: -webkit-linear-gradient(top, #1f72c0 0%,#3096d6 100%); /* Chrome10+,Safari5.1+ */\n    background: -o-linear-gradient(top, #1f72c0 0%,#3096d6 100%); /* Opera 11.10+ */\n    background: -ms-linear-gradient(top, #1f72c0 0%,#3096d6 100%); /* IE10+ */\n    background: linear-gradient(to bottom, #1f72c0 0%,#3096d6 100%); /* W3C */\n    filter: progid:DXImageTransform.Microsoft.gradient( startColorstr='#1f72c0', endColorstr='#3096d6',GradientType=0 ); /* IE6-9 */\n}\n\n.see {\n    position: fixed;\n    right: 20px;\n    bottom: 20px;\n    border: none;\n    font-size:14px;\n    font-weight:bold;\n    padding-top:10px;\n    padding-bottom: 10px;\n    padding-left: 20px;\n    padding-right: 20px;\n    background: rgba(255,255,255,0.7);\n    -webkit-box-shadow: 0px 0px 14px 0px rgba(50, 50, 50, 0.8);\n    -moz-box-shadow:    0px 0px 14px 0px rgba(50, 50, 50, 0.8);\n    box-shadow:         0px 0px 14px 0px rgba(50, 50, 50, 0.8);}\n}\n\n\n</style>\n\n</head>\n\n<body>\n\n<div class=\"main\">\n"
+
+#define LOGO "    <img src=\"data:image/png;base64,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\" />\n"
+
+#define HTML_3 "    <h1>Your <a href=\"http://www.skylable.com/products/sx/\">S<sup>X</sup> node</a> is up and running</h1>\n"
+#define HTML_4 "    <div class=\"pp\">\n            <p><span>Cluster UUID:</span><br> %s</p>\n            <p><span>Node UUID:</span><br> %s</p>\n            <p><span>Distribution:</span><br> %s(%u)</p>\n        </div>\n\n        <p class=\"desc\">Skylable, a complete <a href=\"http://www.skylable.com/how-it-works/\">distributed object-storage</a> software solution.</p><br>\n\n    <a class=\"learn\" href=\"http://www.skylable.com\">Learn More</a>\n</div>\n\n<a class=\"see\" href=\"http://www.skylable.com/docs/faq/#error-messages-interpretation\">Why am I seeing this page?</a>\n\n</body>\n</html>\n"
 static void print_html(int status, const char *title, int errnum, const char *errmsg)
 {
     if (status)
 	CGI_PRINTF("Status: %d\r\n", status);
-    CGI_PRINTF("Content-Type: text/html\r\n\r\n\
-<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0 Strict//EN\" \"http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd\">\n\
-<html>\
-    <head><title>%s</title></head>", title);
-    CGI_PUTS("<body style='background-color:#9fcdea'>\
-        <div style='position:absolute; top:50%; height:20em; margin-top: -10em; text-align:center; width: 90%;'>\
-            <img src=\"");
-    CGI_PUTS(LOGO1);/* too large to put into printf */
-    CGI_PUTS(LOGO2);
-    CGI_PUTS("\"/>");
+    CGI_PRINTF("Content-Type: text/html\r\n\r\n");
+    CGI_PRINTF(HTML_1, errmsg ? 653: 600);
+    CGI_PUTS(HTML_2);
+    CGI_PUTS(LOGO);
+    CGI_PUTS(HTML_3);
     if (errmsg)
-        CGI_PRINTF("<h2>Error %d</h2><pre>%s</pre>", errnum, errmsg);
-    CGI_PUTS("\
-            <h2>\
-                This is an <a href=\"http://www.skylable.com/products/sx\">"SERVER_NAME" node</a>\
-            </h2>\
-        </div>\
-        <div style=\"position: absolute; bottom:1em; right: 1em; border: #ddd 1px solid; font: 10px normal; color: #07c;\">");
-
+        CGI_PRINTF("<h2>Error %d: %s</h2>", errnum, errmsg);
     unsigned int version;
     const sx_uuid_t *cluster_uuid = sx_hashfs_uuid(hashfs);
     const sx_uuid_t *dist_uuid = sx_hashfs_distinfo(hashfs, &version, NULL);
     sx_uuid_t node_uuid;
-    CGI_PRINTF("Cluster UUID: %s<br>Node UUID: %s<br>Distribution: ", cluster_uuid->string, sx_hashfs_self_uuid(hashfs, &node_uuid) == OK ? node_uuid.string : "&lt;not assigned yet&gt;");
-    if(dist_uuid)
-	CGI_PRINTF("%s(%u)", dist_uuid->string, version);
-    else
-	CGI_PUTS("&lt;not defined yet&gt;");
-    CGI_PUTS("\
-        </div>\
-    </body>\
-</html>");
+    CGI_PRINTF(HTML_4,
+               cluster_uuid->string,
+               sx_hashfs_self_uuid(hashfs, &node_uuid) == OK ? node_uuid.string : "&lt;not assigned yet&gt;",
+               dist_uuid ? dist_uuid->string : "&lt;not defined yet&gt;",
+               dist_uuid ? version : 0
+               );
 }
 
 static void send_error_helper(const char sep, int errnum, const char *message) {
+    sx_uuid_t node_uuid;
     CGI_PRINTF("%c\"ErrorMessage\":", sep);
-    json_send_qstring(message);
+    json_send_qstring(message ? message : "");
     if (errnum == 500 || errnum == 400) {
         if (message)
             WARN("HTTP %d: %s", errnum, message);
@@ -157,19 +148,24 @@ static void send_error_helper(const char sep, int errnum, const char *message) {
         json_send_qstring(msg_log_end());
     }
     CGI_PUTS(",\"NodeId\":");
-    const sx_node_t *me = sx_hashfs_self(hashfs);
-    json_send_qstring(me ? sx_node_uuid(me)->string : "<UNKNOWN>");
+    json_send_qstring(sx_hashfs_self_uuid(hashfs, &node_uuid)==OK ? node_uuid.string : "<UNKNOWN>");
     CGI_PUTS(",\"ErrorId\":");
     json_send_qstring(msg_get_id());
     CGI_PUTC('}');
 }
 
 void send_partial_error(const char *message, rc_ty rc) {
-    msg_set_reason("%s: %s", message, rc2str(rc));
-    send_error_helper(',', 500, rc2str(rc));
+    char *reason = *msg_get_reason() ? strdup(msg_get_reason()) : NULL;
+    msg_set_reason("%s: %s", message, reason ? reason : rc2str(rc));
+    free(reason);
+    send_error_helper(',', 500, msg_get_reason());
 }
 
+static sxi_hmac_sha1_ctx *hmac_ctx;
+static sxi_md_ctx *body_ctx;
 void send_error(int errnum, const char *message) {
+    sxi_hmac_sha1_cleanup(&hmac_ctx);
+    sxi_md_cleanup(&body_ctx);
     if(!message || !*message)
 	message = http_err_str(errnum);
 
@@ -192,6 +188,8 @@ void send_error(int errnum, const char *message) {
 
 void send_home(void) {
     print_html(0, SERVER_NAME, 0, NULL);
+    sxi_hmac_sha1_cleanup(&hmac_ctx);
+    sxi_md_cleanup(&body_ctx);
 }
 
 int is_http_10(void) {
@@ -199,95 +197,20 @@ int is_http_10(void) {
     return strcmp(proto, "HTTP/1.0") == 0;
 }
 
-static int hmac_update_str(HMAC_CTX *ctx, const char *str) {
-    int r = sxi_hmac_update(ctx, (unsigned char *)str, strlen(str));
-    if(r)
-	r = sxi_hmac_update(ctx, (unsigned char *)"\n", 1);
-    if(!r)
-	WARN("hmac_update failed for '%s'", str);
-    return r;
-}
-
 uint8_t user[AUTH_UID_LEN], rhmac[20];
 sx_uid_t uid;
+int64_t user_quota;
 static sx_priv_t role;
 
 static enum authed_t { AUTH_NOTAUTH, AUTH_BODYCHECK, AUTH_BODYCHECKING, AUTH_OK } authed;
-static HMAC_CTX hmac_ctx;
-static EVP_MD_CTX body_ctx;
-
-static void auth_begin(void) {
-    const char *param = FCGX_GetParam("HTTP_AUTHORIZATION", envp);
-    uint8_t buf[AUTHTOK_BIN_LEN], key[AUTH_KEY_LEN];
-    unsigned int blen = sizeof(buf);
-    time_t reqdate, now;
-
-    if(!param || strlen(param) != lenof("SKY ") + AUTHTOK_ASCII_LEN || strncmp(param, "SKY ", 4))
-	return;
-
-    if(sxi_b64_dec_core(param+4, buf, &blen) || blen != sizeof(buf))
-	return;
-    memcpy(user, buf, sizeof(user));
-    memcpy(rhmac, buf+20, sizeof(rhmac));
-
-    if(sx_hashfs_get_user_info(hashfs, user, &uid, key, &role) != OK) /* no such user */ {
-        WARN("No such user: %s", param+4);
-       return;
-    }
-    DEBUG("Request from uid %lld", (long long)uid);
-
-    if(!sxi_hmac_init_ex(&hmac_ctx, key, sizeof(key), EVP_sha1(), NULL)) {
-        WARN("hmac_init failed");
-        quit_errmsg(500, "Failed to initialize crypto engine");
-    }
-
-    param = FCGX_GetParam("REQUEST_METHOD", envp);
-    if(!param)
-	return;
-    if(!hmac_update_str(&hmac_ctx, param))
-        quit_errmsg(500, "Failed to initialize crypto engine");
-
-    param = FCGX_GetParam("REQUEST_URI", envp);
-    if(!param)
-	return;
-    if(!hmac_update_str(&hmac_ctx, param+1))
-        quit_errmsg(500, "Failed to initialize crypto engine");
-
-    param = FCGX_GetParam("HTTP_DATE", envp);
-    if(!param)
-        quit_errmsg(400, "Missing Date: header");
-    if(httpdate_to_time_t(param, &reqdate))
-        quit_errmsg(400, "Date header in wrong format");
-    now = time(NULL);
-    if(reqdate < now - MAX_CLOCK_DRIFT * 60 || reqdate > now + MAX_CLOCK_DRIFT * 60)
-        quit_errmsg(400, "Client clock drifted more than "STRIFY(MAX_CLOCK_DRIFT)" minutes");
-    if(!hmac_update_str(&hmac_ctx, param))
-        quit_errmsg(500, "Failed to initialize crypto engine");
-
-    if(!content_len()) {
-	uint8_t chmac[20];
-	unsigned int chmac_len = 20;
-	if(!hmac_update_str(&hmac_ctx, "da39a3ee5e6b4b0d3255bfef95601890afd80709"))
-            quit_errmsg(500, "Failed to initialize crypto engine");
-	if(!sxi_hmac_final(&hmac_ctx, chmac, &chmac_len))
-            quit_errmsg(500, "Failed to initialize crypto engine");
-	if(!hmac_compare(chmac, rhmac, sizeof(rhmac))) {
-	    authed = AUTH_OK;
-	} else {
-	    /* WARN("auth mismatch"); */
-	}
-	return;
-    } else
-	authed = AUTH_BODYCHECK;
-}
 
 int get_body_chunk(char *buf, int buflen) {
     int r = FCGX_GetStr(buf, buflen, fcgi_in);
     if(r>=0) {
 	if(authed == AUTH_BODYCHECK)
 	    authed = AUTH_BODYCHECKING;
-	if(authed == AUTH_BODYCHECKING && !EVP_DigestUpdate(&body_ctx, buf, r)) {
-            WARN("EVP_DigestUpdate failed");
+	if(authed == AUTH_BODYCHECKING && !sxi_sha1_update(body_ctx, buf, r)) {
+            WARN("digest update failed");
 	    authed = AUTH_NOTAUTH;
 	    return -1;
 	}
@@ -307,16 +230,16 @@ void auth_complete(void) {
     if(authed != AUTH_BODYCHECK && authed != AUTH_BODYCHECKING)
 	goto auth_complete_fail;
     
-    if(!EVP_DigestFinal(&body_ctx, d, NULL))
+    if(!sxi_sha1_final(body_ctx, d, NULL))
         quit_errmsg(500, "Failed to initialize crypto engine");
 
     bin2hex(d, sizeof(d), content_hash, sizeof(content_hash));
     content_hash[sizeof(content_hash)-1] = '\0';
     
-    if(!hmac_update_str(&hmac_ctx, content_hash))
+    if(!sxi_hmac_sha1_update_str(hmac_ctx, content_hash))
         quit_errmsg(500, "Failed to initialize crypto engine");
 
-    if(!sxi_hmac_final(&hmac_ctx, d, &dlen))
+    if(!sxi_hmac_sha1_final(hmac_ctx, d, &dlen))
         quit_errmsg(500, "Failed to initialize crypto engine");
 
     if(!hmac_compare(d, rhmac, sizeof(rhmac))) {
@@ -338,11 +261,11 @@ int is_sky(void) {
 }
 
 void send_authreq(void) {
-    CGI_PUTS("WWW-Authenticate: SKY realm=\""SERVER_NAME"\"\r\n");
+    CGI_PUTS("WWW-Authenticate: SKY realm=\"SXAUTH\"\r\n");
     quit_errmsg(401, "Invalid credentials");
 }
 
-static char *inplace_urldecode(char *s, char forbid, char dedup, int *has_forbidden) {
+static char *inplace_urldecode(char *s, char forbid, char dedup, int *has_forbidden, int plusdec) {
     enum { COPY, PCT } mode = COPY;
     char *src = s, *dst = s, c;
     int v;
@@ -364,7 +287,9 @@ static char *inplace_urldecode(char *s, char forbid, char dedup, int *has_forbid
 		mode = PCT;
 		break;
 	    }
-	    if(dst != src - 1)
+	    if(plusdec && c == '+')
+		*dst = ' ';
+	    else if(dst != src - 1)
 		*dst = c;
 	    dst++;
 	    if(dedup && c == dedup) {
@@ -424,6 +349,17 @@ const char *get_arg(const char *arg) {
     return ret;
 }
 
+int get_arg_uint(const char *arg) {
+    const char *str = get_arg(arg);
+    if (!str)
+        return -1;
+    char *eon;
+    int n = strtol(str, &eon, 10);
+    if (*eon || n < 0)
+        return -1;
+    return n;
+}
+
 int arg_is(const char *arg, const char *ref) {
     const char *val = get_arg(arg);
     if(!val) return 0;
@@ -439,34 +375,48 @@ int arg_is(const char *arg, const char *ref) {
  */
 static char reqbuf[8174];
 void handle_request(void) {
-    const char *param;
+    const char *param, *p_method, *p_uri;
     char *argp;
     unsigned int plen;
+    int cluster_readonly = 0;
+
+    if(sx_hashfs_cluster_get_mode(hashfs, &cluster_readonly)) {
+        CRIT("Failed to get cluster operating mode");
+        quit_errmsg(500, "Internal error: failed to check cluster operating mode");
+    }
+
+    if(sx_hashfs_distcheck(hashfs) < 0) {
+	CRIT("Failed to reload distribution");
+	quit_errmsg(503, "Internal error: failed to load distribution");
+    }
+
+    if(sx_hashfs_is_orphan(hashfs))
+	quit_errmsg(410, "This node is no longer a cluster member");
 
     msg_new_id();
     verb = VERB_UNSUP;
-    param = FCGX_GetParam("REQUEST_METHOD", envp);
-    if(param) {
-	plen = strlen(param);
+    p_method = FCGX_GetParam("REQUEST_METHOD", envp);
+    if(p_method) {
+	plen = strlen(p_method);
 	switch(plen) {
 	case 3:
-	    if(!memcmp(param, "GET", 4))
+	    if(!memcmp(p_method, "GET", 4))
 		verb = VERB_GET;
-	    else if(!memcmp(param, "PUT", 4))
+	    else if(!memcmp(p_method, "PUT", 4))
 		verb = VERB_PUT;
 	    break;
 	case 4:
-	    if(!memcmp(param, "HEAD", 5))
+	    if(!memcmp(p_method, "HEAD", 5))
 		verb = VERB_HEAD;
-	    else if(!memcmp(param, "POST", 5))
+	    else if(!memcmp(p_method, "POST", 5))
 		verb = VERB_POST;
 	    break;
 	case 6:
-	    if(!memcmp(param, "DELETE", 7))
+	    if(!memcmp(p_method, "DELETE", 7))
 		verb = VERB_DELETE;
 	    break;
 	case 7:
-	    if(!memcmp(param, "OPTIONS", 8)) {
+	    if(!memcmp(p_method, "OPTIONS", 8)) {
 		CGI_PUTS("Allow: GET,HEAD,OPTIONS,PUT,DELETE\r\nContent-Length: 0\r\n\r\n");
 		return;
 	    }
@@ -479,11 +429,11 @@ void handle_request(void) {
     if(content_len()<0 || (verb != VERB_PUT && content_len()))
 	quit_errmsg(400, "Invalid Content-Length: must be positive and method must be PUT");
 
-    param = FCGX_GetParam("REQUEST_URI", envp);
-    if(!param)
+    p_uri = param = FCGX_GetParam("REQUEST_URI", envp);
+    if(!p_uri)
 	quit_errmsg(400, "No URI provided");
-    plen = strlen(param);
-    if(*param != '/')
+    plen = strlen(p_uri);
+    if(*p_uri != '/')
 	quit_errmsg(400, "URI must start with /");
     if(plen > sizeof(reqbuf) - 1)
 	quit_errmsg(414, "URL too long: request line must be <8k");
@@ -519,7 +469,7 @@ void handle_request(void) {
 		    } while(*nextarg == '&');
 		}
 		if(*argp) {
-		    if(!(args[nargs] = inplace_urldecode(argp, 0, 0, NULL)))
+		    if(!(args[nargs] = inplace_urldecode(argp, 0, 0, NULL, 1)))
 			quit_errmsg(400, "Invalid URL encoding");
 		    if(utf8_validate_len(args[nargs]) < 0)
 			quit_errmsg(400, "Parameters with invalid utf-8 encoding");
@@ -548,7 +498,7 @@ void handle_request(void) {
     volume = *reqbuf ? reqbuf : NULL;
 
     int forbidden = 0;
-    if((volume && !inplace_urldecode(volume, '/', 0, &forbidden)) || (path && !inplace_urldecode(path, '/', '/', &forbidden))) {
+    if((volume && !inplace_urldecode(volume, '/', 0, &forbidden, 0)) || (path && !inplace_urldecode(path, '/', '/', &forbidden, 0))) {
         if (forbidden)
             quit_errmsg(400, "Volume or path with forbidden %2f or %00");
         else
@@ -556,22 +506,22 @@ void handle_request(void) {
     }
 
     int vlen = volume ? utf8_validate_len(volume) : 0;
-    int flen = path ? utf8_validate_len(path) : 0;
+    int flen = path ? strlen(path) : 0;
 
     if (vlen < 0 || flen < 0)
        quit_errmsg(400, "URL with invalid utf-8 encoding");
 
     if (is_reserved()) {
-        /* No UTF8 used on reserved volumes, allow higher limit.
-         * Otherwise we hit the 512 limit with batch requests already */
-        if (path && strlen(path) > SXLIMIT_MAX_FILENAME_LEN * 12) {
-            msg_set_reason("Path too long: filename must be <%d characters (%ld)",
-                           SXLIMIT_MAX_FILENAME_LEN*12+ 1, strlen(path));
+        /* No UTF8/url-encoding used on reserved volumes, allow higher limit.
+         * Otherwise we hit the 1024 limit with batch requests already */
+        if (path && strlen(path) > SXLIMIT_MAX_FILENAME_LEN * 3) {
+            msg_set_reason("Path too long: filename must be <%d bytes (%ld)",
+                           SXLIMIT_MAX_FILENAME_LEN*3+ 1, strlen(path));
             quit_errmsg(414, msg_get_reason());
         }
     } else {
         if (flen > SXLIMIT_MAX_FILENAME_LEN) {
-            msg_set_reason("Path too long: filename must be <%d UTF8 characters (%d)",
+            msg_set_reason("Path too long: filename must be <%d bytes (%d)",
                            SXLIMIT_MAX_FILENAME_LEN + 1, flen);
             quit_errmsg(414, msg_get_reason());
         }
@@ -582,13 +532,89 @@ void handle_request(void) {
         quit_errmsg(414, msg_get_reason());
     }
 
-    if(!EVP_DigestInit(&body_ctx, EVP_sha1()))
+    body_ctx = sxi_md_init();
+    if (!body_ctx || !sxi_sha1_init(body_ctx))
 	quit_errmsg(500, "Failed to initialize crypto engine");
-    HMAC_CTX_init(&hmac_ctx);
+    hmac_ctx = sxi_hmac_sha1_init();
+    if (!hmac_ctx)
+        quit_errmsg(503, "Cannot initialize crypto library");
 
     authed = AUTH_NOTAUTH;
     role = PRIV_NONE;
-    auth_begin();
+
+
+    /* Begin auth check */
+    uint8_t buf[AUTHTOK_BIN_LEN], key[AUTH_KEY_LEN];
+    unsigned int blen = sizeof(buf);
+    time_t reqdate, now;
+
+    param = FCGX_GetParam("HTTP_AUTHORIZATION", envp);
+    if(!param || strlen(param) != lenof("SKY ") + AUTHTOK_ASCII_LEN || strncmp(param, "SKY ", 4)) {
+	if(volume) {
+	    send_authreq();
+	    return;
+	}
+	quit_home();
+    }
+
+    if(sxi_b64_dec_core(param+4, buf, &blen) || blen != sizeof(buf)) {
+	send_authreq();
+	return;
+    }
+
+    memcpy(user, buf, sizeof(user));
+    memcpy(rhmac, buf+20, sizeof(rhmac));
+
+    if(sx_hashfs_get_user_info(hashfs, user, &uid, key, &role, NULL, &user_quota) != OK) /* no such user */ {
+	DEBUG("No such user: %s", param+4);
+	send_authreq();
+	return;
+    }
+    DEBUG("Request from uid %lld", (long long)uid);
+    if(cluster_readonly && (verb == VERB_PUT || verb == VERB_DELETE) && !has_priv(PRIV_CLUSTER) && !has_priv(PRIV_ADMIN))
+        quit_errmsg(503, "Cluster is in read-only mode");
+
+    if(!sxi_hmac_sha1_init_ex(hmac_ctx, key, sizeof(key))) {
+	WARN("hmac_init failed");
+	quit_errmsg(500, "Failed to initialize crypto engine");
+    }
+
+    if(!sxi_hmac_sha1_update_str(hmac_ctx, p_method))
+	quit_errmsg(500, "Crypto error authenticating the request");
+
+    if(!sxi_hmac_sha1_update_str(hmac_ctx, p_uri+1))
+	quit_errmsg(500, "Crypto error authenticating the request");
+
+    param = FCGX_GetParam("HTTP_DATE", envp);
+    if(!param)
+	quit_errmsg(400, "Missing Date: header");
+    if(httpdate_to_time_t(param, &reqdate))
+	quit_errmsg(400, "Date header in wrong format");
+    now = time(NULL);
+    if(reqdate < now - MAX_CLOCK_DRIFT * 60 || reqdate > now + MAX_CLOCK_DRIFT * 60) {
+	CGI_PUTS("WWW-Authenticate: SKY realm=\"SXCLOCK\"\r\n");
+	quit_errmsg(401, "Client clock drifted more than "STRIFY(MAX_CLOCK_DRIFT)" minutes");
+    }
+    if(!sxi_hmac_sha1_update_str(hmac_ctx, param))
+	quit_errmsg(500, "Crypto error authenticating the request");
+
+    if(!content_len()) {
+	/* If no body is present, complete authentication now */
+	uint8_t chmac[20];
+	unsigned int chmac_len = 20;
+	if(!sxi_hmac_sha1_update_str(hmac_ctx, "da39a3ee5e6b4b0d3255bfef95601890afd80709"))
+	    quit_errmsg(500, "Crypto error authenticating the request");
+	if(!sxi_hmac_sha1_final(hmac_ctx, chmac, &chmac_len))
+	    quit_errmsg(500, "Crypto error authenticating the request");
+	if(!hmac_compare(chmac, rhmac, sizeof(rhmac))) {
+	    authed = AUTH_OK;
+	} else {
+	    /* WARN("auth mismatch"); */
+	    send_authreq();
+	    return;
+	}
+    } else /* Otherwise set it as pending */
+	authed = AUTH_BODYCHECK;
 
     if(has_priv(PRIV_CLUSTER) && sx_hashfs_uses_secure_proto(hashfs) != is_https() &&
        !sx_storage_is_bare(hashfs)) {
@@ -603,12 +629,6 @@ void handle_request(void) {
 	quit_errmsg(403, sx_hashfs_uses_secure_proto(hashfs) ? "Cluster operations require SECURE mode" : "Cluster operations require INSECURE mode");
     }
 
-    int dc = sx_hashfs_distcheck(hashfs);
-    if(dc < 0) {
-	CRIT("Failed to reload distribution");
-	/* MODHDIST: should die here */
-    }
-
     if(!volume)
 	cluster_ops();
     else if(!path)
@@ -617,10 +637,10 @@ void handle_request(void) {
 	file_ops();
 
     if(authed == AUTH_BODYCHECKING)
-	WARN("FIXME: Security fail");
+	DEBUG("Bad request signature");
 
-    HMAC_CTX_cleanup(&hmac_ctx);
-    EVP_MD_CTX_cleanup(&body_ctx);
+    sxi_hmac_sha1_cleanup(&hmac_ctx);
+    sxi_md_cleanup(&body_ctx);
 }
 
 int64_t content_len(void) {
@@ -635,7 +655,7 @@ int get_priv(int volume_priv) {
     sx_priv_t mypriv;
     if(role < PRIV_ADMIN && volume_priv) {
 	/* Volume specific check, requires lookup */
-	if(sx_hashfs_get_access(hashfs, uid, volume, &mypriv) != OK) {
+	if(sx_hashfs_get_access(hashfs, user, volume, &mypriv) != OK) {
 	    WARN("Unable to lookup volume access for uid %llu", (long long int )uid);
 	    return 0;
 	}
@@ -643,7 +663,7 @@ int get_priv(int volume_priv) {
 	/* Non volume check, use the base role */
         mypriv = 0;
         if (role >= PRIV_ADMIN)
-            mypriv |= PRIV_READ | PRIV_WRITE | PRIV_OWNER | PRIV_ADMIN;/* admin has all below */
+            mypriv |= PRIV_READ | PRIV_WRITE | PRIV_MANAGER | PRIV_OWNER | PRIV_ADMIN;/* admin has all below */
         if (role >= PRIV_CLUSTER)
             mypriv |= PRIV_CLUSTER;
     }
@@ -651,7 +671,7 @@ int get_priv(int volume_priv) {
 }
 
 int has_priv(sx_priv_t reqpriv) {
-    return get_priv(!(reqpriv & ~(PRIV_READ | PRIV_WRITE | PRIV_OWNER))) & reqpriv;
+    return get_priv(!(reqpriv & ~(PRIV_READ | PRIV_WRITE | PRIV_MANAGER | PRIV_OWNER))) & reqpriv;
 }
 
 int is_reserved(void) {
@@ -663,9 +683,6 @@ int volume_exists(void) {
     return (sx_hashfs_volume_by_name(hashfs, volume, &vol) == OK);
 }
 
-/* FIXME: this does not handle UTF8! we must convert utf8 to utf32 for printing
- * with \u, and we must replace invalid utf8 characters with the unicode
- * replacement char. */
 void json_send_qstring(const char *s) {
     const char *hex_digits = "0123456789abcdef", *begin = s;
     unsigned int len = 0;
@@ -688,6 +705,48 @@ void json_send_qstring(const char *s) {
 	    escaped[4] = hex_digits[c >> 4];
 	    escaped[5] = hex_digits[c & 0xf];
 	    CGI_PUTD(escaped, 6);
+	} else
+	    len++;
+    }
+}
+
+int json_qstring(char *buf, unsigned int buflen, const char *s) {
+    const char *hex_digits = "0123456789abcdef", *begin = s;
+    unsigned int len = 0;
+    char escaped[6] = { '\\', 'u', '0', '0', 'x', 'x' };
+
+    if(buflen < 3)
+	return -1;
+
+    *buf = '"';
+    buf++;
+    buflen--;
+    while(1) {
+	unsigned char c = begin[len];
+	/* flush on end of string and escape quotation mark, reverse solidus,
+	 * and the control characters (U+0000 through U+001F) */
+	if(c < ' ' || c == '"' || c== '\\') {
+	    if(buflen < len + 2) /* Also check for close quote and NUL */
+		return -1;
+	    if(len) { /* flush */
+		memcpy(buf, begin, len);
+		buf += len;
+		buflen -= len;
+	    }
+	    begin = &begin[len+1];
+	    len = 0;
+	    if(!c) {
+		buf[0] = '"';
+		buf[1] = '\0';
+		return 0;
+	    }
+	    escaped[4] = hex_digits[c >> 4];
+	    escaped[5] = hex_digits[c & 0xf];
+	    if(buflen < 6 + 2)
+		return -1;
+	    memcpy(buf, escaped, 6);
+	    buf += 6;
+	    buflen -= 6;
 	} else
 	    len++;
     }
@@ -771,7 +830,7 @@ void send_nodes_randomised(const sx_nodelist_t *nodes) {
 	    continue;
 
 	for(i=pos-1; i>=1; i--) {
-	    j = rand() % (i+1);
+	    j = sxi_rand() % (i+1);
 	    if(i == j)
 		continue;
 	    t = list[i];
@@ -799,14 +858,12 @@ void send_nodes_randomised(const sx_nodelist_t *nodes) {
 }
 
 void send_job_info(job_t job) {
-    /* FIXME:
-     * For now we just output the job id integer as a string.
-     * The client will treat it as an opaque type and simply
-     * replay it back as is when polling
-     * Therefore the format can be changed server side at any
-     * time if we see the need for that */
+    sx_uuid_t node;
+    rc_ty s = sx_hashfs_self_uuid(hashfs, &node);
 
-    CGI_PUTS("Content-Type: application/json\r\n\r\n{\"requestId\":\"");
+    if(s)
+	quit_errmsg(rc2http(s), msg_get_reason());
+    CGI_PRINTF("Content-Type: application/json\r\n\r\n{\"requestId\":\"%s:", node.string);
     CGI_PUTLL(job);
     CGI_PUTS("\",\"minPollInterval\":100,\"maxPollInterval\":6000}");
 }
@@ -814,4 +871,50 @@ void send_job_info(job_t job) {
 int is_https(void) {
     const char *proto = FCGX_GetParam("HTTPS", envp);
     return (proto && !strcasecmp(proto, "on"));
+}
+
+int is_object_fresh(const sx_hash_t *etag, char type, unsigned int last_modified) {
+    char tagbuf[3 + sizeof(*etag) * 2 + 1];
+    const char *cond;
+    int is_cached = 0, skip_modsince = 0;
+
+    CGI_PUTS("Cache-control: public, must-revalidate\r\n");
+
+    if(etag) {
+	tagbuf[0] = '"';
+	tagbuf[1] = type;
+	bin2hex(etag, sizeof(*etag), tagbuf + 2, sizeof(tagbuf) - 2);
+	tagbuf[sizeof(tagbuf) - 2] = '"';
+	tagbuf[sizeof(tagbuf) - 1] = '\0';
+	CGI_PRINTF("ETag: %s\r\n", tagbuf);
+    }
+
+    if(last_modified != NO_LAST_MODIFIED) {
+	CGI_PUTS("Last-Modified: ");
+	send_httpdate(last_modified);
+	CGI_PUTS("\r\n");
+    } else
+	skip_modsince = 1;
+
+    if(etag && (cond = FCGX_GetParam("HTTP_IF_NONE_MATCH", envp))) {
+	if(!strcmp(tagbuf, cond))
+	    is_cached = 1;
+	else
+	    skip_modsince = 1;
+    }
+
+    if(!skip_modsince && (cond = FCGX_GetParam("HTTP_IF_MODIFIED_SINCE", envp))) {
+	time_t modsince;
+	if(!httpdate_to_time_t(cond, &modsince) && modsince >= last_modified)
+	    is_cached = 1;
+	else
+	    is_cached = 0;
+    }
+
+    if(is_cached) {
+	CGI_PUTS("Status: 304\r\n\r\n");
+	return 1;
+    }
+
+    return 0;
 }

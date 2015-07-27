@@ -32,6 +32,7 @@
 #include <sys/types.h>
 
 #include "sx.h"
+#define ZLIB_CONST
 #include "zlib.h"
 
 #define ERROR(...)	sxc_filter_msg(handle, SX_LOG_ERR, __VA_ARGS__)
@@ -47,7 +48,7 @@ static int zcomp_init(const sxf_handle_t *handle, void **ctx)
     return 0;
 }
 
-static int zcomp_configure(const sxf_handle_t *handle, const char *cfgstr, const char *cfgdir, void **cfgdata, unsigned int *cfgdata_len)
+static int zcomp_configure(const sxf_handle_t *handle, const char *cfgstr, const char *cfgdir, void **cfgdata, unsigned int *cfgdata_len, sxc_meta_t *custom_meta)
 {
 	const char *pt = cfgstr;
 
@@ -86,7 +87,7 @@ static int zcomp_shutdown(const sxf_handle_t *handle, void *ctx)
     return 0;
 }
 
-static int zcomp_data_prepare(const sxf_handle_t *handle, void **ctx, const char *filename, const char *cfgdir, const void *cfgdata, unsigned int cfgdata_len, sxf_mode_t mode)
+static int zcomp_data_prepare(const sxf_handle_t *handle, void **ctx, const char *filename, const char *cfgdir, const void *cfgdata, unsigned int cfgdata_len, sxc_meta_t *custom_meta, sxf_mode_t mode)
 {
 	struct zcomp_ctx *zctx;
 	int level = Z_DEFAULT_COMPRESSION;
@@ -216,23 +217,27 @@ static int zcomp_data_finish(const sxf_handle_t *handle, void **ctx, sxf_mode_t 
 sxc_filter_t sxc_filter={
 /* int abi_version */		    SXF_ABI_VERSION,
 /* const char *shortname */	    "zcomp",
-/* const char *fullname */	    "Zlib Compression Filter",
+/* const char *shortdesc */	    "Compress files using zlib",
 /* const char *summary */	    "The filter automatically compresses and decompresses all data using zlib library.",
 /* const char *options */	    "level:N (N = 1..9)",
 /* const char *uuid */		    "d5dbdf0a-fb17-4d1b-a9ce-4060317af5b5",
 /* sxf_type_t type */		    SXF_TYPE_COMPRESS,
-/* int version[2] */		    {0, 2},
+/* int version[2] */		    {1, 1},
 /* int (*init)(const sxf_handle_t *handle, void **ctx) */	    zcomp_init,
 /* int (*shutdown)(const sxf_handle_t *handle, void *ctx) */    zcomp_shutdown,
-/* int (*configure)(const char *cfgstr, const char *cfgdir, void **cfgdata, unsigned int *cfgdata_len) */
+/* int (*configure)(const sxf_handle_t *handle, const char *cfgstr, const char *cfgdir, void **cfgdata, unsigned int *cfgdata_len, sxc_meta_t *custom_meta) */
 				    zcomp_configure,
-/* int (*data_prepare)(const sxf_handle_t *handle, void **ctx, const char *filename, const char *cfgdir, const void *cfgdata, unsigned int cfgdata_len, sxf_mode_t mode) */
+/* int (*data_prepare)(const sxf_handle_t *handle, void **ctx, const char *filename, const char *cfgdir, const void *cfgdata, unsigned int cfgdata_len, sxc_meta_t *custom_meta, sxf_mode_t mode) */
 				    zcomp_data_prepare,
 /* ssize_t (*data_process)(const sxf_handle_t *handle, void *ctx, const void *in, size_t insize, void *out, size_t outsize, sxf_mode_t mode, sxf_action_t *action) */
 				    zcomp_data_process,
 /* int (*data_finish)(const sxf_handle_t *handle, void **ctx, sxf_mode_t mode) */
 				    zcomp_data_finish,
 /* int (*file_process)(const sxf_handle_t *handle, void *ctx, const char *filename, sxc_metalist_t **metalist, sxc_meta_t *meta, const char *cfgdir, const void *cfgdata, unsigned int cfgdata_len, sxf_mode_t mode) */
+				    NULL,
+/* void (*file_notify)(const sxf_handle_t *handle, void *ctx, const void *cfgdata, unsigned int cfgdata_len, sxf_mode_t mode, const char *source_cluster, const char *source_volume, const char *source_path, const char *dest_cluster, const char *dest_volume, const char *dest_path) */
+				    NULL,
+/* int (*file_update)(const sxf_handle_t *handle, void *ctx, const void *cfgdata, unsigned int cfgdata_len, sxf_mode_t mode, sxc_file_t *source, sxc_file_t *dest, int recursive) */
 				    NULL,
 /* internal */
 /* const char *tname; */	    NULL

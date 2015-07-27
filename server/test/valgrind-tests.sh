@@ -36,21 +36,21 @@ echo
 echo "$ADMIN_KEY" | valgrind_run $SXINIT --no-ssl --batch --host-list=$list sx://localhost-nossl
 echo
 
-valgrind_run $SXVOL create sx://localhost/$VOL -o admin -r 1
-valgrind_run $SXVOL create sx://localhost/$VOLr -o admin -r $N
+valgrind_run $SXVOL create sx://localhost/$VOL -o admin -r 1 -s 100M
+valgrind_run $SXVOL create sx://localhost/$VOLr -o admin -r $N -s 100M
 
 valgrind_run $SXACL useradd $USER sx://localhost
 valgrind_run $SXACL userlist sx://localhost
 valgrind_run $SXACL usergetkey $USER sx://localhost
-valgrind_run $SXACL list sx://localhost/$VOL
-valgrind_run $SXACL perm --grant=read $USER sx://localhost/$VOL
-valgrind_run $SXACL perm --grant=write $USER sx://localhost/$VOL
-valgrind_run $SXACL perm --revoke=write,read $USER sx://localhost/$VOL
-valgrind_run $SXACL perm --revoke=read $USER sx://localhost/$VOL
-valgrind_run $SXACL perm --revoke=write $USER sx://localhost/$VOL
-valgrind_run $SXACL perm --grant=write,read $USER sx://localhost/$VOL
-valgrind_run $SXACL perm --grant=read,write $USER sx://localhost/$VOL
-valgrind_run $SXACL list sx://localhost/$VOL
+valgrind_run $SXACL volshow sx://localhost/$VOL
+valgrind_run $SXACL volperm --grant=read $USER sx://localhost/$VOL
+valgrind_run $SXACL volperm --grant=write $USER sx://localhost/$VOL
+valgrind_run $SXACL volperm --revoke=write,read $USER sx://localhost/$VOL
+valgrind_run $SXACL volperm --revoke=read $USER sx://localhost/$VOL
+valgrind_run $SXACL volperm --revoke=write $USER sx://localhost/$VOL
+valgrind_run $SXACL volperm --grant=write,read $USER sx://localhost/$VOL
+valgrind_run $SXACL volperm --grant=read,write $USER sx://localhost/$VOL
+valgrind_run $SXACL volshow sx://localhost/$VOL
 
 for size in 0 4096 8192 1048575; do
     test/randgen $size $size >ftest
@@ -106,14 +106,14 @@ valgrind_run ../client/src/tools/sxreport-client/sxreport-client
 # test filters
 mkdir -p $SX_FILTER_DIR
 for i in ../client/src/filters/*/.libs/*.so.0.0*; do
-    # can't symlink, libsx only supports real files for plugins
+    # can't symlink, libsxclient only supports real files for plugins
     cp `pwd`/$i $SX_FILTER_DIR/
 done
 
 # filters that don't require input
 for filter in attribs null zcomp; do
     vol=vf$filter
-    valgrind_run $SXVOL create -f $filter -o admin -r $N sx://localhost/$vol
+    valgrind_run $SXVOL create -f $filter -o admin -r $N -s 100M sx://localhost/$vol
     valgrind_run $SXCP configure sx://localhost/$vol/
     rm -f ftest
     valgrind_run $SXCP sx://localhost/$vol/configure ftest

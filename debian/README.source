@@ -1,0 +1,10 @@
+gbp-import-orig's filter feature was used to remove the bundled 3rdparty/ sources
+from upstream tarball, for example:
+
+# fetch tags
+git remote add up http://git.skylable.com/sx
+git remote update up
+# import version 1.0
+gbp import-orig --upstream-vcs-tag=1.1 -u '1.1+ds' --uscan --verbose
+# update debian/changelog version to 1.1+ds-1
+....

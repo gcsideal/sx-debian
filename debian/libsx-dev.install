@@ -1,2 +1,2 @@
+usr/include/sx.h
 usr/lib/*/*.so
-usr/lib/*/sxclient/*.so

@@ -38,5 +38,13 @@ void fcgi_list_acl(const sx_hashfs_volume_t *vol);
 void fcgi_volume_onoff(int enable);
 void fcgi_delete_volume(void);
 void fcgi_trigger_gc(void);
+void fcgi_volsizes(void);
+void fcgi_volume_mod(void);
+void fcgi_node_status(void);
+void fcgi_cluster_mode(void);
+void fcgi_cluster_upgrade(void);
+void fcgi_list_revision_blocks(const sx_hashfs_volume_t *vol);
+void fcgi_mass_delete(void);
+void fcgi_mass_rename(void);
 
 #endif

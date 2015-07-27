@@ -1,14 +1,23 @@
 package "sxacl"
-args "--unamed-opts --no-handle-version --no-handle-error --file-name=cmd_useradd --func-name=useradd_cmdline_parser --arg-struct-name=useradd_args_info --strict-hidden"
+args "--unamed-opts --no-handle-version --no-handle-error --file-name=cmd_useradd --func-name=useradd_cmdline_parser --arg-struct-name=useradd_args_info"
 usage "sxacl useradd [OPTIONS] <username> sx://[profile@]cluster"
 
 section "User creation options"
 option "role" t "User type" values="admin","normal" enum default="normal" optional
 option "auth-file" a "Store authentication token in given file (instead of stdout)" string optional
+option "pass-file" p "File containing user password (instead of stdin)" string optional
+option "description" d "Set the description of this user" string optional default=""
+option "quota" q "Set total quota for all volumes owned by this user (allows K,M,G,T suffixes)" typestr="SIZE" string optional
 
 section "Common options"
 
 option  "config-dir"		c "Path to SX configuration directory"
-        string typestr="PATH" optional
+        string typestr="PATH" optional hidden
+
+option  "force-key"                - "Create user with an old authentication token" string typestr="TOKEN" optional hidden
+
+option  "generate-key"      g "Generate a random key" flag off
+
+option "batch-mode" b		"Disable additional information and only print the automatically generated key" flag off
 
 option  "debug"		D "Enable debug messages" flag off
