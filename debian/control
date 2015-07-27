@@ -24,7 +24,7 @@ Description: Scalable public and private cloud storage
  Additionally Sx has built-in support for deduplication, client-side
  encryption, on-the-fly compression and much more.
 
-Package: libsx2
+Package: libsxclient2
 Architecture: any
 Depends: ${shlibs:Depends}, ${misc:Depends}
 Description: Scalable public and private cloud storage
@@ -39,10 +39,10 @@ Description: Scalable public and private cloud storage
  Additionally Sx has built-in support for deduplication, client-side 
  encryption, on-the-fly compression and much more.
 
-Package: libsx-dev
+Package: libsxclient-dev
 Section: libdevel
 Architecture: any
-Depends: libsx2 (= ${binary:Version}), ${misc:Depends}
+Depends: libsxclient2 (= ${binary:Version}), ${misc:Depends}
 Description: Scalable public and private cloud storage
  Skylable Sx is a reliable, fully distributed cluster solution for your data 
  storage needs.
