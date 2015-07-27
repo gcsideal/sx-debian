@@ -45,8 +45,8 @@
 #include <unistd.h>
 #include <ftw.h>
 #include "isaac.h"
-#include "../libsx/src/misc.h"
-#include "../libsx/src/vcrypto.h"
+#include "../libsxclient/src/misc.h"
+#include "../libsxclient/src/vcrypto.h"
 #include "version.h"
 
 static const char hexchar[16] = "0123456789abcdef";
@@ -193,9 +193,9 @@ uint64_t MurmurHash64(const void *key, size_t len, unsigned int seed)
 
     while(len >= 8) {
 	k1  = data[0];
-	k1 |= data[1] << 8;
-	k1 |= data[2] << 16;
-	k1 |= data[3] << 24;
+	k1 |= (unsigned)data[1] << 8;
+	k1 |= (unsigned)data[2] << 16;
+	k1 |= (unsigned)data[3] << 24;
 	k1 *= m; k1 ^= k1 >> r; 
 	k1 *= m; h1 *= m;
 	h1 ^= k1;
@@ -203,9 +203,9 @@ uint64_t MurmurHash64(const void *key, size_t len, unsigned int seed)
 	len -= 4;
 
 	k2  = data[0];
-	k2 |= data[1] << 8;
-	k2 |= data[2] << 16;
-	k2 |= data[3] << 24;
+	k2 |= (unsigned)data[1] << 8;
+	k2 |= (unsigned)data[2] << 16;
+	k2 |= (unsigned)data[3] << 24;
 	k2 *= m; k2 ^= k2 >> r; 
 	k2 *= m; h2 *= m;
 	h2 ^= k2;
@@ -215,9 +215,9 @@ uint64_t MurmurHash64(const void *key, size_t len, unsigned int seed)
 
     if(len >= 4) {
 	k1  = data[0];
-	k1 |= data[1] << 8;
-	k1 |= data[2] << 16;
-	k1 |= data[3] << 24;
+	k1 |= (unsigned)data[1] << 8;
+	k1 |= (unsigned)data[2] << 16;
+	k1 |= (unsigned)data[3] << 24;
 	k1 *= m; k1 ^= k1 >> r; 
 	k1 *= m; h1 *= m;
 	h1 ^= k1;
@@ -226,8 +226,8 @@ uint64_t MurmurHash64(const void *key, size_t len, unsigned int seed)
     }
 
     switch(len) {
-	case 3: h2 ^= data[2] << 16;
-	case 2: h2 ^= data[1] << 8;
+        case 3: h2 ^= (unsigned)data[2] << 16;
+        case 2: h2 ^= (unsigned)data[1] << 8;
 	case 1: h2 ^= data[0];
 		h2 *= m;
     };
@@ -361,6 +361,7 @@ int derive_key(const unsigned char *salt, unsigned slen,
         !sxi_hmac_sha1_update(hmac_ctx, ikm, ilen) || /* Input Keying Material */
         !sxi_hmac_sha1_final(hmac_ctx, prk, &mdlen)) {
         /*SSLERR();*/
+	sxi_hmac_sha1_cleanup(&hmac_ctx);
         return -1;
     }
     if (!sxi_hmac_sha1_init_ex(hmac_ctx, prk, mdlen) || /* PRK */
@@ -368,6 +369,7 @@ int derive_key(const unsigned char *salt, unsigned slen,
         !sxi_hmac_sha1_update(hmac_ctx, (const unsigned char*)"\x1", 1) || /* || 0x01 */
         !sxi_hmac_sha1_final(hmac_ctx, md, &mdlen)) {
         /*SSLERR();*/
+	sxi_hmac_sha1_cleanup(&hmac_ctx);
         return -1;
     }
     sxi_hmac_sha1_cleanup(&hmac_ctx);

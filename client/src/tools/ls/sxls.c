@@ -35,8 +35,8 @@
 #include "sx.h"
 #include "cmdline.h"
 #include "version.h"
-#include "libsx/src/misc.h"
-#include "libsx/src/clustcfg.h"
+#include "libsxclient/src/misc.h"
+#include "libsxclient/src/clustcfg.h"
 #include "bcrumbs.h"
 
 static sxc_client_t *sx = NULL;
@@ -194,7 +194,7 @@ int main(int argc, char **argv) {
                     unsigned int len;
                     if(n<=0) {
                         if(n) {
-                            fprintf(stderr, "ERROR: Failed to retrieve file name for %s\n", args.inputs[i]);
+                            fprintf(stderr, "ERROR: Failed to retrieve volume name for %s\n", args.inputs[i]);
                             ret = 1;
                         }
                         break;
@@ -228,7 +228,7 @@ int main(int argc, char **argv) {
 
 		    if(n<=0) {
 			if(n)
-        		    fprintf(stderr, "ERROR: Failed to retrieve file name for %s\n", args.inputs[i]);
+                            fprintf(stderr, "ERROR: Failed to retrieve volume name for %s\n", args.inputs[i]);
 			break;
 		    }
 

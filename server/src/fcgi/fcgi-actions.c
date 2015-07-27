@@ -83,6 +83,12 @@ void volume_ops(void) {
             return;
         }
 
+        /* Get basic user information */
+        if(!strcmp(volume, ".self")) {
+            fcgi_self();
+            return;
+        }
+
 	if(is_reserved())
 	    quit_errmsg(403, "Volume name is reserved");
 
@@ -99,7 +105,7 @@ void volume_ops(void) {
 	}
 
 	/* Locating or listing volume data requires READ|WRITE|ACL access or better */
-        if (!has_priv(PRIV_READ) && !has_priv(PRIV_WRITE) && !has_priv(PRIV_ACL) && !has_priv(PRIV_ADMIN))
+        if (!has_priv(PRIV_READ) && !has_priv(PRIV_WRITE) && !has_priv(PRIV_MANAGER) && !has_priv(PRIV_ADMIN))
             quit_errmsg(403, "Permission denied: not enough privileges");
 
 	if(has_arg("o")) {
@@ -134,22 +140,40 @@ void volume_ops(void) {
 	if(is_reserved())
 	    quit_errmsg(403, "Volume name is reserved");
 	if(!has_priv(PRIV_ADMIN))
-	    quit_unless_has(PRIV_ACL);
+	    quit_unless_has(PRIV_MANAGER);
 	fcgi_acl_volume();
 	return;
     }
 
-    /* Only ADMIN or better allowed beyond this point */
-    quit_unless_has(PRIV_ADMIN);
+    if(verb == VERB_DELETE && has_arg("filter")) {
+        if(is_reserved())
+            quit_errmsg(403, "Volume name is reserved");
+        /* Delete files matching given filter */
+        quit_unless_has(PRIV_WRITE);
+        fcgi_mass_delete();
+        return;
+    }
 
+    /* privs enforcement will be done after body parsing */
     if(verb == VERB_PUT && arg_is("o", "mod")) {
         if(is_reserved())
             quit_errmsg(403, "Volume name is reserved");
-        quit_unless_has(PRIV_ADMIN);
-        /* Modify volume - ADMIN required */
+        /* Modify volume */
         fcgi_volume_mod();
         return;
     }
+
+    if(verb == VERB_PUT && has_arg("source") && has_arg("dest")) {
+        if(is_reserved())
+            quit_errmsg(403, "Volume name is reserved");
+        /* Rename files matching given filter to the destination pattern */
+        quit_unless_has(PRIV_WRITE);
+        fcgi_mass_rename();
+        return;
+    }
+
+    /* Only ADMIN or better allowed beyond this point */
+    quit_unless_has(PRIV_ADMIN);
 
     if(verb == VERB_PUT && (arg_is("o","disable") || arg_is("o","enable"))) {
 	/* Enable / disable volume (2pc/s2s) - CLUSTER required */
@@ -204,6 +228,9 @@ void volume_ops(void) {
         } else if(!strcmp(volume, ".mode")) {
             /* Switch cluster to read-only or to read-write mode (sxadm entry) - ADMIN required */
             fcgi_cluster_mode();
+        } else if(!strcmp(volume, ".clusterMeta")) {
+            /* Set cluster metadata - ADMIN required */
+            fcgi_cluster_setmeta();
         } else {
 	    /* Create new volume - ADMIN required */
 	    if(is_reserved())
@@ -226,11 +253,11 @@ void volume_ops(void) {
 	    quit_unless_has(PRIV_CLUSTER);
 	    fcgi_revoke_distribution();
         } else {
-	    /* Delete volume - ADMIN or CLUSTER required */
-	    quit_unless_has(PRIV_ADMIN);
 	    if(is_reserved())
 		quit_errmsg(403, "Volume name is reserved");
-	    fcgi_delete_volume();
+            /* Delete volume - ADMIN or CLUSTER required */
+            quit_unless_has(PRIV_ADMIN);
+            fcgi_delete_volume();
 	}
 	return;
     }
@@ -332,7 +359,7 @@ void file_ops(void) {
             if (memcmp(requser, user, sizeof(requser))) {
                 quit_unless_has(PRIV_ADMIN);
             }
-            fcgi_user_newkey();
+            fcgi_user_modify();
             return;
         }
 
@@ -409,7 +436,7 @@ void file_ops(void) {
 
 	/* File deletion - WRITE required */
 	quit_unless_has(PRIV_WRITE);
-	fcgi_delete_file();
+        fcgi_delete_file();
 	return;
     }
 }

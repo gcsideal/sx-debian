@@ -32,7 +32,7 @@
 #include "utils.h"
 #include "nodes.h"
 #include "job_common.h"
-#include "../libsx/src/cluster.h"
+#include "../libsxclient/src/cluster.h"
 #include "sxdbi.h"
 #include "hashop.h"
 
@@ -80,6 +80,10 @@
 #define SXLIMIT_MAX_REVISIONS 64
 
 #define METADBS 16
+
+#define QUOTA_UNDEFINED -1LL
+#define QUOTA_UNLIMITED 0LL
+#define SX_CUSTOM_META_PREFIX "$custom$"
 
 typedef enum {
     NL_PREV,
@@ -135,7 +139,8 @@ rc_ty sx_hashfs_challenge_gen(sx_hashfs_t *h, sx_hash_challenge_t *c, int random
 
 int sx_hashfs_check_volume_name(const char *name);
 rc_ty sx_hashfs_check_volume_settings(sx_hashfs_t *h, const char *volume, int64_t size, unsigned int replica, unsigned int revisions);
-int sx_hashfs_check_meta(const char *key, const void *value, unsigned int value_len);
+rc_ty sx_hashfs_check_meta(const char *key, const void *value, unsigned int value_len);
+rc_ty sx_hashfs_check_volume_meta(const char *key, const void *value, unsigned int value_len);
 int sx_hashfs_check_username(const char *name);
 
 rc_ty sx_hashfs_derive_key(sx_hashfs_t *h, unsigned char *key, int len, const char *info);
@@ -169,8 +174,8 @@ typedef struct _sx_hashfs_user_t {
     int role;
 } sx_hashfs_user_t;
 
-rc_ty sx_hashfs_create_user(sx_hashfs_t *h, const char *user, const uint8_t *uid, unsigned uid_size, const uint8_t *key, unsigned key_size, int role, const char *desc);
-rc_ty sx_hashfs_user_newkey(sx_hashfs_t *h, const char *user, const uint8_t *key, unsigned key_size);
+rc_ty sx_hashfs_create_user(sx_hashfs_t *h, const char *user, const uint8_t *uid, unsigned uid_size, const uint8_t *key, unsigned key_size, int role, const char *desc, int64_t quota);
+rc_ty sx_hashfs_user_modify(sx_hashfs_t *h, const char *user, const uint8_t *key, unsigned key_size, int64_t quota, const char *description);
 rc_ty sx_hashfs_delete_user(sx_hashfs_t *h, const char *username, const char *new_owner, int all_clones);
 rc_ty sx_hashfs_get_uid(sx_hashfs_t *h, const char *user, int64_t *uid);
 rc_ty sx_hashfs_get_uid_role(sx_hashfs_t *h, const char *user, int64_t *uid, int *role);
@@ -180,11 +185,13 @@ const char *sx_hashfs_authtoken(sx_hashfs_t *h);
 char *sxi_hashfs_admintoken(sx_hashfs_t *h);
 rc_ty sx_hashfs_uid_get_name(sx_hashfs_t *h, uint64_t uid, char *name, unsigned len);
 rc_ty sx_hashfs_user_onoff(sx_hashfs_t *h, const char *user, int enable, int all_clones);
+/* Get user quota and usage */
+rc_ty sx_hashfs_get_owner_quota_usage(sx_hashfs_t *h, sx_uid_t uid, int64_t *quota, int64_t *used);
 /* Generate unique user ID for new user */
 rc_ty sx_hashfs_generate_uid(sx_hashfs_t *h, uint8_t *uid);
 
-typedef int (*user_list_cb_t)(sx_uid_t user_id, const char *username, const uint8_t *user, const uint8_t *key, int is_admin, const char *decs, void *ctx);
-rc_ty sx_hashfs_list_users(sx_hashfs_t *h, const uint8_t *list_clones, user_list_cb_t cb, int desc, void *ctx);
+typedef int (*user_list_cb_t)(sx_uid_t user_id, const char *username, const uint8_t *user, const uint8_t *key, int is_admin, const char *desc, int64_t quota, int64_t quota_usage, void *ctx);
+rc_ty sx_hashfs_list_users(sx_hashfs_t *h, const uint8_t *list_clones, user_list_cb_t cb, int desc, int send_quota, void *ctx);
 
 #define CLUSTER_USER (const uint8_t*)"\x08\xb5\x12\x4c\x44\x7f\x00\xb2\xcd\x38\x31\x3f\x44\xe3\x93\xfd\x44\x84\x47"
 #define ADMIN_USER (const uint8_t*)"\xd0\x33\xe2\x2a\xe3\x48\xae\xb5\x66\x0f\xc2\x14\x0a\xec\x35\x85\x0c\x4d\xa9\x97"
@@ -197,7 +204,7 @@ rc_ty sx_hashfs_revoke(sx_hashfs_t *h, uint64_t uid, const char *volume, int pri
 /* Volume ops */
 void sx_hashfs_volume_new_begin(sx_hashfs_t *h);
 rc_ty sx_hashfs_volume_new_addmeta(sx_hashfs_t *h, const char *key, const void *value, unsigned int value_len);
-rc_ty sx_hashfs_volume_new_finish(sx_hashfs_t *h, const char *volume, int64_t size, unsigned int replica, unsigned int revisions, sx_uid_t owner_uid);
+rc_ty sx_hashfs_volume_new_finish(sx_hashfs_t *h, const char *volume, int64_t size, unsigned int replica, unsigned int revisions, sx_uid_t owner_uid, int do_transaction);
 /* Returns (and logs reason/error):
  *  - EFAULT
  *  - EINVAL
@@ -252,7 +259,9 @@ int sx_hashfs_is_node_ignored(sx_hashfs_t *h, const sx_uuid_t *node_uuid);
 rc_ty sx_hashfs_set_unfaulty(sx_hashfs_t *h, const sx_uuid_t *nodeid, int64_t dist_rev);
 
 /* Change volume ownership and/or size*/
-rc_ty sx_hashfs_volume_mod(sx_hashfs_t *h, const char *volume, const char *newowner, int64_t newsize, int max_revs);
+rc_ty sx_hashfs_volume_mod(sx_hashfs_t *h, const char *volume, const char *newowner, int64_t newsize, int max_revs, int modify_meta);
+rc_ty sx_hashfs_volume_mod_begin(sx_hashfs_t *h, const sx_hashfs_volume_t *vol);
+rc_ty sx_hashfs_volume_mod_addmeta(sx_hashfs_t *h, const char *key, const void *value, unsigned int value_len);
 
 /* File list */
 typedef struct _sx_hashfs_file_t {
@@ -263,8 +272,9 @@ typedef struct _sx_hashfs_file_t {
     unsigned int created_at;
     char name[SXLIMIT_MAX_FILENAME_LEN+2];
     char revision[REV_LEN+1];
+    sx_hash_t revision_id;
 } sx_hashfs_file_t;
-rc_ty sx_hashfs_list_first(sx_hashfs_t *h, const sx_hashfs_volume_t *volume, const char *pattern, const sx_hashfs_file_t **file, int recurse, const char *after);
+rc_ty sx_hashfs_list_first(sx_hashfs_t *h, const sx_hashfs_volume_t *volume, const char *pattern, const sx_hashfs_file_t **file, int recurse, const char *after, int escape);
 rc_ty sx_hashfs_list_next(sx_hashfs_t *h);
 rc_ty sx_hashfs_revision_first(sx_hashfs_t *h, const sx_hashfs_volume_t *volume, const char *name, const sx_hashfs_file_t **file, int reversed);
 rc_ty sx_hashfs_revision_next(sx_hashfs_t *h, int reversed);
@@ -305,7 +315,6 @@ rc_ty sx_hashfs_delete_old_revs(sx_hashfs_t *h, const sx_hashfs_volume_t *volume
 /* File put */
 
 const char *sx_hashfs_geterrmsg(sx_hashfs_t *h);
-rc_ty sx_hashfs_check_file_size(sx_hashfs_t *h, const sx_hashfs_volume_t *vol, const char *filename, int64_t size);
 rc_ty sx_hashfs_putfile_begin(sx_hashfs_t *h, sx_uid_t user_id, const char *volume, const char *file, const sx_hashfs_volume_t **volptr);
 rc_ty sx_hashfs_putfile_extend_begin(sx_hashfs_t *h, sx_uid_t user_id, const uint8_t *user, const char *token);
 rc_ty sx_hashfs_putfile_putblock(sx_hashfs_t *h, sx_hash_t *hash);
@@ -337,6 +346,7 @@ typedef struct _sx_hashfs_tmpinfo_t {
     unsigned int current_replica; /* Replica being presence checked */
     char name[SXLIMIT_MAX_FILENAME_LEN+1]; /* File name */
     char revision[128]; /* File revision */
+    sx_hash_t revision_id;
     int somestatechanged;
 } sx_hashfs_tmpinfo_t;
 rc_ty sx_hashfs_tmp_getmeta(sx_hashfs_t *h, int64_t tmpfile_id, sxc_meta_t *metadata);
@@ -350,16 +360,25 @@ rc_ty sx_hashfs_tmp_delete(sx_hashfs_t *h, int64_t tmpfile_id);
 rc_ty sx_hashfs_file_delete(sx_hashfs_t *h, const sx_hashfs_volume_t *volume, const char *file, const char *revision);
 rc_ty sx_hashfs_filedelete_job(sx_hashfs_t *h, sx_uid_t user_id, const sx_hashfs_volume_t *vol, const char *name, const char *revision, job_t *job_id);
 
+/* File rename */
+rc_ty sx_hashfs_file_rename(sx_hashfs_t *h, const sx_hashfs_volume_t *volume, const char *oldname, const char *revision, const char *newname);
+
+/* Create and schedule batch jobs (batch rename or delete) */
+rc_ty sx_hashfs_files_processing_job(sx_hashfs_t *h, sx_uid_t user_id, const sx_hashfs_volume_t *vol, int recursive, const char *input_pattern, const char *output_pattern, job_t *job_id);
 
 /* Users */
 typedef enum {
   PRIV_NONE = 0,
   PRIV_READ = 1,
   PRIV_WRITE = 2,
-  PRIV_ACL = 4,
-  PRIV_ADMIN = 8,
-  PRIV_CLUSTER = 16} sx_priv_t;
-rc_ty sx_hashfs_get_user_info(sx_hashfs_t *h, const uint8_t *user, sx_uid_t *uid, uint8_t *key, sx_priv_t *basepriv, char **desc);
+  PRIV_MANAGER = 4,
+  PRIV_OWNER = 8,
+  PRIV_ADMIN = 16,
+  PRIV_CLUSTER = 32} sx_priv_t;
+
+#define ALL_USER_PRIVS (PRIV_READ | PRIV_WRITE | PRIV_MANAGER)
+
+rc_ty sx_hashfs_get_user_info(sx_hashfs_t *h, const uint8_t *user, sx_uid_t *uid, uint8_t *key, sx_priv_t *basepriv, char **desc, int64_t *quota);
 rc_ty sx_hashfs_get_access(sx_hashfs_t *h, const uint8_t *user, const char *volume, sx_priv_t *access);
 
 /* Jobs */
@@ -463,6 +482,14 @@ rc_ty sx_hashfs_cluster_get_name(sx_hashfs_t *h, const char **name);
 
 int sx_hashfs_is_readonly(sx_hashfs_t *h);
 
+/* Load cluster meta from database */
+rc_ty sx_hashfs_clustermeta_begin(sx_hashfs_t *h);
+rc_ty sx_hashfs_clustermeta_next(sx_hashfs_t *h, const char **key, const void **value, unsigned int *value_len);
+void sx_hashfs_clustermeta_set_begin(sx_hashfs_t *h);
+rc_ty sx_hashfs_clustermeta_set_addmeta(sx_hashfs_t *h, const char *key, const void *value, unsigned int value_len);
+rc_ty sx_hashfs_clustermeta_set_finish(sx_hashfs_t *h, time_t ts, int do_transaction);
+rc_ty sx_hashfs_clustermeta_last_change(sx_hashfs_t *h, time_t *t);
+
 typedef struct {
     sx_hash_t revision_id;
     int32_t blocksize;
@@ -470,9 +497,9 @@ typedef struct {
     int op;
 } sx_revision_op_t;
 int sx_revision_op_of_blob(sx_blob_t *b, sx_revision_op_t *op);
-int sx_unique_fileid(sxc_client_t *sx, const sx_hashfs_volume_t *volume, const char *name, const char *revision, sx_hash_t *fileid);
-rc_ty sx_hashfs_upgrade_1_0_prepare(sx_hashfs_t *h);
-rc_ty sx_hashfs_upgrade_1_0_local(sx_hashfs_t *h);
+int sx_unique_fileid(sxc_client_t *sx, const char *revision, sx_hash_t *fileid);
+rc_ty sx_hashfs_upgrade_1_0_or_1_1_prepare(sx_hashfs_t *h);
+rc_ty sx_hashfs_upgrade_1_0_or_1_1_local(sx_hashfs_t *h);
 
 typedef int (*lrb_cb_t)(const sx_hashfs_volume_t *vol, const sx_uuid_t *target, const sx_hash_t *revision_id, const sx_hash_t *contents, int64_t nblocks, unsigned blocksize);
 typedef int (*lrb_count_t)(int64_t count);
@@ -484,4 +511,10 @@ rc_ty sx_hashfs_heal_update(sx_hashfs_t *h, const sx_hashfs_volume_t *vol, const
 int sx_hashfs_has_upgrade_job(sx_hashfs_t *h);
 const char *sx_hashfs_heal_status_local(sx_hashfs_t *h);
 const char *sx_hashfs_heal_status_remote(sx_hashfs_t *h);
+
+
+rc_ty sx_hashfs_syncglobs_begin(sx_hashfs_t *h);
+void sx_hashfs_syncglobs_abort(sx_hashfs_t *h);
+rc_ty sx_hashfs_syncglobs_end(sx_hashfs_t *h);
+
 #endif

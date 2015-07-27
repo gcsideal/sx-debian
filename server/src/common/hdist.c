@@ -35,6 +35,7 @@
 #include <sys/time.h>
 #include <ctype.h>
 #include <limits.h>
+#include <netinet/in.h>
 
 #include "hdist.h"
 #include "isaac.h"
@@ -42,7 +43,7 @@
 #include "log.h"
 #include "nodes.h"
 #include "zlib.h"
-#include "../libsx/src/vcrypto.h"
+#include "../libsxclient/src/vcrypto.h"
 
 #ifdef WORDS_BIGENDIAN
 uint32_t swapu32(uint32_t v)
@@ -126,6 +127,7 @@ sxi_hdist_t *sxi_hdist_new(unsigned int seed, unsigned int max_builds, sx_uuid_t
     model->sxnl = (sx_nodelist_t **) wrap_calloc(sizeof(sx_nodelist_t *), max_builds);
     if(!model->sxnl) {
 	CRIT("Can't allocate memory for model->sxnl");
+	free(model->node_list);
 	free(model);
 	return NULL;
     }
@@ -134,6 +136,7 @@ sxi_hdist_t *sxi_hdist_new(unsigned int seed, unsigned int max_builds, sx_uuid_t
     if(!model->node_count) {
 	CRIT("Can't allocate memory for model->node_count");
 	free(model->node_list);
+	free(model->sxnl);
 	free(model);
 	return NULL;
     }
@@ -142,6 +145,7 @@ sxi_hdist_t *sxi_hdist_new(unsigned int seed, unsigned int max_builds, sx_uuid_t
     if(!model->capacity_total) {
 	CRIT("Can't allocate memory for model->capacity_total");
 	free(model->node_list);
+	free(model->sxnl);
 	free(model->node_count);
 	free(model);
 	return NULL;
@@ -151,6 +155,7 @@ sxi_hdist_t *sxi_hdist_new(unsigned int seed, unsigned int max_builds, sx_uuid_t
     if(!model->circle) {
 	CRIT("Can't allocate memory for model->circle");
 	free(model->node_list);
+	free(model->sxnl);
 	free(model->node_count);
 	free(model->capacity_total);
 	free(model);
@@ -161,6 +166,7 @@ sxi_hdist_t *sxi_hdist_new(unsigned int seed, unsigned int max_builds, sx_uuid_t
     if(!model->circle_points) {
 	CRIT("Can't allocate memory for model->circle_points");
 	free(model->node_list);
+	free(model->sxnl);
 	free(model->node_count);
 	free(model->circle);
 	free(model->capacity_total);
@@ -174,6 +180,7 @@ sxi_hdist_t *sxi_hdist_new(unsigned int seed, unsigned int max_builds, sx_uuid_t
     if(!model->cfg) {
 	CRIT("Can't allocate memory for model->circle_points");
 	free(model->node_list);
+	free(model->sxnl);
 	free(model->node_count);
 	free(model->circle);
 	free(model->capacity_total);
@@ -220,6 +227,24 @@ static char *gettoken(const char *str, unsigned int *pos, char *buf, size_t bufs
     }
     buf[stored] = 0;
     return stored ? buf : NULL;
+}
+
+static char *addr_to_hdist(const char *addr)
+{
+    unsigned i;
+    char *ret = wrap_strdup(addr);
+    if (ret)
+        for (i=0;i<strlen(ret);i++) if (ret[i] == ':') ret[i] = ';';
+    return ret;
+}
+
+static char *addr_from_hdist(const char *addr)
+{
+    unsigned i;
+    char *ret = wrap_strdup(addr);
+    if (ret)
+        for (i=0;i<strlen(ret);i++) if (ret[i] == ';') ret[i] = ':';
+    return ret;
 }
 
 sxi_hdist_t *sxi_hdist_from_cfg(const void *cfg, unsigned int cfg_len)
@@ -323,7 +348,7 @@ sxi_hdist_t *sxi_hdist_from_cfg(const void *cfg, unsigned int cfg_len)
 	    };
 
 	} else {
-		char addr[40], addr_int[40];
+		char addr[INET6_ADDRSTRLEN], addr_int[INET6_ADDRSTRLEN];
 		long long int capacity;
 		char *prev_uuid;
 		sx_uuid_t puuid;
@@ -378,7 +403,9 @@ sxi_hdist_t *sxi_hdist_from_cfg(const void *cfg, unsigned int cfg_len)
 		break;
 	    }
 
-	    ret = sxi_hdist_addnode(model, &uuid, addr, addr_int, capacity, prev_uuid ? &puuid : NULL);
+            char *orig_addr = addr_from_hdist(addr), *orig_addr_int = addr_from_hdist(addr_int);
+	    ret = sxi_hdist_addnode(model, &uuid, orig_addr, orig_addr_int, capacity, prev_uuid ? &puuid : NULL);
+            free(orig_addr); free(orig_addr_int);
 	    if(ret)
 		break;
 	}
@@ -464,8 +491,12 @@ static rc_ty hdist_addnode(sxi_hdist_t *model, unsigned int id, uint64_t capacit
 	    return ENOMEM;
 	}
     }
-    if(sxn)
-	model->cfg_size += sprintf(model->cfg + model->cfg_size, ":%s%s%s:%s:%s:%llu", sx_node_uuid_str(sxn), prev_uuid ? "@" : "", prev_uuid ? prev_uuid->string : "", sx_node_addr(sxn), sx_node_internal_addr(sxn), (unsigned long long) sx_node_capacity(sxn));
+    if(sxn) {
+        char *addr = addr_to_hdist(sx_node_addr(sxn)), *int_addr = addr_to_hdist(sx_node_internal_addr(sxn));
+	model->cfg_size += sprintf(model->cfg + model->cfg_size, ":%s%s%s:%s:%s:%llu", sx_node_uuid_str(sxn), prev_uuid ? "@" : "", prev_uuid ? prev_uuid->string : "", addr, int_addr, (unsigned long long) sx_node_capacity(sxn));
+        free(addr); free(int_addr);
+
+    }
 
     return OK;
 }

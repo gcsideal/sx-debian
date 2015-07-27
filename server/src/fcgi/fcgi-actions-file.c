@@ -188,7 +188,6 @@ struct cb_newfile_ctx {
     int64_t filesize; /* file size if creating, extend seq if extending */
     unsigned nhashes;
     int extending;
-    int64_t metasize; /* meta size is used to honour volume qouta */
     char metakey[SXLIMIT_META_MAX_KEY_LEN+1];
 };
 
@@ -231,7 +230,6 @@ static int cb_newfile_map_key(void *ctx, const unsigned char *s, size_t l) {
 	    return 0;
 	memcpy(c->metakey, s, l);
 	c->metakey[l] = '\0';
-        c->metasize += l;
 	c->state = CB_NEWFILE_METAVALUE;
 	return 1;
     }
@@ -286,7 +284,6 @@ static int cb_newfile_string(void *ctx, const unsigned char *s, size_t l) {
 	    return 0;
 	if(sx_hashfs_putfile_putmeta(hashfs, c->metakey, metavalue, l/2))
 	    return 0;
-        c->metasize += l/2;
 	c->state = CB_NEWFILE_METAKEY;
 	return 1;
     }
@@ -365,7 +362,6 @@ void fcgi_create_file(void) {
     struct cb_newfile_ctx yctx;
     yctx.state = CB_NEWFILE_START;
     yctx.filesize = -1;
-    yctx.metasize = 0;
     yctx.nhashes = 0;
     yctx.extending = 0;
 
@@ -389,17 +385,8 @@ void fcgi_create_file(void) {
     quit_unless_authed();
 
     s = sx_hashfs_createfile_commit(hashfs, volume, path, get_arg("rev"), yctx.filesize);
-    switch (s) {
-    case OK:
-	break;
-    case ENOENT:
-	quit_errnum(404);
-    case EINVAL:
-	quit_errnum(400);
-    default:
-	WARN("sx_hashfs_createfile_commit failed: %d", s);
-	quit_errmsg(500, "Cannot initialize file upload");
-    }
+    if(s != OK)
+	quit_errmsg(rc2http(s), msg_get_reason());
 
     CGI_PUTS("\r\n");
 }
@@ -413,7 +400,6 @@ static void create_or_extend_tempfile(const sx_hashfs_volume_t *vol, const char 
     struct cb_newfile_ctx yctx;
     yctx.state = CB_NEWFILE_START;
     yctx.filesize = -1;
-    yctx.metasize = 0;
     yctx.nhashes = 0;
     yctx.extending = extending;
     yajl_handle yh = yajl_alloc(&newfile_parser, NULL, &yctx);
@@ -435,23 +421,11 @@ static void create_or_extend_tempfile(const sx_hashfs_volume_t *vol, const char 
     auth_complete();
     quit_unless_authed();
 
-    if(vol && filename && !extending && (s = sx_hashfs_check_file_size(hashfs, vol, filename, yctx.filesize + strlen(filename) + yctx.metasize)) != OK) {
-        sx_hashfs_putfile_end(hashfs);
-        WARN("File size is not correct: %s", msg_get_reason());
-        if(s == ENOSPC)
-            quit_errmsg(413, msg_get_reason());
-        else
-            quit_errmsg(500, msg_get_reason());
-    }
-
-
-    /* FIXME: extend should reuse old token, not get a new one because the
-     * expiry time will be wrong... */
     s = sx_hashfs_putfile_gettoken(hashfs, user, yctx.filesize, &token, hash_presence_callback, &ctx);
     if (s != OK) {
 	sx_hashfs_putfile_end(hashfs);
-	if (s == ENOSPC)
-	    quit_errmsg(507, "Out of space");
+	if(s == ENOSPC)
+	    quit_errmsg(413, msg_get_reason());
 	WARN("store_filehash_end failed: %d", s);
 	if(!*msg_get_reason())
 	    msg_set_reason("Cannot obtain upload token: %s", rc2str(s));
@@ -459,7 +433,7 @@ static void create_or_extend_tempfile(const sx_hashfs_volume_t *vol, const char 
     }
 
     CGI_PRINTF("Content-type: application/json\r\n\r\n{\"uploadToken\":");
-    json_send_qstring(token);
+    json_send_qstring(extending ? path : token);
     CGI_PUTS(",\"uploadData\":{");
     ctx.h = hashfs;
     ctx.comma = 0;
@@ -530,7 +504,6 @@ void fcgi_delete_file(void) {
 	send_job_info(job);
     }
 }
-
 
 struct rplfiles {
     sx_blob_t *b;
