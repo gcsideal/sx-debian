@@ -5,7 +5,7 @@ Maintainer: Laszlo Boszormenyi (GCS) <gcs@debian.org>
 Build-Depends: debhelper (>= 9), libssl-dev, libyajl-dev, libfcgi-dev,
     libcurl4-openssl-dev (>= 7.34.0), libltdl-dev,
     libsqlite3-dev (>= 3.8.4.3), pkg-config, nginx,
-    libwww-perl, libjson-xs-perl, libdigest-hmac-perl, liburi-perl
+    libwww-perl, libjson-perl, libjson-xs-perl, libdigest-hmac-perl, liburi-perl
 Standards-Version: 3.9.6
 Homepage: http://www.skylable.com/products/sx
 
