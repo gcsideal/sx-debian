@@ -37,13 +37,14 @@
 #include "sx.h"
 #include "cmdline.h"
 #include "version.h"
-#include "libsx/src/misc.h"
+#include "libsxclient/src/misc.h"
+#include "bcrumbs.h"
 
 struct gengetopt_args_info args;
 static sxc_client_t *sx = NULL;
 
 static int is_sx(const char *p) {
-    return strncmp(p, "sx://", 5) == 0;
+    return strncmp(p, "sx://", 5) == 0 || strncmp(p, SXC_ALIAS_PREFIX, strlen(SXC_ALIAS_PREFIX)) == 0;
 }
 
 static void sighandler(int signal)
@@ -68,23 +69,29 @@ static sxc_file_t *sxfile_from_arg(sxc_cluster_t **cluster, const char *arg) {
 	sxc_uri_t *uri = sxc_parse_uri(sx, arg);
 
 	if(!uri) {
-	    fprintf(stderr, "Bad uri %s: %s\n", arg, sxc_geterrmsg(sx));
+	    fprintf(stderr, "ERROR: Bad uri %s: %s\n", arg, sxc_geterrmsg(sx));
 	    return NULL;
 	}
 	if(!uri->volume) {
-	    fprintf(stderr, "Bad path %s\n", arg);
+	    fprintf(stderr, "ERROR: Bad path %s\n", arg);
 	    sxc_free_uri(uri);
 	    return NULL;
 	}
-
-	*cluster = sxc_cluster_load_and_update(sx, args.config_dir_arg, uri->host, uri->profile);
+        if(!*cluster || strcmp(sxc_cluster_get_sslname(*cluster), uri->host)) {
+	    sxc_cluster_free(*cluster);
+	    *cluster = sxc_cluster_load_and_update(sx, uri->host, uri->profile);
+	}
 	if(!*cluster) {
-	    fprintf(stderr, "Failed to load config for %s: %s\n", uri->host, sxc_geterrmsg(sx));
+	    fprintf(stderr, "ERROR: Failed to load config for %s: %s\n", uri->host, sxc_geterrmsg(sx));
+	    if(strstr(sxc_geterrmsg(sx), SXBC_TOOLS_CFG_ERR))
+		fprintf(stderr, SXBC_TOOLS_CFG_MSG, uri->host, uri->host);
+            else if(strstr(sxc_geterrmsg(sx), SXBC_TOOLS_CONN_ERR))
+                fprintf(stderr, SXBC_TOOLS_CONN_MSG);
 	    sxc_free_uri(uri);
 	    return NULL;
 	}
 
-	file = sxc_file_remote(*cluster, uri->volume, uri->path);
+	file = sxc_file_remote(*cluster, uri->volume, uri->path, NULL);
 	sxc_free_uri(uri);
 	if(!file) {
 	    sxc_cluster_free(*cluster);
@@ -94,7 +101,7 @@ static sxc_file_t *sxfile_from_arg(sxc_cluster_t **cluster, const char *arg) {
 	file = sxc_file_local(sx, arg);
 
     if(!file) {
-	fprintf(stderr, "Failed to create file object: %s\n", sxc_geterrmsg(sx));
+	fprintf(stderr, "ERROR: Failed to create file object: %s\n", sxc_geterrmsg(sx));
 	return NULL;
     }
 
@@ -119,27 +126,39 @@ int main(int argc, char **argv) {
 	exit(0);
     }
 
+    if(!args.inputs_num) {
+	cmdline_parser_print_help();
+	printf("\n");
+	fprintf(stderr, "ERROR: Wrong number of arguments\n");
+	return 1;
+    };
+
     signal(SIGINT, sighandler);
     signal(SIGTERM, sighandler);
 
-    if(!(sx = sxc_init(SRC_VERSION, sxc_default_logger(&log, argv[0]), sxi_yesno))) {
+    if(!(sx = sxc_init(SRC_VERSION, sxc_default_logger(&log, argv[0]), sxc_input_fn, NULL))) {
 	cmdline_parser_free(&args);
 	return 1;
     }
 
+    if(args.config_dir_given && sxc_set_confdir(sx, args.config_dir_arg)) {
+        fprintf(stderr, "ERROR: Could not set configuration directory %s: %s\n", args.config_dir_arg, sxc_geterrmsg(sx));
+        cmdline_parser_free(&args);
+        return 1;
+    }
     sxc_set_debug(sx, args.debug_flag);
 
     if(args.filter_dir_given) {
 	filter_dir = strdup(args.filter_dir_arg);
     } else {
-	const char *pt = getenv("SX_FILTER_DIR");
+	const char *pt = sxi_getenv("SX_FILTER_DIR");
 	if(pt)
 	    filter_dir = strdup(pt);
 	else
 	    filter_dir = strdup(SX_FILTER_DIR);
     }
     if(!filter_dir) {
-	fprintf(stderr, "Failed to set filter dir\n");
+	fprintf(stderr, "ERROR: Failed to set filter dir\n");
 	cmdline_parser_free(&args);
 	return 1;
     }
@@ -151,14 +170,27 @@ int main(int argc, char **argv) {
 	    ret = 1;
 	    break;
 	}
+	if(args.inputs[i][strlen(args.inputs[i]) - 1] == '/') {
+	    fprintf(stderr, "ERROR: Can't cat directories (trailing slash in %s)\n", args.inputs[i]);
+	    sxc_file_free(src_file);
+	    ret = 1;
+	    break;
+	}
 
 	if(sxc_cat(src_file, STDOUT_FILENO)) {
-	    fprintf(stderr, "Failed to stream %s: %s\n", args.inputs[i], sxc_geterrmsg(sx));
+	    fprintf(stderr, "ERROR: Failed to stream %s: %s\n", args.inputs[i], sxc_geterrmsg(sx));
+	    if(cluster && strstr(sxc_geterrmsg(sx), SXBC_TOOLS_VOL_ERR)) {
+		sxc_uri_t *u = sxc_parse_uri(sx, args.inputs[i]);
+		if(u) {
+		    fprintf(stderr, SXBC_TOOLS_VOL_MSG, u->profile ? u->profile : "", u->profile ? "@" : "", u->host);
+		    sxc_free_uri(u);
+		}
+	    }
 	    ret = 1;
 	}
 	sxc_file_free(src_file);
-        sxc_cluster_free(cluster);
     }
+    sxc_cluster_free(cluster);
 
     signal(SIGINT, SIG_IGN);
     signal(SIGTERM, SIG_IGN);

@@ -1,0 +1,27 @@
+/var/log/sxserver/sxhttpd-access.log /var/log/sxserver/sxhttpd-error.log {
+        daily
+        missingok
+        rotate 7
+        compress
+	delaycompress
+        notifempty
+	create 0640
+        sharedscripts
+	postrotate
+		[ ! -s /var/run/sxserver/sxhttpd.pid ] || kill -USR1 `cat /var/run/sxserver/sxhttpd.pid`
+	endscript
+}
+
+/var/log/sxserver/sxfcgi.log {
+        daily
+        missingok
+        rotate 7
+        compress
+	delaycompress
+        notifempty
+	create 0640
+        sharedscripts
+	postrotate
+		[ ! -s /var/run/sxserver/sxfcgi.pid ] || kill -USR1 `cat /var/run/sxserver/sxfcgi.pid`
+	endscript
+}

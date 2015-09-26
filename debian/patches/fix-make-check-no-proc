@@ -1,0 +1,132 @@
+Description: fix 'make check' when /proc is not mounted
+ When /proc is not mounted (e.g. in a chroot) the node .status query failed
+ to fill the 'memTotal' field.
+ Fill it with -1 if /proc is not mounted: it is just used for display purposes.
+ Patch is committed in upstream's git repository.
+
+---
+The information above should follow the Patch Tagging Guidelines, please
+checkout http://dep.debian.net/deps/dep3/ to learn about the format. Here
+are templates for supplementary fields that you might want to add:
+
+Origin: upstream
+Bug: https://bugzilla.skylable.com/show_bug.cgi?id=1499
+Reviewed-By: edwin@skylable.com
+Last-Update: 2015-09-26
+
+--- sx-1.2+ds.orig/server/src/common/hashfs.c
++++ sx-1.2+ds/server/src/common/hashfs.c
+@@ -15193,31 +15193,35 @@ rc_ty sx_hashfs_node_status(sx_hashfs_t
+         return EINVAL;
+     }
+     memset(status, 0, sizeof(*status));
++    status->block_size = -1;
++    status->total_blocks = -1;
++    status->avail_blocks = -1;
++    status->mem_total = -1;
++    status->cores = -1;
+ 
+     /* System information */
+     if(sxi_report_os(h->sx, status->os_name, sizeof(status->os_name), status->os_arch, sizeof(status->os_arch),
+         status->os_release, sizeof(status->os_release), status->os_version, sizeof(status->os_version))) {
+         WARN("Failed to get OS information: %s", sxc_geterrmsg(h->sx));
+-        return FAIL_EINTERNAL;
++        sprintf(status->os_name, "N/A");
++        sprintf(status->os_arch, "N/A");
++        sprintf(status->os_release, "N/A");
++        sprintf(status->os_version, "N/A");
+     }
+ 
+     /* Processor information */
+     if(sxi_report_cpu(h->sx, &status->cores, status->endianness, sizeof(status->endianness))) {
+         WARN("Failed to get CPU information: %s", sxc_geterrmsg(h->sx));
+-        return FAIL_EINTERNAL;
++        sprintf(status->endianness, "N/A");
+     }
+ 
+     /* Filesystem information */
+-    if(sxi_report_fs(h->sx, h->dir, &status->block_size, &status->total_blocks, &status->avail_blocks)) {
++    if(sxi_report_fs(h->sx, h->dir, &status->block_size, &status->total_blocks, &status->avail_blocks))
+         WARN("Failed to get hashFS node directory filesystem information: %s", sxc_geterrmsg(h->sx));
+-        return FAIL_EINTERNAL;
+-    }
+ 
+     /* Get available memory */
+-    if(sxi_report_mem(h->sx, &status->mem_total)) {
++    if(sxi_report_mem(h->sx, &status->mem_total))
+         WARN("Failed to get memory information: %s", sxc_geterrmsg(h->sx));
+-        return FAIL_EINTERNAL;
+-    }
+ 
+     tm = gmtime(&t);
+     if (tm && strftime(status->utctime, sizeof(status->utctime), "%Y-%m-%d %H:%M:%S UTC", tm) <= 0) {
+--- sx-1.2+ds.orig/server/src/tools/sxadm/sxadm.c
++++ sx-1.2+ds/server/src/tools/sxadm/sxadm.c
+@@ -1614,7 +1614,10 @@ static void print_status(sxc_client_t *s
+     printf("        Architecture: %s\n", status->os_arch);
+     printf("        Release: %s\n", status->os_release);
+     printf("        Version: %s\n", status->os_version);
+-    printf("        CPU(s): %d\n", status->cores);
++    if(status->cores != -1)
++        printf("        CPU(s): %d\n", status->cores);
++    else
++        printf("        CPU(s): N/A\n");
+     printf("        Endianness: %s\n", status->endianness);
+     printf("        Local time: %s\n", status->localtime);
+     printf("        UTC time: %s\n", status->utctime);
+@@ -1628,20 +1631,35 @@ static void print_status(sxc_client_t *s
+     fmt_capa(status->storage_commited, str, sizeof(str), human_readable);
+     printf("        Used space: %s\n", str);
+     printf("    Storage filesystem:\n");
+-    fmt_capa(status->block_size, str, sizeof(str), human_readable);
+-    printf("        Block size: %s\n", str);
+-    fmt_capa(status->block_size * status->total_blocks, str, sizeof(str), human_readable);
+-    printf("        Total size: %s\n", str);
+-    fmt_capa(status->block_size * status->avail_blocks, str, sizeof(str), human_readable);
+-    printf("        Available: %s\n", str);
+-    if(status->total_blocks && status->avail_blocks) /* Avoid division by 0 */
++    if(status->block_size != -1) {
++        fmt_capa(status->block_size, str, sizeof(str), human_readable);
++        printf("        Block size: %s\n", str);
++    } else
++        printf("        Block size: N/A\n");
++
++    if(status->avail_blocks != -1) {
++        fmt_capa(status->block_size * status->total_blocks, str, sizeof(str), human_readable);
++        printf("        Total size: %s\n", str);
++    } else
++        printf("        Total size: N/A\n");
++
++    if(status->total_blocks != -1) {
++        fmt_capa(status->block_size * status->avail_blocks, str, sizeof(str), human_readable);
++        printf("        Available: %s\n", str);
++    } else
++        printf("        Available: N/A\n");
++
++    if(status->total_blocks > 0 && status->avail_blocks > 0) /* Avoid division by 0 and printing not assigned (-1) values */
+         printf("        Used: %.2lf%%\n", (double)(status->total_blocks - status->avail_blocks) * 100.0 / status->total_blocks);
+     else
+         printf("        Used: N/A\n");
+     
+     printf("    Memory:\n");
+-    fmt_capa(status->mem_total, str, sizeof(str), human_readable);
+-    printf("        Total: %s\n", str);
++    if(status->mem_total != -1) {
++        fmt_capa(status->mem_total, str, sizeof(str), human_readable);
++        printf("        Total: %s\n", str);
++    } else
++        printf("        Total: N/A\n");
+ 
+     /*printf("    Heal: %s\n", status->heal_status);*/
+     printf("\n");
+--- sx-1.2+ds.orig/server/test/fcgi-test.pl
++++ sx-1.2+ds/server/test/fcgi-test.pl
+@@ -1336,7 +1336,7 @@ test_get "listing clones of $ru", admin_
+ test_get "node status", admin_only(200, 'application/json'), ".status", undef, sub { my $json = get_json(shift); return 0 unless is_string($json->{'osType'}) && is_string($json->{'osArch'}) && is_string($json->{'osRelease'})
+     && is_string($json->{'osVersion'}) && is_string($json->{'osEndianness'}) && is_string($json->{'libsxclientVersion'}) && is_string($json->{'hashFSVersion'}) && is_string($json->{'localTime'}) && is_string($json->{'utcTime'})
+     && is_string($json->{'address'}) && is_string($json->{'internalAddress'}) && is_string($json->{'UUID'}) && is_string($json->{'nodeDir'}) && is_int($json->{'storageAllocated'}) && is_int($json->{'storageUsed'}) && is_int($json->{'fsBlockSize'})
+-    && is_int($json->{'fsTotalBlocks'}) && is_int($json->{'fsAvailBlocks'}) && is_int($json->{'memTotal'}); };
++    && is_int($json->{'fsTotalBlocks'}) && is_int($json->{'fsAvailBlocks'}) && (is_int($json->{'memTotal'}) || $json->{'memTotal'} == -1); };
+ 
+ 
+ # Check .lock query correctness

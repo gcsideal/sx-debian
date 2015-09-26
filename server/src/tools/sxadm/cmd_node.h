@@ -38,33 +38,50 @@ extern "C" {
 struct node_args_info
 {
   const char *help_help; /**< @brief Print help and exit help description.  */
+  const char *full_help_help; /**< @brief Print help, including hidden options, and exit help description.  */
   const char *version_help; /**< @brief Print version and exit help description.  */
-  const char *new_help; /**< @brief Creates a new local SX node in PATH help description.  */
-  const char *info_help; /**< @brief Print details about the local node in PATH help description.  */
-  const char *check_help; /**< @brief Perform sanity check on the local node in PATH help description.  */
+  const char *new_help; /**< @brief Creates a new local SX node in STORAGE_PATH help description.  */
+  const char *info_help; /**< @brief Print details about the local node in STORAGE_PATH help description.  */
+  const char *check_help; /**< @brief Perform sanity check on the local node in STORAGE_PATH help description.  */
+  char * extract_arg;	/**< @brief Extract all files from the local node in STORAGE_PATH to DESTPATH.  */
+  char * extract_orig;	/**< @brief Extract all files from the local node in STORAGE_PATH to DESTPATH original value given at command line.  */
+  const char *extract_help; /**< @brief Extract all files from the local node in STORAGE_PATH to DESTPATH help description.  */
+  char * rename_cluster_arg;	/**< @brief Set a new name for an SX cluster.  */
+  char * rename_cluster_orig;	/**< @brief Set a new name for an SX cluster original value given at command line.  */
+  const char *rename_cluster_help; /**< @brief Set a new name for an SX cluster help description.  */
+  const char *upgrade_help; /**< @brief Upgrade a node to new SX version help description.  */
+  const char *upgrade_job_help; /**< @brief Run the upgrade job directly help description.  */
+  char * cluster_key_arg;	/**< @brief File containing a pre-generated cluster authentication token or stdin if \"-\" is given (default autogenerate token)..  */
+  char * cluster_key_orig;	/**< @brief File containing a pre-generated cluster authentication token or stdin if \"-\" is given (default autogenerate token). original value given at command line.  */
+  const char *cluster_key_help; /**< @brief File containing a pre-generated cluster authentication token or stdin if \"-\" is given (default autogenerate token). help description.  */
+  const char *batch_mode_help; /**< @brief Turn off interactive confirmations and assume yes for all questions help description.  */
   char * cluster_uuid_arg;	/**< @brief The SX cluster UUID (default autogenerate UUID)..  */
   char * cluster_uuid_orig;	/**< @brief The SX cluster UUID (default autogenerate UUID). original value given at command line.  */
   const char *cluster_uuid_help; /**< @brief The SX cluster UUID (default autogenerate UUID). help description.  */
-  char * key_arg;	/**< @brief File containing a pre-generated cluster authentication token or stdin if \"-\" is given (default autogenerate token)..  */
-  char * key_orig;	/**< @brief File containing a pre-generated cluster authentication token or stdin if \"-\" is given (default autogenerate token). original value given at command line.  */
-  const char *key_help; /**< @brief File containing a pre-generated cluster authentication token or stdin if \"-\" is given (default autogenerate token). help description.  */
-  const char *batch_mode_help; /**< @brief Turn off interactive confirmations and assume yes for all questions help description.  */
-  char * run_as_arg;	/**< @brief Run as specified user[:group].  */
-  char * run_as_orig;	/**< @brief Run as specified user[:group] original value given at command line.  */
-  const char *run_as_help; /**< @brief Run as specified user[:group] help description.  */
+  int human_readable_flag;	/**< @brief Print human readable sizes (default=off).  */
+  const char *human_readable_help; /**< @brief Print human readable sizes help description.  */
   int debug_flag;	/**< @brief Enable debug messages (default=off).  */
   const char *debug_help; /**< @brief Enable debug messages help description.  */
+  char * owner_arg;	/**< @brief Set ownership of storage to user[:group].  */
+  char * owner_orig;	/**< @brief Set ownership of storage to user[:group] original value given at command line.  */
+  const char *owner_help; /**< @brief Set ownership of storage to user[:group] help description.  */
   
   unsigned int help_given ;	/**< @brief Whether help was given.  */
+  unsigned int full_help_given ;	/**< @brief Whether full-help was given.  */
   unsigned int version_given ;	/**< @brief Whether version was given.  */
   unsigned int new_given ;	/**< @brief Whether new was given.  */
   unsigned int info_given ;	/**< @brief Whether info was given.  */
   unsigned int check_given ;	/**< @brief Whether check was given.  */
-  unsigned int cluster_uuid_given ;	/**< @brief Whether cluster-uuid was given.  */
-  unsigned int key_given ;	/**< @brief Whether key was given.  */
+  unsigned int extract_given ;	/**< @brief Whether extract was given.  */
+  unsigned int rename_cluster_given ;	/**< @brief Whether rename-cluster was given.  */
+  unsigned int upgrade_given ;	/**< @brief Whether upgrade was given.  */
+  unsigned int upgrade_job_given ;	/**< @brief Whether upgrade-job was given.  */
+  unsigned int cluster_key_given ;	/**< @brief Whether cluster-key was given.  */
   unsigned int batch_mode_given ;	/**< @brief Whether batch-mode was given.  */
-  unsigned int run_as_given ;	/**< @brief Whether run-as was given.  */
+  unsigned int cluster_uuid_given ;	/**< @brief Whether cluster-uuid was given.  */
+  unsigned int human_readable_given ;	/**< @brief Whether human-readable was given.  */
   unsigned int debug_given ;	/**< @brief Whether debug was given.  */
+  unsigned int owner_given ;	/**< @brief Whether owner was given.  */
 
   char **inputs ; /**< @brief unamed options (options without names) */
   unsigned inputs_num ; /**< @brief unamed options number */
@@ -89,6 +106,8 @@ extern const char *node_args_info_usage;
 extern const char *node_args_info_description;
 /** @brief all the lines making the help output */
 extern const char *node_args_info_help[];
+/** @brief all the lines making the full help output (including hidden options) */
+extern const char *node_args_info_full_help[];
 
 /**
  * The command line parser
@@ -150,6 +169,10 @@ int node_cmdline_parser_file_save(const char *filename,
  * Print the help
  */
 void node_cmdline_parser_print_help(void);
+/**
+ * Print the full help (including hidden options)
+ */
+void node_cmdline_parser_print_full_help(void);
 /**
  * Print the version
  */

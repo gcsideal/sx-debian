@@ -52,6 +52,9 @@ uint64_t swapu64(uint64_t v)
 #define swapu64(x) (x)
 #endif
 
+#define ERROR(...)	{ sxc_filter_msg(handle, SX_LOG_ERR, __VA_ARGS__); }
+#define WARN(...)	{ sxc_filter_msg(handle, SX_LOG_WARNING, __VA_ARGS__); }
+
 static int attribs_process_up(const sxf_handle_t *handle, void *ctx, const char *filename, sxc_meta_t *meta, const void *cfgdata, unsigned int cfgdata_len)
 {
 	struct stat sb;
@@ -71,8 +74,10 @@ static int attribs_process_up(const sxf_handle_t *handle, void *ctx, const char 
     if(sxc_meta_setval(meta, "attribsName", filename, strlen(filename)))
 	return 1;
 
-    if(stat(filename, &sb) == -1)
+    if(stat(filename, &sb) == -1) {
+	ERROR("Failed to stat file %s", filename);
 	return 1;
+    }
 
     val32 = swapu32(sb.st_mode);
     if(sxc_meta_setval(meta, "attribsMode", &val32, sizeof(val32)))
@@ -110,7 +115,8 @@ static int attribs_process_down(const sxf_handle_t *handle, void *ctx, const cha
     sxc_meta_getval(meta, "attribsMode", &val, &len);
     if(len != sizeof(uint32_t))
 	return 1;
-    chmod(filename, (mode_t)swapu32(*(uint32_t *) val));
+    if(chmod(filename, (mode_t)swapu32(*(uint32_t *) val)))
+	WARN("Failed to chmod file %s", filename);
 
     /* root only */
     sxc_meta_getval(meta, "attribsUID", &val, &len);
@@ -125,7 +131,8 @@ static int attribs_process_down(const sxf_handle_t *handle, void *ctx, const cha
 	return 1;
     utb.actime = swapu64(*(uint64_t *) val);
     utb.modtime = swapu64(*(uint64_t *) val2);
-    utime(filename, &utb);
+    if(utime(filename, &utb))
+	WARN("Failed to set times for file %s", filename);
 
     return 0;
 }
@@ -141,17 +148,17 @@ static int attribs_process(const sxf_handle_t *handle, void *ctx, const char *fi
 sxc_filter_t sxc_filter={
 /* int abi_version */		    SXF_ABI_VERSION,
 /* const char *shortname */	    "attribs",
-/* const char *fullname */	    "File Attributes",
+/* const char *shortdesc */	    "Preserve file attributes",
 /* const char *summary */	    "Preserve attributes while storing files in SX.",
 /* const char *options */	    NULL,
 /* const char *uuid */		    "43122b8c-56d1-4671-8500-aa6831eb983c",
 /* sxf_type_t type */		    SXF_TYPE_GENERIC,
-/* int version[2] */		    {1, 1},
+/* int version[2] */		    {1, 2},
 /* int (*init)(const sxf_handle_t *handle, void **ctx) */	    NULL,
 /* int (*shutdown)(const sxf_handle_t *handle, void *ctx) */    NULL,
-/* int (*configure)(const char *cfgstr, const char *cfgdir, void **cfgdata, unsigned int *cfgdata_len) */
+/* int (*configure)(const sxf_handle_t *handle, const char *cfgstr, const char *cfgdir, void **cfgdata, unsigned int *cfgdata_len, sxc_meta_t *custom_meta) */
 				    NULL,
-/* int (*data_prepare)(const sxf_handle_t *handle, void **ctx, const char *filename, const char *cfgdir, const void *cfgdata, unsigned int cfgdata_len, sxf_mode_t mode) */
+/* int (*data_prepare)(const sxf_handle_t *handle, void **ctx, const char *filename, const char *cfgdir, const void *cfgdata, unsigned int cfgdata_len, sxc_meta_t *custom_meta, sxf_mode_t mode) */
 				    NULL,
 /* ssize_t (*data_process)(const sxf_handle_t *handle, void *ctx, const void *in, size_t insize, void *out, size_t outsize, sxf_mode_t mode, sxf_action_t *action) */
 				    NULL,
@@ -159,6 +166,10 @@ sxc_filter_t sxc_filter={
 				    NULL,
 /* int (*file_process)(const sxf_handle_t *handle, void *ctx, const char *filename, sxc_meta_t *meta, const char *cfgdir, const void *cfgdata, unsigned int cfgdata_len, sxf_mode_t mode) */
 				    attribs_process,
+/* void (*file_notify)(const sxf_handle_t *handle, void *ctx, const void *cfgdata, unsigned int cfgdata_len, sxf_mode_t mode, const char *source_cluster, const char *source_volume, const char *source_path, const char *dest_cluster, const char *dest_volume, const char *dest_path) */
+				    NULL,
+/* int (*file_update)(const sxf_handle_t *handle, void *ctx, const void *cfgdata, unsigned int cfgdata_len, sxf_mode_t mode, sxc_file_t *source, sxc_file_t *dest, int recursive) */
+				    NULL,
 /* internal */
 /* const char *tname; */	    NULL
 };

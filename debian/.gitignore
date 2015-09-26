@@ -1,0 +1,6 @@
+/sx/
+/*.substvars
+/*.debhelper
+/libsxclient-dev/
+/libsx*/
+/files

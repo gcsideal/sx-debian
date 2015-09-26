@@ -1,17 +1,17 @@
 #!/bin/sh -x
 set -e
-../client/src/tools/acl/sxacl useradd $SXINITFLAGS theadmin --role=admin sx://localhost --debug >admin2.auth
+../client/src/tools/acl/sxacl useradd $SXINITFLAGS theadmin --role=admin sx://localhost --debug --auth-file=admin2.auth
 # Create normal user
 OWNER=user1
 ../client/src/tools/acl/sxacl useradd $SXINITFLAGS $OWNER --role=normal sx://localhost --auth-file normal.auth
-../client/src/tools/acl/sxacl useradd $SXINITFLAGS user2 --role=normal sx://localhost >normal2.auth
+../client/src/tools/acl/sxacl useradd $SXINITFLAGS user2 --role=normal sx://localhost --auth-file=normal2.auth
 
 ../client/src/tools/acl/sxacl userlist sx://localhost
 
 # Volume creation (owned by admin)
-../client/src/tools/vol/sxvol create sx://localhost/vol1 --owner admin -r 1
+../client/src/tools/vol/sxvol create sx://localhost/vol1 --owner admin -r 1 -s 100M
 # Volume creation (owned by user)
-../client/src/tools/vol/sxvol create sx://localhost/vol2 --owner $OWNER -r 1
+../client/src/tools/vol/sxvol create sx://localhost/vol2 --owner $OWNER -r 1 -s 100M
 # Volume listing
 ../client/src/tools/ls/sxls sx://localhost
 # TODO: sxvol delete a volume
@@ -70,13 +70,13 @@ fi
 # TODO: test delete
 
 # Cannot grant myself permission to admin's volume
-if ../client/src/tools/acl/sxacl perm $OWNER --grant=read,write sx://localhost/vol1; then
+if ../client/src/tools/acl/sxacl volperm $OWNER --grant=read,write sx://localhost/vol1; then
     echo "Grant supposed to fail"
     exit 1
 fi
 # Grant permission to user2 on my volume
-../client/src/tools/acl/sxacl perm user2 --grant=read,write sx://localhost/vol2
-../client/src/tools/acl/sxacl list sx://localhost/vol2
+../client/src/tools/acl/sxacl volperm user2 --grant=read,write sx://localhost/vol2
+../client/src/tools/acl/sxacl volshow sx://localhost/vol2
 
 # User2
 ../client/src/tools/init/sxinit --no-ssl --host-list=$1 sx://localhost --auth-file normal2.auth
@@ -86,7 +86,7 @@ fi
 ../client/src/tools/cp/sxcp sx://localhost/vol2/z z
 
 # Got write permission but cannot grant permissions to others!
-if ../client/src/tools/acl/sxacl perm admin --grant=read sx://localhost/vol2; then
+if ../client/src/tools/acl/sxacl volperm admin --grant=read sx://localhost/vol2; then
     echo "Expected grant to fail"
     exit 1
 fi

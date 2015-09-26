@@ -38,27 +38,70 @@ extern "C" {
 struct gengetopt_args_info
 {
   const char *help_help; /**< @brief Print help and exit help description.  */
+  const char *full_help_help; /**< @brief Print help, including hidden options, and exit help description.  */
   const char *version_help; /**< @brief Print version and exit help description.  */
   int recursive_flag;	/**< @brief Recursively copy files from SOURCE to DEST directory (default=off).  */
   const char *recursive_help; /**< @brief Recursively copy files from SOURCE to DEST directory help description.  */
+  int one_file_system_flag;	/**< @brief Don't cross filesystem boundaries (default=off).  */
+  const char *one_file_system_help; /**< @brief Don't cross filesystem boundaries help description.  */
+  char ** exclude_arg;	/**< @brief Exclude files matching PATTERN.  */
+  char ** exclude_orig;	/**< @brief Exclude files matching PATTERN original value given at command line.  */
+  unsigned int exclude_min; /**< @brief Exclude files matching PATTERN's minimum occurreces */
+  unsigned int exclude_max; /**< @brief Exclude files matching PATTERN's maximum occurreces */
+  const char *exclude_help; /**< @brief Exclude files matching PATTERN help description.  */
+  char ** include_arg;	/**< @brief Only copy files matching PATTERN.  */
+  char ** include_orig;	/**< @brief Only copy files matching PATTERN original value given at command line.  */
+  unsigned int include_min; /**< @brief Only copy files matching PATTERN's minimum occurreces */
+  unsigned int include_max; /**< @brief Only copy files matching PATTERN's maximum occurreces */
+  const char *include_help; /**< @brief Only copy files matching PATTERN help description.  */
+  char * bwlimit_arg;	/**< @brief Set bandwidth usage limit in kilobytes per second (allows K, M, G suffixes, assume K when no suffix given).  */
+  char * bwlimit_orig;	/**< @brief Set bandwidth usage limit in kilobytes per second (allows K, M, G suffixes, assume K when no suffix given) original value given at command line.  */
+  const char *bwlimit_help; /**< @brief Set bandwidth usage limit in kilobytes per second (allows K, M, G suffixes, assume K when no suffix given) help description.  */
+  int no_progress_flag;	/**< @brief Don't output progress bar (default=off).  */
+  const char *no_progress_help; /**< @brief Don't output progress bar help description.  */
+  int ignore_errors_flag;	/**< @brief Keep processing files even when there are errors (default=off).  */
+  const char *ignore_errors_help; /**< @brief Keep processing files even when there are errors help description.  */
   int verbose_flag;	/**< @brief Print more details about the upload (default=off).  */
   const char *verbose_help; /**< @brief Print more details about the upload help description.  */
+  int debug_flag;	/**< @brief Enable debug messages (default=off).  */
+  const char *debug_help; /**< @brief Enable debug messages help description.  */
   char * config_dir_arg;	/**< @brief Path to SX configuration directory.  */
   char * config_dir_orig;	/**< @brief Path to SX configuration directory original value given at command line.  */
   const char *config_dir_help; /**< @brief Path to SX configuration directory help description.  */
   char * filter_dir_arg;	/**< @brief Path to SX filter directory.  */
   char * filter_dir_orig;	/**< @brief Path to SX filter directory original value given at command line.  */
   const char *filter_dir_help; /**< @brief Path to SX filter directory help description.  */
-  int debug_flag;	/**< @brief Enable debug messages (default=off).  */
-  const char *debug_help; /**< @brief Enable debug messages help description.  */
+  int total_conns_limit_arg;	/**< @brief Limit number of connections (default='5').  */
+  char * total_conns_limit_orig;	/**< @brief Limit number of connections original value given at command line.  */
+  const char *total_conns_limit_help; /**< @brief Limit number of connections help description.  */
+  int host_conns_limit_arg;	/**< @brief Limit number of connections with one host (default='2').  */
+  char * host_conns_limit_orig;	/**< @brief Limit number of connections with one host original value given at command line.  */
+  const char *host_conns_limit_help; /**< @brief Limit number of connections with one host help description.  */
+  char * dot_size_arg;	/**< @brief Use specified size for each dot printed with file transfer progress (short: 1KB, long: 8KB, scale: block size).  */
+  char * dot_size_orig;	/**< @brief Use specified size for each dot printed with file transfer progress (short: 1KB, long: 8KB, scale: block size) original value given at command line.  */
+  const char *dot_size_help; /**< @brief Use specified size for each dot printed with file transfer progress (short: 1KB, long: 8KB, scale: block size) help description.  */
+  char * node_preference_arg;	/**< @brief Set node preference level for data transfers (accepts values between 0.0 and 1.0).  */
+  char * node_preference_orig;	/**< @brief Set node preference level for data transfers (accepts values between 0.0 and 1.0) original value given at command line.  */
+  const char *node_preference_help; /**< @brief Set node preference level for data transfers (accepts values between 0.0 and 1.0) help description.  */
   
   unsigned int help_given ;	/**< @brief Whether help was given.  */
+  unsigned int full_help_given ;	/**< @brief Whether full-help was given.  */
   unsigned int version_given ;	/**< @brief Whether version was given.  */
   unsigned int recursive_given ;	/**< @brief Whether recursive was given.  */
+  unsigned int one_file_system_given ;	/**< @brief Whether one-file-system was given.  */
+  unsigned int exclude_given ;	/**< @brief Whether exclude was given.  */
+  unsigned int include_given ;	/**< @brief Whether include was given.  */
+  unsigned int bwlimit_given ;	/**< @brief Whether bwlimit was given.  */
+  unsigned int no_progress_given ;	/**< @brief Whether no-progress was given.  */
+  unsigned int ignore_errors_given ;	/**< @brief Whether ignore-errors was given.  */
   unsigned int verbose_given ;	/**< @brief Whether verbose was given.  */
+  unsigned int debug_given ;	/**< @brief Whether debug was given.  */
   unsigned int config_dir_given ;	/**< @brief Whether config-dir was given.  */
   unsigned int filter_dir_given ;	/**< @brief Whether filter-dir was given.  */
-  unsigned int debug_given ;	/**< @brief Whether debug was given.  */
+  unsigned int total_conns_limit_given ;	/**< @brief Whether total-conns-limit was given.  */
+  unsigned int host_conns_limit_given ;	/**< @brief Whether host-conns-limit was given.  */
+  unsigned int dot_size_given ;	/**< @brief Whether dot-size was given.  */
+  unsigned int node_preference_given ;	/**< @brief Whether node-preference was given.  */
 
   char **inputs ; /**< @brief unamed options (options without names) */
   unsigned inputs_num ; /**< @brief unamed options number */
@@ -82,6 +125,8 @@ extern const char *gengetopt_args_info_usage;
 extern const char *gengetopt_args_info_description;
 /** @brief all the lines making the help output */
 extern const char *gengetopt_args_info_help[];
+/** @brief all the lines making the full help output (including hidden options) */
+extern const char *gengetopt_args_info_full_help[];
 
 /**
  * The command line parser
@@ -143,6 +188,10 @@ int cmdline_parser_file_save(const char *filename,
  * Print the help
  */
 void cmdline_parser_print_help(void);
+/**
+ * Print the full help (including hidden options)
+ */
+void cmdline_parser_print_full_help(void);
 /**
  * Print the version
  */

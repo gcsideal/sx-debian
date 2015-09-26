@@ -1,21 +1,36 @@
 package "sxinit"
-purpose "Manage local configuration of SX"
-args "--unamed-opts=sx://[profile@]cluster --no-handle-version --no-handle-error --strict-hidden"
-usage "sxinit [OPTIONS]... sx://[profile@]cluster"
+purpose "Manage local configuration of SX clusters"
+args "--unamed-opts=sx://[profile@]cluster --no-handle-version --no-handle-error"
+usage "sxinit [OPTIONS]... { sx://[profile@]cluster | --list | --config-link | --sxauthd }"
 
-option  "config-dir"		c "Path to SX configuration directory"
-        string typestr="PATH" optional
+option  "config-link"       C "Use a configuration link for an automated setup" string optional typestr="URI"
 
-option  "host-list"		l "List of SX hosts (IP addresses)"
-        string typestr="IP_1,IP_2,IP_3,... " optional
+option  "sxauthd"           - "Use sxauthd credentials (provide https://[username@]host/ uri)" string optional typestr="URI"
 
-option  "no-ssl"	- "Disable secure communication" flag off
+option	"list"		    L "List configured profiles and aliases" optional
 
-option  "debug"		D "Enable debug messages" flag off
+option  "info"              I "Show information about a configured cluster" optional
 
-option "batch-mode" b "Turn off interactive confirmations and assume yes for all questions" flag off
+option  "delete"            - "Delete a profile" optional
 
-option  "auth-file" a "File containing user key (instead of stdin)" string optional
+option  "no-ssl"	    - "Disable secure communication" flag off
 
-option  "force-reinit"	- "Remove old cluster configuration and init from scratch" flag off
+option  "pass-file"         p "File containing user password (instead of stdin)" string optional hidden
 
+option  "port"		    - "Set the cluster destination TCP port (default 443 in secure mode and 80 in insecure mode)" int optional
+
+option  "host-list"	    l "List of SX hosts (IP addresses)" string typestr="IP_1,IP_2,IP_3,... " optional
+
+option	"alias"		    A "Alias that will be used instead of full sx://[profile@]cluster/" string optional 
+
+option  "batch-mode"	    b "Turn off interactive confirmations and assume yes for all questions" flag off
+
+option  "force-reinit"	    - "Remove old cluster configuration and init from scratch" flag off
+
+option  "key"               k "Ask for a key instead of a password" flag off
+
+option  "auth-file"	    a "File containing user key (instead of stdin)" string optional hidden
+
+option  "debug"		    D "Enable debug messages" flag off
+
+option  "config-dir"	    c "Path to SX configuration directory" string typestr="PATH" optional hidden

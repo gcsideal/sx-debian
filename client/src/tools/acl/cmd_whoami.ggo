@@ -1,0 +1,13 @@
+package "sxacl"
+args "--unamed-opts --no-handle-version --no-handle-error --file-name=cmd_whoami --func-name=whoami_cmdline_parser --arg-struct-name=whoami_args_info"
+usage "sxacl whoami [OPTIONS] sx://[profile@]cluster"
+
+section "Common options"
+
+option  "config-dir"		c "Path to SX configuration directory"
+        string typestr="PATH" optional hidden
+
+option  "verbose"               v "Print additional details about the user" flag off
+option  "human-readable"        H "Print human readable sizes" flag off
+
+option  "debug"		D "Enable debug messages" flag off

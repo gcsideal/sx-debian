@@ -28,11 +28,14 @@
 #include "default.h"
 #include <string.h>
 #include <stdlib.h>
+#include <arpa/inet.h>
 #include <yajl/yajl_parse.h>
 
 #include "fcgi-utils.h"
 #include "utils.h"
 #include "blob.h"
+#include "fcgi-actions-block.h"
+#include "job_common.h"
 
 void fcgi_send_blocks(void) {
     unsigned int blocksize;
@@ -47,27 +50,29 @@ void fcgi_send_blocks(void) {
     if(sx_hashfs_check_blocksize(blocksize))
 	quit_errmsg(404, "The requested block size does not exist");
 
-    if(*hpath != '/')
-	quit_errmsg(404, "Path must begin with /");
+    if(*hpath != '/') {
+        msg_set_reason("Path must begin with / after blocksize: %s", path);
+        quit_errmsg(404, msg_get_reason());
+    }
     while(*hpath == '/')
 	hpath++;
     urlen = strlen(hpath);
-    if(!urlen || urlen % HASH_TEXT_LEN)
+    if(!urlen || urlen % SXI_SHA1_TEXT_LEN)
 	quit_errmsg(400, "Invalid url length: not multiple of hash length");
-    if(urlen > DOWNLOAD_MAX_BLOCKS * HASH_TEXT_LEN)
+    if(urlen > DOWNLOAD_MAX_BLOCKS * SXI_SHA1_TEXT_LEN)
 	quit_errmsg(414, "Too many blocks requested in batch download");
 
-    urlen /= HASH_TEXT_LEN;
+    urlen /= SXI_SHA1_TEXT_LEN;
     for(i=0; i<urlen; i++) {
-	if(hex2bin(hpath + HASH_TEXT_LEN*i, HASH_TEXT_LEN, reqhash.b, HASH_BIN_LEN)) {
-            msg_set_reason("Invalid hash %*.s", HASH_TEXT_LEN, hpath + HASH_TEXT_LEN * i);
+	if(hex2bin(hpath + SXI_SHA1_TEXT_LEN*i, SXI_SHA1_TEXT_LEN, reqhash.b, SXI_SHA1_BIN_LEN)) {
+            msg_set_reason("Invalid hash %*.s", SXI_SHA1_TEXT_LEN, hpath + SXI_SHA1_TEXT_LEN * i);
             quit_errmsg(400,"invalid hash");
         }
 	s = sx_hashfs_block_get(hashfs, blocksize, &reqhash, NULL);
 	if(s == ENOENT || s == FAIL_BADBLOCKSIZE)
 	    quit_errmsg(404, "Block not found");
         else if(s != OK) {
-            msg_set_reason("Failed to read block with hash %.*s", HASH_TEXT_LEN, hpath + HASH_TEXT_LEN*i);
+            msg_set_reason("Failed to read block with hash %.*s", SXI_SHA1_TEXT_LEN, hpath + SXI_SHA1_TEXT_LEN*i);
 	    quit_errmsg(500, msg_get_reason());
         }
     }
@@ -94,15 +99,13 @@ void fcgi_send_blocks(void) {
 	return;
 
     for(i=0; i<urlen; i++) {
-	if(hex2bin(hpath + HASH_TEXT_LEN*i, HASH_TEXT_LEN, reqhash.b, HASH_BIN_LEN))
+	if(hex2bin(hpath + SXI_SHA1_TEXT_LEN*i, SXI_SHA1_TEXT_LEN, reqhash.b, SXI_SHA1_BIN_LEN))
 	    break;
 	if(sx_hashfs_block_get(hashfs, blocksize, &reqhash, &data) != OK)
 	    break;
 	CGI_PUTD(data, blocksize);
     }
 }
-
-#define GC_HASHOP_PERIOD 60
 
 #define DEBUGHASH(MSG, X) do {				\
     char _debughash[sizeof(sx_hash_t)*2+1];		\
@@ -115,49 +118,388 @@ void fcgi_hashop_blocks(enum sxi_hashop_kind kind) {
     unsigned blocksize, n=0;
     const char *hpath;
     sx_hash_t reqhash;
-    rc_ty rc;
+    rc_ty rc = OK;
     unsigned missing = 0;
-    const char *id;
+    const char *reserve_id, *revision_id, *expires;
+    char *end = NULL;
     int comma = 0;
     unsigned idx = 0;
+    uint64_t op_expires_at;
+    unsigned replica;
 
     auth_complete();
     quit_unless_authed();
 
-    id = get_arg("id");
+    reserve_id = get_arg("reserve_id");
+    revision_id = get_arg("revision_id");
+    expires = get_arg("op_expires_at");
+    replica = get_arg_uint("replica");
+    if (replica == -1) replica = 0;
+    if (kind != HASHOP_CHECK) {
+        if (!reserve_id || !revision_id || !expires)
+            quit_errmsg(400, "Missing id/expires");
+        op_expires_at = strtoll(expires, &end, 10);
+        if (!end || *end)
+            quit_errmsg(400, "Invalid number for op_expires_at");
+    } else
+        op_expires_at = 0;
 
     blocksize = strtol(path, (char **)&hpath, 10);
-    if(*hpath != '/')
-	quit_errmsg(404, "Path must begin with /");
+    if(*hpath != '/') {
+        msg_set_reason("Path must begin with / after blocksize: %s", path);
+        quit_errmsg(404, msg_get_reason());
+    }
     while(*hpath == '/')
 	hpath++;
-    rc = sx_hashfs_hashop_begin(hashfs, blocksize);
-    if (rc) {
-        msg_set_reason("Failed to reserve hashes: %s", rc2str(rc));
-        quit_errmsg(500, msg_get_reason());
-    }
     CGI_PUTS("Content-type: application/json\r\n\r\n{\"presence\":[");
     while (*hpath) {
-        int present;
-        if(hex2bin(hpath, HASH_TEXT_LEN, reqhash.b, HASH_BIN_LEN)) {
-            msg_set_reason("Invalid hash %*.s", HASH_TEXT_LEN, hpath);
+        sx_hash_t reserve_hash, revision_hash;
+	int present;
+        if(hex2bin(hpath, SXI_SHA1_TEXT_LEN, reqhash.b, SXI_SHA1_BIN_LEN)) {
+            msg_set_reason("Invalid hash %*.s", SXI_SHA1_TEXT_LEN, hpath);
             rc = EINVAL;
             break;
         }
-        hpath += HASH_TEXT_LEN;
+        hpath += SXI_SHA1_TEXT_LEN;
         if (*hpath++ != ',') {
             CGI_PUTC(']');
-            quit_itererr("bad URL format for hashop", 400);
+            quit_itererr("bad URL format for hashop", EINVAL);
         }
         n++;
-        rc = sx_hashfs_hashop_perform(hashfs, kind, &reqhash, id);
+        switch (kind) {
+            case HASHOP_RESERVE:
+                if (hex2bin(reserve_id, strlen(reserve_id), reserve_hash.b, sizeof(reserve_hash.b)) ||
+                    hex2bin(revision_id, strlen(revision_id), revision_hash.b, sizeof(revision_hash.b))) {
+                    msg_set_reason("Invalid hash(es): %s, %s", reserve_id, revision_id);
+                    rc = EINVAL;
+                    break;
+                }
+                rc = sx_hashfs_hashop_perform(hashfs, blocksize, replica, HASHOP_RESERVE, &reqhash, &reserve_hash, &revision_hash, op_expires_at, &present);
+                break;
+            case HASHOP_CHECK:
+                rc = sx_hashfs_hashop_perform(hashfs, blocksize, 0, HASHOP_CHECK, &reqhash, NULL, NULL, 0, &present);
+                break;
+            default:
+                WARN("unexpected kind: %d", kind);
+                rc = EINVAL;
+                break;
+        }
+        if (comma)
+            CGI_PUTC(',');
+        if (rc != OK)
+                break;
+        /* the presence callback wants an index not the actual hash...
+         * */
+        CGI_PUTS(present ? "true" : "false");
+        DEBUGHASH("Status sent for ", &reqhash);
+	DEBUG("Hash index %d, present: %d", idx, present);
+        comma = 1;
+        idx++;
+    }
+    if (rc != OK) {
+        WARN("hashop: %s", rc2str(rc));
+        CGI_PUTC(']');
+        quit_itererr(msg_get_reason(), rc);
+    }
+    CGI_PUTS("]}");
+    DEBUG("hashop: missing %d, n: %d", missing, n);
+}
+
+static int meta_add(block_meta_t *meta, unsigned replica, int64_t op, const sx_hash_t *revision_id)
+{
+    block_meta_entry_t *e;
+    if (!meta || !revision_id)
+        return -1;
+    meta->entries = wrap_realloc_or_free(meta->entries, ++meta->count * sizeof(*meta->entries));
+    if (!meta->entries)
+        return -1;
+    e = &meta->entries[meta->count - 1];
+    memcpy(&e->revision_id, revision_id, sizeof(e->revision_id));
+    e->replica = replica;
+    e->op = op;
+    return 0;
+}
+
+static int all_add(blocks_t *all, const block_meta_t *m)
+{
+    if (!all)
+        return -1;
+    all->all = wrap_realloc_or_free(all->all, ++all->n * sizeof(*all->all));
+    if (!all->all)
+        return -1;
+    memcpy(&all->all[all->n - 1], m, sizeof(*m));
+    return 0;
+}
+
+struct inuse_ctx {
+    rc_ty error;
+    block_meta_t meta;
+    blocks_t all;
+    sx_hash_t revision_id;
+    unsigned replica;
+    unsigned blocksize;
+    int op;
+    enum inuse_state { CB_IU_START, CB_IU_MAP_HASHES, CB_IU_HASH, CB_IU_MAP_BLOCKSIZE, CB_IU_BLOCKSIZE_VAL, CB_IU_ARRAY, CB_IU_MAP_REVISION, CB_IU_REPLICA, CB_IU_COMPLETE  } state;
+};
+
+/* TODO: parse json replica */
+static int cb_inuse_number(void *ctx, const char *s, size_t l)
+{
+    char numb[24], *enumb;
+    int64_t nnumb;
+    struct inuse_ctx *yactx = (struct inuse_ctx*)ctx;
+    if (!yactx)
+        return 0;
+    if(l > 20) {
+	DEBUG("number too long (%u bytes)", (unsigned)l);
+	return 0;
+    }
+    if (yactx->state != CB_IU_REPLICA) {
+        DEBUG("bad number state %d", yactx->state);
+        return 0;
+    }
+    memcpy(numb, s, l);
+    numb[l] = '\0';
+    nnumb = strtoll(numb, &enumb, 10);
+    if(*enumb) {
+	DEBUG("failed to parse number %.*s", (int)l, s);
+	return 0;
+    }
+
+    DEBUG("replica: %lld", (long long)nnumb);
+    yactx->replica = nnumb;
+
+    if (meta_add(&yactx->meta, yactx->replica, yactx->op, &yactx->revision_id)) {
+        DEBUG("meta_add failed");
+        return 0;
+    }
+    yactx->replica = 0;
+    yactx->state = CB_IU_MAP_REVISION;
+    return 1;
+}
+
+static int cb_inuse_start_map(void *ctx) {
+    struct inuse_ctx *yactx = (struct inuse_ctx*)ctx;
+    if (!yactx) {
+        DEBUG("null yactx");
+        return 0;
+    }
+    switch (yactx->state) {
+        case CB_IU_START:
+            yactx->state = CB_IU_MAP_HASHES;
+            break;
+        case CB_IU_HASH:
+            yactx->state = CB_IU_MAP_BLOCKSIZE;
+            break;
+        case CB_IU_ARRAY:
+            yactx->state = CB_IU_MAP_REVISION;
+            break;
+        default:
+            DEBUG("bad startmap state: %d", yactx->state);
+            return 0;
+    }
+    DEBUG("start_map OK");
+    return 1;
+}
+
+static int cb_inuse_end_map(void *ctx) {
+    struct inuse_ctx *yactx = (struct inuse_ctx*)ctx;
+    if (!yactx)
+        return 0;
+    switch (yactx->state) {
+        case CB_IU_MAP_HASHES:
+            yactx->state = CB_IU_COMPLETE;
+            break;
+        case CB_IU_MAP_BLOCKSIZE:
+            if (all_add(&yactx->all, &yactx->meta)) {
+                free(yactx->meta.entries);
+                return 0;
+            }
+            memset(&yactx->meta, 0, sizeof(yactx->meta));
+            yactx->state = CB_IU_MAP_HASHES;
+            break;
+        case CB_IU_MAP_REVISION:
+            yactx->state = CB_IU_ARRAY;
+            break;
+        default:
+            DEBUG("bad endmap state: %d", yactx->state);
+            return 0;
+    }
+    DEBUG("end_map OK");
+    return 1;
+}
+
+static int cb_inuse_start_array(void *ctx) {
+    struct inuse_ctx *yactx = (struct inuse_ctx*)ctx;
+    if (!yactx) {
+        DEBUG("null yactx");
+        return 0;
+    }
+    switch (yactx->state) {
+        case CB_IU_BLOCKSIZE_VAL:
+            yactx->state = CB_IU_ARRAY;
+            break;
+        default:
+            DEBUG("bad array state: %d", yactx->state);
+            return 0;
+    }
+    DEBUG("start_array OK");
+    return 1;
+}
+
+static int cb_inuse_end_array(void *ctx) {
+    struct inuse_ctx *yactx = (struct inuse_ctx*)ctx;
+    if (!yactx) {
+        DEBUG("null yactx");
+        return 0;
+    }
+    switch (yactx->state) {
+        case CB_IU_ARRAY:
+            yactx->state = CB_IU_MAP_BLOCKSIZE;
+            break;
+        default:
+            DEBUG("bad array state: %d", yactx->state);
+            return 0;
+    }
+    DEBUG("end_array OK");
+    return 1;
+}
+
+static int cb_inuse_map_key(void *ctx, const unsigned char *s, size_t l) {
+    char numb[24], *enumb;
+    int64_t nnumb;
+    struct inuse_ctx *yactx = (struct inuse_ctx*)ctx;
+    if (!yactx)
+        return 0;
+    switch (yactx->state) {
+        case CB_IU_MAP_HASHES:
+            yactx->state = CB_IU_HASH;
+            memset(&yactx->meta, 0, sizeof(yactx->meta));
+            if(hex2bin(s, l, (uint8_t *)&yactx->meta.hash, sizeof(yactx->meta.hash)))
+                return 0;
+            break;
+        case CB_IU_MAP_BLOCKSIZE:
+            if(l > 20) {
+        	DEBUG("number too long (%u bytes)", (unsigned)l);
+        	return 0;
+            }
+            memcpy(numb, s, l);
+            numb[l] = '\0';
+            nnumb = strtoll(numb, &enumb, 10);
+            DEBUG("blocksize: %lld", (long long)nnumb);
+            yactx->meta.blocksize = nnumb;
+            yactx->state = CB_IU_BLOCKSIZE_VAL;
+            return 1;
+        case CB_IU_MAP_REVISION:
+            if(!l)
+                return 0;
+            yactx->op = s[0] == '+' ? 1 : s[0] == '-' ? -1 : 0;
+            if (!yactx->op) {
+                WARN("bad revision id: %.*s", (int)l, s);
+                return 0;
+            }
+	    if(hex2bin(s+1, l-1, yactx->revision_id.b, sizeof(yactx->revision_id.b)))
+                return 0;
+            yactx->state = CB_IU_REPLICA;
+            break;
+        default:
+            DEBUG("bad map key state: %d", yactx->state);
+            return 0;
+    }
+    return 1;
+}
+
+static void blocks_free(blocks_t *blocks)
+{
+    unsigned i;
+    for (i=0;i<blocks->n;i++)
+        free(blocks->all[i].entries);
+    free(blocks->all);
+    blocks->all = NULL;
+}
+
+static const yajl_callbacks inuse_parser = {
+    cb_fail_null,
+    cb_fail_boolean,
+    NULL,
+    NULL,
+    cb_inuse_number,
+    cb_fail_string,
+    cb_inuse_start_map,
+    cb_inuse_map_key,
+    cb_inuse_end_map,
+    cb_inuse_start_array,
+    cb_inuse_end_array
+};
+
+void fcgi_hashop_inuse(void) {
+    unsigned i, j;
+    rc_ty rc = FAIL_EINTERNAL;
+    unsigned missing = 0;
+    const char *reserve_id;
+    int comma = 0;
+    unsigned idx = 0;
+    sx_hash_t reserve_hash;
+
+    struct inuse_ctx yctx;
+    memset(&yctx, 0, sizeof(yctx));
+
+    reserve_id = get_arg("reserve_id");
+    if (reserve_id &&
+        hex2bin(reserve_id, strlen(reserve_id), reserve_hash.b, sizeof(reserve_hash.b))) {
+        msg_set_reason("bad reserve id: %s", reserve_id);
+        quit_errmsg(400, "Bad reserve id");
+    }
+
+    yajl_handle yh = yajl_alloc(&inuse_parser, NULL, &yctx);
+    if (!yh) {
+        quit_errmsg(500, "Cannot allocate json parser");
+    }
+    int len;
+    while((len = get_body_chunk(hashbuf, sizeof(hashbuf))) > 0) {
+        DEBUG("parsing: %.*s", len, hashbuf);
+	if(yajl_parse(yh, hashbuf, len) != yajl_status_ok) {
+            DEBUG("yajl_parse failed on chunk: %.*s", len, hashbuf);
+            break;
+        }
+    }
+
+    if(len || yajl_complete_parse(yh) != yajl_status_ok || yctx.state != CB_IU_COMPLETE) {
+        free(yctx.meta.entries);
+        blocks_free(&yctx.all);
+        DEBUG("yajl parse failed, state: %d (%d)", yctx.state, CB_IU_COMPLETE);
+	yajl_free(yh);
+	quit_errmsg(rc2http(yctx.error), (yctx.error == ENOMEM) ? "Out of memory processing the request" : "Invalid request content");
+    }
+    free(yctx.meta.entries);
+    yctx.meta.entries = NULL;
+    yajl_free(yh);
+
+    auth_complete();
+    if(!is_authed()) {
+        blocks_free(&yctx.all);
+	send_authreq();
+	return;
+    }
+
+    CGI_PUTS("Content-type: application/json\r\n\r\n{\"presence\":[");
+
+    for (i=0;i<yctx.all.n;i++) {
+        int present;
+        const block_meta_t *m = &yctx.all.all[i];
+        rc = FAIL_EINTERNAL;
+        for (j=0;j<m->count;j++) {
+            const block_meta_entry_t *e = &m->entries[j];
+            rc = sx_hashfs_hashop_mod(hashfs, &m->hash, reserve_id ? &reserve_hash : NULL, &e->revision_id, m->blocksize, e->replica, e->op, 0);
+            if (rc && rc != ENOENT)
+                break;
+        }
         present = rc == OK;
         if (comma)
             CGI_PUTC(',');
         /* the presence callback wants an index not the actual hash...
          * */
         CGI_PUTS(present ? "true" : "false");
-        DEBUGHASH("Status sent for ", &reqhash);
         DEBUG("Hash index %d, present: %d", idx, present);
         comma = 1;
         if (rc != OK) {
@@ -168,14 +510,14 @@ void fcgi_hashop_blocks(enum sxi_hashop_kind kind) {
         }
         idx++;
     }
-    rc = sx_hashfs_hashop_finish(hashfs, rc);
+    blocks_free(&yctx.all);
     if (rc != OK) {
         WARN("hashop: %s", rc2str(rc));
         CGI_PUTC(']');
-        quit_itererr(msg_get_reason(), rc2http(rc));
+        quit_itererr(msg_get_reason(), rc);
     }
     CGI_PUTS("]}");
-    DEBUG("hashop: missing %d, n: %d", missing, n);
+    DEBUG("hashop: missing %d, n: %ld", missing, yctx.all.n);
 }
 
 void fcgi_save_blocks(void) {
@@ -191,7 +533,7 @@ void fcgi_save_blocks(void) {
 
     if(has_priv(PRIV_CLUSTER)) {  /* FIXME: use a cluster token to avoid arbitrary replays to over-replica nodes */
 	/* MODHDIST: WTF?! */
-	replica_count = sx_nodelist_count(sx_hashfs_nodelist(hashfs, NL_NEXT));
+	replica_count = sx_nodelist_count(sx_hashfs_all_nodes(hashfs, NL_NEXT));
     } else {
         if(sx_hashfs_token_get(hashfs, user, token, &replica_count, NULL))
             quit_errmsg(400, "Invalid token");
@@ -213,6 +555,8 @@ void fcgi_save_blocks(void) {
     const uint8_t *end = hashbuf + len;
     for(const uint8_t *src = hashbuf;src < end; src += blocksize) {
         rc_ty rc;
+	/* Maximum replica used here;
+	 * block_put internally skips ignored nodes and only propagates to effective nodes */
         if ((rc = sx_hashfs_block_put(hashfs, src, blocksize, replica_count, !has_priv(PRIV_CLUSTER)))) {
             WARN("Cannot store block: %s", rc2str(rc));
 	    quit_errmsg(500, "Cannot store block");
@@ -373,7 +717,7 @@ void fcgi_push_blocks(void) {
 
     sx_hash_t block;
     /* MODHDIST: propagate to _next set */
-    const sx_nodelist_t *nodes = sx_hashfs_nodelist(hashfs, NL_NEXT);
+    const sx_nodelist_t *nodes = sx_hashfs_all_nodes(hashfs, NL_NEXT);
     sx_nodelist_t *targets = sx_nodelist_new();
     if(!nodes || !targets) {
 	sx_nodelist_delete(targets);
@@ -431,4 +775,123 @@ void fcgi_push_blocks(void) {
     sx_nodelist_delete(targets);
     sx_blob_free(yctx.stash);
     CGI_PUTS("\r\n");
+}
+
+void fcgi_send_replacement_blocks(void) {
+    sx_block_meta_index_t bmidx, *bmidxptr = NULL;
+    unsigned int version = 0, bytes_sent = 0;
+    sx_uuid_t target;
+    sx_blob_t *b;
+
+    if(uuid_from_string(&target, get_arg("target")))
+	quit_errmsg(400, "Parameter target is not valid");
+
+    if(has_arg("dist")) {
+	char *eon;
+	version = strtol(get_arg("dist"), &eon, 10);
+	if(*eon)
+	    version = 0;
+    }
+    if(version == 0)
+	quit_errmsg(400, "Parameter dist missing or invalid");
+
+    if(has_arg("idx")) {
+	if(strlen(get_arg("idx")) != sizeof(bmidx) * 2 ||
+	   hex2bin(get_arg("idx"), sizeof(bmidx) * 2, (uint8_t *)&bmidx, sizeof(bmidx)))
+	    quit_errmsg(400, "Parameter idx is not valid");
+	bmidxptr = &bmidx;
+    }
+
+    b = sx_blob_new();
+    if(!b)
+	quit_errmsg(503, "Out of memory");
+
+    CGI_PUTS("\r\n");
+    while(bytes_sent < REPLACEMENT_BATCH_SIZE) {
+	const uint8_t *blockdata;
+	unsigned int header_len, hlenton;
+	block_meta_t *bmeta;
+	const void *header;
+	rc_ty r;
+
+	sx_blob_reset(b);
+	r = sx_hashfs_br_find(hashfs, bmidxptr, version, &target, &bmeta);
+
+	if(r == ITER_NO_MORE) {
+	    if(sx_blob_add_string(b, "$THEEND$"))
+		break;
+	} else if(r != OK) {
+	    break;
+	} else {
+	    unsigned int i;
+	    if(sx_blob_add_string(b, "$BLOCK$") ||
+	       sx_blob_add_int32(b, bmeta->blocksize) ||
+	       sx_blob_add_blob(b, &bmeta->hash, sizeof(bmeta->hash)) ||
+	       sx_blob_add_blob(b, &bmeta->cursor, sizeof(bmeta->cursor)) ||
+	       sx_blob_add_int32(b, bmeta->count)) {
+		sx_hashfs_blockmeta_free(&bmeta);
+		break;
+	    }
+            /* TODO: token id */
+	    for(i=0; i<bmeta->count; i++)
+		if(sx_blob_add_blob(b, bmeta->entries[i].revision_id.b, sizeof(bmeta->entries[i].revision_id.b)) ||
+                   sx_blob_add_int32(b, bmeta->entries[i].replica) ||
+		   sx_blob_add_int32(b, bmeta->entries[i].op))
+		    break;
+	    if(i < bmeta->count ||
+	       sx_hashfs_block_get(hashfs, bmeta->blocksize, &bmeta->hash, &blockdata) != OK) {
+		sx_hashfs_blockmeta_free(&bmeta);
+		break;
+	    }
+	}
+	sx_blob_to_data(b, &header, &header_len);
+	hlenton = htonl(header_len);
+	CGI_PUTD(&hlenton, sizeof(hlenton));
+	CGI_PUTD(header, header_len);
+	bytes_sent += sizeof(hlenton) + header_len;
+	if(r == ITER_NO_MORE)
+	    break;
+
+	CGI_PUTD(blockdata, bmeta->blocksize);
+	bytes_sent += bmeta->blocksize;
+	memcpy(&bmidx, &bmeta->cursor, sizeof(bmidx));
+	bmidxptr = &bmidx;
+	sx_hashfs_blockmeta_free(&bmeta);
+    }
+    sx_blob_free(b);
+}
+
+void fcgi_revision_op(void) {
+    sx_revision_op_t op;
+    const char *revision_id_hex;
+    char *hpath;
+
+    revision_id_hex = get_arg("revision_id");
+    if (!revision_id_hex || strlen(revision_id_hex) != SXI_SHA1_TEXT_LEN ||
+        hex2bin(revision_id_hex, SXI_SHA1_TEXT_LEN, op.revision_id.b, sizeof(op.revision_id.b)))
+    {
+        msg_set_reason("Cannot parse revision in request");
+        quit_errmsg(400, msg_get_reason());
+    }
+    op.blocksize = strtol(path, &hpath, 10);
+    if (*hpath != '\0') {
+        msg_set_reason("Path must consist of just the blocksize and /: %s", path);
+        quit_errmsg(404, msg_get_reason());
+    }
+    if(sx_hashfs_check_blocksize(op.blocksize)) {
+	msg_set_reason("The requested block size does not exist");
+        quit_errmsg(400, msg_get_reason());
+    }
+    switch (verb) {
+        case VERB_PUT:
+            op.op = 1;
+            break;
+        case VERB_DELETE:
+            op.op = -1;
+            break;
+        default:
+            quit_errmsg(405,"Bad verb");
+    }
+    op.lock = revision_id_hex;
+    job_2pc_handle_request(sx_hashfs_client(hashfs), &revision_spec, &op);
 }

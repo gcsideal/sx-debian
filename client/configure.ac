@@ -2,7 +2,7 @@
 # Process this file with autoconf to produce a configure script.
 
 AC_PREREQ([2.68])
-AC_INIT([sxclient], [0.1], [https://bugzilla.skylable.com])
+AC_INIT([sxclient], [1.2], [https://bugzilla.skylable.com])
 AC_CONFIG_AUX_DIR([build-aux])
 AC_CONFIG_MACRO_DIR([m4])
 dnl for cmdline.c
@@ -24,8 +24,6 @@ AM_PROG_CC_C_O
 
 AC_DEFINE([_XOPEN_SOURCE], [600], [Expose C99, and POSIX.1-2001 + XSI extension])
 
-AC_DEFINE([_BSD_SOURCE], [], [OpenBSD won''t expose some POSIX.1 definitions unless this is used])
-
 AC_PROG_CC_C99
 #if test "$ac_cv_prog_cc_c89" = "no"; then
 #    AC_MSG_ERROR([A C89 compiler is required, for example GCC.])
@@ -42,9 +40,25 @@ AC_SUBST([ZCOMP_LIBS])
 AM_CONDITIONAL([BUILD_ZCOMP], [test "$have_zlib" = "yes"])
 
 # libcrypto
-AC_CHECK_LIB([crypto], [EVP_EncryptUpdate], [AES256_LIBS="-lcrypto"; have_crypto="yes"])
-AC_SUBST([AES256_LIBS])
+ac_save_LIBS=$LIBS
+PKG_CHECK_MODULES([OPENSSL], [libssl], [have_crypto="yes"], [
+    AC_CHECK_LIB([crypto], [HMAC_Update], [OPENSSL_LIBS="-lcrypto -lssl"; have_crypto="yes"])])
+LIBS=$ac_save_LIBS
 AM_CONDITIONAL([BUILD_AES256], [test "$have_crypto" = "yes"])
+AC_CACHE_CHECK([whether HMAC_Update returns int], ac_cv_type_HMAC_update,
+[AC_COMPILE_IFELSE(
+    [AC_LANG_PROGRAM([#include <openssl/hmac.h>
+    ],[return HMAC_Update(NULL, NULL, 0) == 1;])],
+    [ac_cv_type_HMAC_update=yes],
+    [ac_cv_type_HMAC_update=no])
+])
+if test "$ac_cv_type_HMAC_update" = "yes"; then
+    AC_DEFINE([HMAC_UPDATE_RETURNS_INT], 1, [Defined if HMAC_Update returns int])
+fi
+VCRYPTO_LIBS="$OPENSSL_LIBS"
+VCRYPTO_CFLAGS="$OPENSSL_CFLAGS"
+AC_SUBST(VCRYPTO_LIBS)
+AC_SUBST(VCRYPTO_CFLAGS)
 
 # Checks for header files.
 AC_CHECK_HEADERS([stddef.h stdint.h stdlib.h string.h sys/types.h])
@@ -75,6 +89,7 @@ AM_CONDITIONAL([COVERAGE], test "$do_coverage" = "yes")
 
 # Checks for library functions.
 AC_CHECK_FUNCS([memset])
+AC_CHECK_FUNCS([isatty])
 
 if test "x$GCC" = "xyes"; then
     AX_APPEND_COMPILE_FLAGS([-pedantic -Wall -Wformat-security -fstack-protector], [AM_CFLAGS])
@@ -88,9 +103,17 @@ fi
 AC_SUBST([AM_CFLAGS])
 AC_SUBST([AM_LDFLAGS])
 
+if test "x$prefix" = xNONE; then
+  filter_dir=$ac_default_prefix/lib/$PACKAGE
+else
+  filter_dir=$prefix/lib/$PACKAGE
+fi
+AC_SUBST([SX_FILTER_DIR], [$filter_dir])
+
 AC_CONFIG_FILES([Makefile])
+AC_CONFIG_FILES([man/sxacl.1 man/sxacl-useradd.1 man/sxacl-userclone.1 man/sxacl-userdel.1 man/sxacl-userlist.1 man/sxacl-usermod.1 man/sxacl-usergetkey.1 man/sxacl-usernewkey.1 man/sxacl-volperm.1 man/sxacl-volshow.1 man/sxacl-whoami.1 man/sxcat.1 man/sxrm.1 man/sxls.1 man/sxmv.1 man/sxcp.1 man/sxinit.1 man/sxreport-client.1 man/sxvol.1 man/sxvol-create.1 man/sxvol-modify.1 man/sxvol-remove.1 man/sxvol-filter.1 man/sxrev.1 man/sxrev-list.1 man/sxrev-copy.1 man/sxrev-delete.1])
 AC_CONFIG_FILES([src/filters/attribs/Makefile])
-AC_CONFIG_FILES([src/filters/null/Makefile])
 AC_CONFIG_FILES([src/filters/zcomp/Makefile])
 AC_CONFIG_FILES([src/filters/aes256/Makefile])
+AC_CONFIG_FILES([src/filters/undelete/Makefile])
 AC_OUTPUT

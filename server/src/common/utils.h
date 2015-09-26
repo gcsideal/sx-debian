@@ -28,7 +28,9 @@
 #ifndef UTILS_H
 #define UTILS_H
 #include "default.h"
+
 #include <sys/time.h>
+#include <sys/types.h>
 
 int bin2hex(const void *src, uint32_t src_len, char *dst, uint32_t dst_len);
 int hex2bin(const char *src, uint32_t src_len, uint8_t *dst, uint32_t dst_len);
@@ -36,7 +38,7 @@ int utf8_validate_len(const char *str);
 int hmac_compare(const unsigned char *hmac1, const unsigned char *hmac2, size_t len);
 uint64_t MurmurHash64(const void *key, size_t len, unsigned int seed);
 
-int wait_trigger(int pipe, unsigned max_wait_sec, int *forced_awake);
+int wait_trigger(int pipe, float max_wait_sec, int *forced_awake);
 
 extern const int hexchars[256];
 static inline int hexcharval(unsigned char c) {
@@ -76,7 +78,7 @@ typedef struct _sx_uuid_t {
     char string[UUID_STRING_SIZE+1];
 } sx_uuid_t;
 
-void uuid_generate(sx_uuid_t *u);
+int uuid_generate(sx_uuid_t *u);
 int uuid_from_string(sx_uuid_t *u, const char *s);
 void uuid_from_binary(sx_uuid_t *u, const void *b);
 
@@ -93,7 +95,8 @@ int encode_auth_bin(const uint8_t *userhash, const unsigned char *key, unsigned 
 int ssl_version_check(void);
 const char *strptimegm(const char *s, const char *format, time_t *t);
 
-int runas(char *usergroup);
+int parse_usergroup(const char *usergroup, uid_t *uid, gid_t *gid);
+int runas(const char *usergroup);
 
 int cb_fail_null(void *ctx);
 int cb_fail_boolean(void *ctx, int boolean);
@@ -121,3 +124,15 @@ char *wrap_strdup_impl(const char *src, const char *_f);
 #define wrap_waitpid(...) WRAP(waitpid, __VA_ARGS__)
 pid_t wrap_waitpid_impl(pid_t pid, int *status, int options, const char *_f);
 #endif
+
+/* tweaks */
+extern int gc_interval;
+extern int gc_max_batch;
+extern float blockmgr_delay;
+extern int db_min_passive_wal_pages;
+extern int db_max_passive_wal_pages;
+extern int db_max_restart_wal_pages;
+extern int db_idle_restart;
+extern int db_busy_timeout;
+extern int worker_max_wait;
+extern int worker_max_requests;
